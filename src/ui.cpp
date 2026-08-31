@@ -142,6 +142,10 @@ constexpr DWORD kHoverMs  = 80;    // hover outline
 constexpr DWORD kTabMs    = 130;   // panel underline slide
 constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
+// Shown in the About box. The authoritative version lives in the resource
+// block; keep the two in step when releasing.
+constexpr const wchar_t* kAppVersion = L"1.1.1";
+
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
 struct Anim {
@@ -201,6 +205,8 @@ struct App {
 
     std::vector<DriveHit> driveHits;
     std::vector<Rect>     crumbHits;
+    Rect                  menuHit;   // the "···" beside the title
+    Settings              settings;
     size_t                crumbFirst = 0;   // trail index of crumbHits[0]
 
     // Side panel. Every comparable tool carries these two views next to the
@@ -216,6 +222,9 @@ struct App {
 
     std::wstring          query;
     bool                  searchFocus = false;
+    // Ctrl+A: the whole query is selected, so the next keystroke or paste
+    // replaces it. The only selection state the box has.
+    bool                  searchSelectAll = false;
     Rect                  searchBox;
 
     Progress              progress;
@@ -426,6 +435,9 @@ struct ScanRequest {
     std::wstring root;
     HWND         hwnd = nullptr;
     uint64_t     gen  = 0;
+    // Copied from settings at start time so the scan thread never reads the
+    // live settings struct the UI thread may be editing.
+    bool         keepCache = true;
 };
 
 // Scan thread entry. Wrapped end to end: an exception escaping here would
@@ -444,7 +456,8 @@ unsigned __stdcall ScanThread(void* param) {
         // hands it to the UI thread. Cancelled or faulted scans are not
         // saved: a truncated tree served instantly next launch would look
         // authoritative and be wrong.
-        if (!g_app.progress.cancel.load(std::memory_order_relaxed) &&
+        if (req->keepCache &&
+            !g_app.progress.cancel.load(std::memory_order_relaxed) &&
             !res->stats.faulted) {
             SaveScanCache(req->root, *res);
         }
@@ -495,7 +508,7 @@ static void StartScan(int volumeIndex, bool useCache = true) {
     // and the scan below revalidates it. Skipped after a delete, where the
     // cache is known to describe the old state of exactly the files the user
     // is looking at.
-    if (useCache) {
+    if (useCache && g_app.settings.keepCaches) {
         auto cached = std::make_unique<ScanResult>();
         CacheMeta meta;
         if (LoadScanCache(g_app.volumes[static_cast<size_t>(volumeIndex)].path,
@@ -517,9 +530,10 @@ static void StartScan(int volumeIndex, bool useCache = true) {
     g_app.scanning = true;
 
     auto req = std::make_unique<ScanRequest>();
-    req->root = g_app.volumes[static_cast<size_t>(volumeIndex)].path;
-    req->hwnd = g_app.hwnd;
-    req->gen  = g_app.scanGen.fetch_add(1) + 1;
+    req->root      = g_app.volumes[static_cast<size_t>(volumeIndex)].path;
+    req->hwnd      = g_app.hwnd;
+    req->gen       = g_app.scanGen.fetch_add(1) + 1;
+    req->keepCache = g_app.settings.keepCaches;
 
     const uintptr_t h =
         _beginthreadex(nullptr, 0, ScanThread, req.get(), 0, nullptr);
@@ -671,6 +685,12 @@ static void DrawSidebar(const Rect& area) {
              Rect{area.x + layout::kPad, y, area.w - layout::kPad * 2,
                   layout::kLineHead},
              theme::kType);
+    // About & settings, tucked beside the title where chrome belongs.
+    g_app.menuHit = Rect{area.right() - 44.0f, y, 30.0f, 24.0f};
+    DrawText(L"\u00B7\u00B7\u00B7", g_app.fmtBody.get(),
+             Rect{g_app.menuHit.x, g_app.menuHit.y, g_app.menuHit.w,
+                  layout::kLineBody},
+             theme::kMute, 1.0f, false, DWRITE_TEXT_ALIGNMENT_CENTER);
     y += 30.0f;
     DrawText(L"Disk space, mapped", g_app.fmtSmall.get(),
              Rect{area.x + layout::kPad, y, area.w - layout::kPad * 2,
@@ -741,6 +761,14 @@ static void DrawSidebar(const Rect& area) {
     if (g_app.panel == App::Panel::Search) {
         g_app.searchBox = Rect{area.x + layout::kPad, y, rowW, 26.0f};
         FillRound(g_app.searchBox, 4.0f, theme::kInk);
+        if (g_app.searchSelectAll && !g_app.query.empty()) {
+            // The whole query is selected; tint it the way every other text
+            // box does, so replace-on-type is not a surprise.
+            FillRound(Rect{g_app.searchBox.x + 4.0f, g_app.searchBox.y + 4.0f,
+                           g_app.searchBox.w - 8.0f,
+                           g_app.searchBox.h - 8.0f},
+                      3.0f, theme::kSignal, 0.28f);
+        }
         if (g_app.searchFocus) {
             SetBrush(theme::kSignal, 0.8f);
             const D2D1_ROUNDED_RECT rr{ToD2D(g_app.searchBox), 4.0f, 4.0f};
@@ -790,10 +818,20 @@ static void DrawSidebar(const Rect& area) {
 
     // Largest / Find both render a file list.
     if (g_app.fileList.empty()) {
-        const wchar_t* empty =
-            (g_app.panel == App::Panel::Search)
-                ? (g_app.query.empty() ? L"" : L"Nothing matches")
-                : L"No files here";
+        std::wstring empty = L"No files here";
+        if (g_app.panel == App::Panel::Search) {
+            // Search is scoped to the directory being viewed, and the empty
+            // states are where that is worth saying out loud.
+            const std::wstring where =
+                SanitizeForDisplay(TrailPath(g_app.trail));
+            if (g_app.query.empty()) {
+                empty = where.empty() ? std::wstring()
+                                      : L"Searches " + where;
+            } else {
+                empty = L"Nothing matches in " +
+                        (where.empty() ? std::wstring(L"this view") : where);
+            }
+        }
         DrawText(empty, g_app.fmtSmall.get(),
                  Rect{area.x + layout::kPad, y, rowW, layout::kLineSmall},
                  theme::kMute);
@@ -1380,6 +1418,31 @@ static void RevealInExplorer(const std::wstring& path) {
                   SW_SHOWNORMAL);
 }
 
+// Paste into the search box: first line only, printable characters only, the
+// same 128-character cap as typing. Clipboard text is as attacker-controlled
+// as filenames are.
+static void PasteIntoSearch() {
+    if (!OpenClipboard(g_app.hwnd)) return;
+    if (const HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const auto* text = static_cast<const wchar_t*>(GlobalLock(h))) {
+            if (g_app.searchSelectAll) {
+                g_app.query.clear();
+                g_app.searchSelectAll = false;
+            }
+            for (const wchar_t* p = text; *p != 0; ++p) {
+                if (*p == L'\r' || *p == L'\n') break;
+                if (*p < 0x20 || *p == 0x7F) continue;
+                if (g_app.query.size() >= 128) break;
+                g_app.query.push_back(*p);
+            }
+            GlobalUnlock(h);
+            g_app.panelDirty = true;
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        }
+    }
+    CloseClipboard();
+}
+
 // CSV export, the interchange format every comparable tool offers.
 static void DoExport() {
     if (g_app.trail.empty() || !g_app.result) return;
@@ -1409,6 +1472,79 @@ static void DoExport() {
     }
 }
 
+// Everything that is not the map: about, the key list, and the only two
+// settings the program actually has. A native popup, not a dialog - the
+// same chrome budget as the rest of the interface.
+static void ShowAppMenu(POINT screenPt) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+
+    AppendMenuW(menu, MF_STRING, 1, L"About Spindle");
+    AppendMenuW(menu, MF_STRING, 2, L"Controls");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu,
+                MF_STRING | (g_app.settings.keepCaches ? MF_CHECKED : 0u), 3,
+                L"Keep scan caches");
+    AppendMenuW(menu,
+                MF_STRING | (g_app.settings.resumeOnLaunch ? MF_CHECKED : 0u),
+                4, L"Resume last drive at launch");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 5, L"Open cache folder");
+    AppendMenuW(menu, MF_STRING, 6, L"Clear scan caches");
+
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                   screenPt.x, screenPt.y, 0, g_app.hwnd,
+                                   nullptr);
+    DestroyMenu(menu);
+
+    switch (cmd) {
+        case 1: {
+            const std::wstring about =
+                std::wstring(L"Spindle ") + kAppVersion +
+                L"\n\nDisk space, mapped. Native Win32 and Direct2D, one "
+                L"portable executable, nothing installed.\n\n"
+                L"github.com/thetrueartist/spindle";
+            MessageBoxW(g_app.hwnd, about.c_str(), L"About Spindle", MB_OK);
+            break;
+        }
+        case 2:
+            MessageBoxW(g_app.hwnd,
+                        L"Click a drive - scan it\n"
+                        L"Click a block - descend into it\n"
+                        L"Backspace - go up a level\n"
+                        L"Click a breadcrumb - jump to that level\n"
+                        L"Right-click a block - Explorer, copy path, recycle\n"
+                        L"Ctrl+F - search names\n"
+                        L"Ctrl+E - export CSV\n"
+                        L"F5 - rescan\n"
+                        L"Esc - cancel a running scan",
+                        L"Controls", MB_OK);
+            break;
+        case 3:
+            g_app.settings.keepCaches = !g_app.settings.keepCaches;
+            SaveSettings(g_app.settings);
+            break;
+        case 4:
+            g_app.settings.resumeOnLaunch = !g_app.settings.resumeOnLaunch;
+            SaveSettings(g_app.settings);
+            break;
+        case 5: {
+            const std::wstring dir = CacheDirPath();
+            if (!dir.empty()) {
+                ShellExecuteW(g_app.hwnd, L"open", L"explorer.exe",
+                              (L"\"" + dir + L"\"").c_str(), nullptr,
+                              SW_SHOWNORMAL);
+            }
+            break;
+        }
+        case 6:
+            ClearScanCaches();
+            break;
+        default:
+            break;
+    }
+}
+
 static void ShowCellMenu(int cellIndex, POINT screenPt) {
     if (cellIndex < 0 ||
         static_cast<size_t>(cellIndex) >= g_app.cells.size()) {
@@ -1424,7 +1560,10 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
     AppendMenuW(menu, MF_STRING, 1, L"Show in Explorer");
     AppendMenuW(menu, MF_STRING, 2, L"Copy path");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 3, L"Move to Recycle Bin\tDel");
+    // No keyboard shortcut on purpose: deleting should take deliberate
+    // pointing, not a stray keypress. The ellipsis is the Windows convention
+    // for "asks before doing anything".
+    AppendMenuW(menu, MF_STRING, 3, L"Move to Recycle Bin...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 4, L"Export this folder to CSV\tCtrl+E");
 
@@ -1456,6 +1595,21 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
         if (MessageBoxW(g_app.hwnd, prompt.c_str(), L"Spindle",
                         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
             return;
+        }
+
+        // A folder is a recursive delete, and one Yes is too cheap for
+        // that. Folders ask twice, with the scale restated and No the
+        // default both times.
+        if (node->dir) {
+            const std::wstring again =
+                L"That folder holds " + FormatCount(node->files) +
+                L" files (" + FormatSize(node->size) +
+                L").\n\nMove all of it to the Recycle Bin?";
+            if (MessageBoxW(g_app.hwnd, again.c_str(), L"Spindle",
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) !=
+                IDYES) {
+                return;
+            }
         }
 
         // SHFileOperationW takes a double-NUL-terminated list. Building it by
@@ -1526,6 +1680,13 @@ static void OnLeftClick(int x, int y) {
     const float fx = static_cast<float>(x) * inv;
     const float fy = static_cast<float>(y) * inv;
 
+    if (g_app.menuHit.contains(fx, fy)) {
+        POINT pt{x, y};
+        ClientToScreen(g_app.hwnd, &pt);
+        ShowAppMenu(pt);
+        return;
+    }
+
     for (const DriveHit& d : g_app.driveHits) {
         if (d.rect.contains(fx, fy)) {
             StartScan(d.index);
@@ -1578,15 +1739,23 @@ static void OnLeftClick(int x, int y) {
         }
 
         // A row in the file list opens that file's location, which is the
-        // point of having the list next to the map.
+        // point of having the list next to the map. Joined with
+        // AppendComponent, not naive concatenation: at the volume root the
+        // trail path already ends in a backslash, and Explorer's /select
+        // quietly opens the default folder when handed the doubled
+        // separator that produced.
         if (i >= g_app.fileList.size()) return;
-        RevealInExplorer(TrailPath(g_app.trail) + L"\\" +
-                         g_app.fileList[i].path);
+        {
+            std::wstring full = TrailPath(g_app.trail);
+            AppendComponent(full, g_app.fileList[i].path);
+            RevealInExplorer(full);
+        }
         return;
     }
 
     if (fx < layout::kSidebar) {
         g_app.searchFocus = false;
+        g_app.searchSelectAll = false;
         return;
     }
 
@@ -1653,6 +1822,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             g_app.dpiScale = QueryDpiScale(hwnd);
             g_app.volumes  = EnumerateVolumes();
+            g_app.settings = LoadSettings();
+
+            // Open where the user left off: the drive with the freshest
+            // cache comes up mapped immediately and revalidates behind the
+            // map. Only that one - auto-scanning every disk on launch would
+            // spin up hardware nobody asked about, which is exactly what
+            // this program promises not to do.
+            if (g_app.settings.resumeOnLaunch && g_app.settings.keepCaches) {
+                int      best = -1;
+                FILETIME bestTime{};
+                for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+                    const std::wstring cp =
+                        CachePathForVolume(g_app.volumes[i].path);
+                    if (cp.empty()) continue;
+                    WIN32_FILE_ATTRIBUTE_DATA fad{};
+                    if (!GetFileAttributesExW(cp.c_str(),
+                                              GetFileExInfoStandard, &fad)) {
+                        continue;
+                    }
+                    if (best < 0 ||
+                        CompareFileTime(&fad.ftLastWriteTime, &bestTime) > 0) {
+                        best     = static_cast<int>(i);
+                        bestTime = fad.ftLastWriteTime;
+                    }
+                }
+                if (best >= 0) StartScan(best);
+            }
             return 0;
         }
 
@@ -1709,7 +1905,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_PAINT: {
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
-            Render();
+            // A paint that throws must not take the process with it: under
+            // memory pressure the string churn in Render can hit bad_alloc
+            // (crash report #2 died exactly there). Dropping the frame is
+            // harmless - the next invalidation repaints. Three in a row is
+            // not pressure, it is a bug: let it reach the crash handler.
+            static int paintFailures = 0;
+            try {
+                Render();
+                paintFailures = 0;
+            } catch (...) {
+                if (++paintFailures >= 3) {
+                    EndPaint(hwnd, &ps);
+                    throw;
+                }
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -1811,8 +2021,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_app.searchFocus) return 0;
             const wchar_t c = static_cast<wchar_t>(wp);
             if (c == L'\b') {
-                if (!g_app.query.empty()) g_app.query.pop_back();
+                if (g_app.searchSelectAll) {
+                    g_app.query.clear();
+                    g_app.searchSelectAll = false;
+                } else if (!g_app.query.empty()) {
+                    g_app.query.pop_back();
+                }
             } else if (c >= 0x20 && c != 0x7F) {
+                if (g_app.searchSelectAll) {
+                    g_app.query.clear();
+                    g_app.searchSelectAll = false;
+                }
                 if (g_app.query.size() < 128) g_app.query.push_back(c);
             } else {
                 return 0;
@@ -1828,8 +2047,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_app.searchFocus && wp == VK_BACK) return 0;
             if (wp == VK_ESCAPE && g_app.searchFocus) {
                 g_app.searchFocus = false;
+                g_app.searchSelectAll = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
+            }
+            // The editing keys every text box owes its user. Selection is
+            // all-or-nothing: Ctrl+A marks the query, and the next
+            // keystroke, paste or backspace replaces it.
+            if (g_app.searchFocus && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                if (wp == 'A') {
+                    g_app.searchSelectAll = !g_app.query.empty();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wp == 'C' || wp == 'X') {
+                    if (!g_app.query.empty()) {
+                        CopyPathToClipboard(g_app.query);
+                    }
+                    if (wp == 'X') {
+                        g_app.query.clear();
+                        g_app.searchSelectAll = false;
+                        g_app.panelDirty = true;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    return 0;
+                }
+                if (wp == 'V') {
+                    PasteIntoSearch();
+                    return 0;
+                }
             }
             if (wp == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 g_app.panel = App::Panel::Search;
@@ -1891,6 +2137,51 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // acted on. The report records the faulting address as an offset from the
 // module base, which is what makes it meaningful under ASLR: a raw address
 // differs every run, while base+offset maps straight onto the binary.
+// module+offset for an address, whatever module that is. A raw address is
+// meaningless under ASLR, and a spindle-relative offset for an address that
+// actually lives in kernelbase is worse: it looks symbolisable and is not.
+// ASCII out, because the report writer is deliberately ASCII-only.
+static int DescribeAddress(uintptr_t addr, char* out, size_t cap) {
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(addr), &mod) &&
+        mod != nullptr) {
+        char name[64] = "?";
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleFileNameW(mod, path, MAX_PATH) > 0) {
+            const wchar_t* leaf = wcsrchr(path, L'\\');
+            leaf = leaf ? leaf + 1 : path;
+            size_t i = 0;
+            for (; leaf[i] != 0 && i < sizeof(name) - 1; ++i) {
+                const wchar_t c = leaf[i];
+                name[i] = (c < 0x20 || c > 0x7E) ? '?'
+                                                 : static_cast<char>(c);
+            }
+            name[i] = 0;
+        }
+        const bool self = (mod == GetModuleHandleW(nullptr));
+        return _snprintf_s(out, cap, _TRUNCATE, "%s+0x%llX",
+                           self ? "spindle" : name,
+                           addr - reinterpret_cast<uintptr_t>(mod));
+    }
+    return _snprintf_s(out, cap, _TRUNCATE, "0x%llX (unmapped)", addr);
+}
+
+// The few exception codes that keep turning up, named, so a report reads
+// without a lookup table. 0x20474343 is "GCC " - MinGW's tag for a C++
+// exception that nothing caught.
+static const char* ExceptionCodeNote(DWORD code) {
+    switch (code) {
+        case 0xC0000005: return " (access violation)";
+        case 0x20474343: return " (unhandled C++ exception)";
+        case 0xE06D7363: return " (unhandled C++ exception, MSVC)";
+        case 0xC0000374: return " (heap corruption)";
+        case 0xC00000FD: return " (stack overflow)";
+        default:         return "";
+    }
+}
+
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_EXECUTE_HANDLER;
 
@@ -1913,22 +2204,24 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     const auto addr =
         reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
 
+    char where[128];
+    DescribeAddress(addr, where, sizeof(where));
+
     char buf[2048];
     int n = _snprintf_s(
         buf, sizeof(buf), _TRUNCATE,
         "Spindle crash report\r\n"
         "--------------------\r\n"
-        "exception code : 0x%08lX\r\n"
-        "exception addr : 0x%016llX\r\n"
-        "module base    : 0x%016llX\r\n"
-        "module offset  : 0x%llX      <- symbolise this\r\n"
+        "exception code : 0x%08lX%s\r\n"
+        "exception at   : %s\r\n"
+        "spindle base   : 0x%016llX\r\n"
         "thread id      : %lu\r\n"
         "scanning       : %s\r\n"
         "cells          : %zu\r\n",
         ep->ExceptionRecord->ExceptionCode,
-        static_cast<unsigned long long>(addr),
+        ExceptionCodeNote(ep->ExceptionRecord->ExceptionCode),
+        where,
         static_cast<unsigned long long>(base),
-        addr - base,
         GetCurrentThreadId(),
         g_app.scanning ? "yes" : "no",
         g_app.cells.size());
@@ -1937,17 +2230,18 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
         DWORD written = 0;
         WriteFile(f, buf, static_cast<DWORD>(n), &written, nullptr);
 
-        // Return addresses, same base+offset convention.
+        // Return addresses, each named against the module it belongs to.
+        // "spindle+0x..." lines symbolise against this binary; the rest say
+        // which DLL they were in, which is usually all they need to.
         void* frames[32] = {};
         const USHORT got = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
-        const char* hdr = "\r\nreturn addresses (module offsets)\r\n";
+        const char* hdr = "\r\nreturn addresses\r\n";
         WriteFile(f, hdr, static_cast<DWORD>(strlen(hdr)), &written, nullptr);
         for (USHORT i = 0; i < got; ++i) {
-            const auto fa = reinterpret_cast<uintptr_t>(frames[i]);
-            n = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                            "  [%2u] 0x%llX%s\r\n", i,
-                            fa >= base ? fa - base : fa,
-                            fa >= base ? "" : "   (outside spindle.exe)");
+            DescribeAddress(reinterpret_cast<uintptr_t>(frames[i]), where,
+                            sizeof(where));
+            n = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "  [%2u] %s\r\n", i,
+                            where);
             if (n > 0) {
                 WriteFile(f, buf, static_cast<DWORD>(n), &written, nullptr);
             }
