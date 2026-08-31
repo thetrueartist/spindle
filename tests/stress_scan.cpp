@@ -23,6 +23,14 @@
 
 using namespace spindle;
 
+// core.cpp's CSV writer defers the actual file write to the platform. The
+// stress harness never exports CSV; this exists only so core.cpp links here.
+namespace spindle {
+bool WriteTextFileUtf8(const std::wstring&, const std::wstring&) {
+    return false;
+}
+}  // namespace spindle
+
 namespace {
 
 constexpr int kMaxDepth = 512;
