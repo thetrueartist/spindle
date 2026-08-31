@@ -224,6 +224,10 @@ struct App {
     // application creates a long-lived thread.
     HANDLE                worker = nullptr;
     bool                  scanning = false;
+    // The map on screen came from the cache file and a rescan is running
+    // behind it. Cleared when the fresh tree is adopted.
+    bool                  showingCache = false;
+    uint64_t              cacheSavedMs = 0;
     // Bumped per scan. A result carrying a stale generation is discarded, so
     // a superseded scan can never overwrite the one the user is waiting on.
     std::atomic<uint64_t> scanGen{0};
@@ -406,6 +410,8 @@ static uint32_t ShadeForDepth(uint32_t base, int depth) {
 
 // ------------------------------------------------------------------ scanning
 
+static void RebuildTreemap();   // defined below; the cache path uses it early
+
 static void JoinWorker() {
     if (g_app.worker) {
         g_app.progress.cancel.store(true, std::memory_order_relaxed);
@@ -434,6 +440,15 @@ unsigned __stdcall ScanThread(void* param) {
         auto res = std::make_unique<ScanResult>(
             Scan(req->root, si.dwNumberOfProcessors, &g_app.progress));
 
+        // Cache the tree while this thread still owns it, before the post
+        // hands it to the UI thread. Cancelled or faulted scans are not
+        // saved: a truncated tree served instantly next launch would look
+        // authoritative and be wrong.
+        if (!g_app.progress.cancel.load(std::memory_order_relaxed) &&
+            !res->stats.faulted) {
+            SaveScanCache(req->root, *res);
+        }
+
         // Ownership passes to the UI thread only if the post succeeds. If the
         // window has already gone, the unique_ptr frees it on the way out.
         if (PostMessageW(req->hwnd, WM_SCAN_DONE,
@@ -452,7 +467,7 @@ unsigned __stdcall ScanThread(void* param) {
     return 0;
 }
 
-static void StartScan(int volumeIndex) {
+static void StartScan(int volumeIndex, bool useCache = true) {
     if (volumeIndex < 0 ||
         volumeIndex >= static_cast<int>(g_app.volumes.size())) {
         return;
@@ -474,6 +489,25 @@ static void StartScan(int volumeIndex) {
     g_app.fileList.clear();
     g_app.rowHits.clear();
     g_app.result.reset();
+    g_app.showingCache = false;
+
+    // A cached tree goes up immediately - no animation, that is the point -
+    // and the scan below revalidates it. Skipped after a delete, where the
+    // cache is known to describe the old state of exactly the files the user
+    // is looking at.
+    if (useCache) {
+        auto cached = std::make_unique<ScanResult>();
+        CacheMeta meta;
+        if (LoadScanCache(g_app.volumes[static_cast<size_t>(volumeIndex)].path,
+                          *cached, meta)) {
+            g_app.result = std::move(cached);
+            g_app.trail.push_back(&g_app.result->root);
+            RebuildTreemap();
+            g_app.panelDirty   = true;
+            g_app.showingCache = true;
+            g_app.cacheSavedMs = meta.savedUnixMs;
+        }
+    }
 
     g_app.progress.files.store(0);
     g_app.progress.dirs.store(0);
@@ -785,7 +819,15 @@ static void DrawSidebar(const Rect& area) {
                  Rect{area.x + layout::kPad + 11.0f, y + 1.0f,
                       rowW - 11.0f, layout::kLineSmall},
                  theme::kType);
-        DrawText(FormatSize(hit.size), g_app.fmtSmall.get(),
+        // The parent folder rides along with the size: several results can
+        // share one filename (pak00.pak in every game) and the name alone
+        // does not say which one is eating the space.
+        std::wstring detail = FormatSize(hit.size);
+        if (hit.path.size() > hit.node->name.size() + 1) {
+            detail += L"  \u00B7  " + SanitizeForDisplay(hit.path.substr(
+                          0, hit.path.size() - hit.node->name.size() - 1));
+        }
+        DrawText(detail, g_app.fmtSmall.get(),
                  Rect{area.x + layout::kPad + 11.0f, y + 15.0f,
                       rowW - 11.0f, layout::kLineSmall},
                  theme::kMute, 0.9f, true);
@@ -949,7 +991,9 @@ static void DrawCell(const Cell& c, const Rect& r, bool hovered,
 static void DrawTreemap(const Rect& area) {
     FillRect(area, theme::kInk);
 
-    if (g_app.scanning) {
+    // With a cached map on screen the rescan runs behind it; the overlay is
+    // only for the blank first scan, when there is nothing better to show.
+    if (g_app.scanning && g_app.cells.empty()) {
         const uint64_t f = g_app.progress.files.load(std::memory_order_relaxed);
         const uint64_t b = g_app.progress.bytes.load(std::memory_order_relaxed);
 
@@ -1034,6 +1078,23 @@ static void DrawTreemap(const Rect& area) {
     }
 }
 
+// How old a cached map is, in the coarsest unit that still reads as true.
+// Precision is noise here: the point is "roughly now" versus "last week".
+static std::wstring FormatAge(uint64_t savedUnixMs) {
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    const uint64_t ticks =
+        (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    const uint64_t nowMs = ticks / 10000 - 11644473600000ULL;
+    if (nowMs <= savedUnixMs) return L"just now";
+
+    const uint64_t s = (nowMs - savedUnixMs) / 1000;
+    if (s < 90) return L"just now";
+    if (s < 90 * 60) return std::to_wstring(s / 60) + L"m ago";
+    if (s < 36 * 3600) return std::to_wstring(s / 3600) + L"h ago";
+    return std::to_wstring(s / 86400) + L"d ago";
+}
+
 static void DrawStatus(const Rect& area) {
     FillRect(area, theme::kSlab, 0.7f);
     FillRect(Rect{area.x, area.y, area.w, 1.0f}, theme::kRule);
@@ -1057,6 +1118,22 @@ static void DrawStatus(const Rect& area) {
                  Rect{area.right() - 214.0f, area.y + 8.0f, 200.0f,
                       layout::kLineSmall},
                  theme::kSignal, 1.0f, true);
+        return;
+    }
+
+    // The cached map is on screen. Say so, and say that fresher data is on
+    // its way - silently presenting yesterday's numbers as current would be
+    // a lie of omission.
+    if (g_app.result && g_app.showingCache) {
+        const ScanStats& s = g_app.result->stats;
+        std::wstring line = L"cached " + FormatAge(g_app.cacheSavedMs);
+        if (g_app.scanning) line += L"  \u00B7  rescanning\u2026";
+        line += L"  \u00B7  " + FormatCount(s.fileCount) + L" files  \u00B7  " +
+                FormatSize(s.bytes);
+        DrawText(line, g_app.fmtSmall.get(),
+                 Rect{area.x + pad, area.y + 8.0f, area.w - pad * 2,
+                      layout::kLineSmall},
+                 theme::kMute, 1.0f, true);
         return;
     }
 
@@ -1395,7 +1472,9 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
         op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING;
 
         if (SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted) {
-            StartScan(g_app.selected);   // sizes are now stale; rescan
+            // Sizes are now stale; rescan - and not from the cache, which
+            // still contains the files that were just recycled.
+            StartScan(g_app.selected, false);
         }
     } else if (cmd == 4) {
         DoExport();
@@ -1682,7 +1761,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // The panel lists were dropped when the scan started; without
                 // this they stay empty (or worse, would describe the old tree)
                 // until the user next changes view.
-                g_app.panelDirty = true;
+                g_app.panelDirty   = true;
+                g_app.showingCache = false;
                 g_app.zoomFrom = g_app.mapBounds;
                 g_app.zoom.Begin(0);
                 g_app.reveal.Begin(g_app.motion ? kRevealMs : 0);
