@@ -12,7 +12,7 @@ scan take well under a second.
 
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
-make test       764 assertions under ASan, UBSan and ThreadSanitizer
+make test       771 assertions under ASan, UBSan and ThreadSanitizer
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
 make icon       regenerate spindle.ico (prints each frame's encoding)
@@ -123,9 +123,10 @@ and reads raw disk structures while elevated.
   in run-list sign extension, and a signed overflow accumulating the cluster
   delta.
 - The volume is opened `FILE_READ_DATA`, sharing read/write/delete.
-- Deletion is recycle-bin only, confirmed, and refuses anything that looks
+- Deletion is recycle-bin only, confirmed (twice for folders, No the default
+  both times), has no keyboard shortcut, and refuses anything that looks
   like a volume root. The `SHFileOperationW` buffer is built with an explicit
-  double NUL.
+  double NUL. Nothing in the program deletes without that dialog chain.
 - **No network, registry-write, process-creation or injection APIs.**
   `ShellExecuteW` is present for exactly one thing: opening Explorer at a
   path. `LoadLibraryW`/`VirtualProtect`/`CryptGenRandom` appear in the import
