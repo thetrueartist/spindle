@@ -144,7 +144,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.3.0";
+constexpr const wchar_t* kAppVersion = L"1.3.1";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -226,6 +226,9 @@ struct App {
     DupReport             dupes;
     bool                  dupesRun = false;
     Rect                  dupeButton;
+    // Separate from the scanner's, so the two never write each other's
+    // counters or cancel one another.
+    Progress              dupeProgress;
     std::vector<Rect>     panelTabs;
     std::vector<Rect>     rowHits;
     bool                  panelDirty = true;
@@ -431,6 +434,26 @@ static uint32_t ShadeForDepth(uint32_t base, int depth) {
 
 static void RebuildTreemap();   // defined below; the cache path uses it early
 
+// Everything that holds a Node* into the current tree. One function with
+// two callers - starting a scan, and adopting a finished one - because the
+// two drifted apart once already and the result was a use-after-free that
+// only showed up when a rescan landed under the pointer.
+static void DropTreeReferences() {
+    g_app.trail.clear();
+    g_app.cells.clear();
+    g_app.hoverNode  = nullptr;
+    g_app.hoverPrev  = nullptr;
+    g_app.hoverIndex = -1;
+    // The panel caches hold Node pointers too, and a paint arrives mid-scan
+    // because the progress timer forces one every frame.
+    g_app.extStats.clear();
+    g_app.fileList.clear();
+    g_app.rowHits.clear();
+    // DupFile::node likewise.
+    g_app.dupes = DupReport{};
+    g_app.dupesRun = false;
+}
+
 static void JoinWorker() {
     if (g_app.worker) {
         g_app.progress.cancel.store(true, std::memory_order_relaxed);
@@ -501,20 +524,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     // Order matters: everything that points into the old tree is dropped
     // before the tree itself is freed.
     g_app.selected  = volumeIndex;
-    g_app.trail.clear();
-    g_app.cells.clear();
-    g_app.hoverNode  = nullptr;
-    g_app.hoverIndex = -1;
-    // The panel caches too: fileList holds Node pointers into the tree that
-    // dies on the next line, and a paint arrives mid-scan (the progress
-    // timer forces one every frame), so leaving them populated is a
-    // use-after-free the first time the panel draws a row.
-    g_app.extStats.clear();
-    g_app.fileList.clear();
-    g_app.rowHits.clear();
-    // DupFile also holds Node pointers into the tree about to be freed.
-    g_app.dupes = DupReport{};
-    g_app.dupesRun = false;
+    DropTreeReferences();
     g_app.result.reset();
     g_app.showingCache = false;
 
@@ -610,10 +620,12 @@ static void RebuildTreemap() {
 // view. Deferred behind a dirty flag: these walk the whole subtree, and doing
 // that inside a paint would stall the window.
 static void RefreshPanel() {
-    g_app.panelDirty = false;
     g_app.extStats.clear();
     g_app.fileList.clear();
-    if (g_app.trail.empty()) return;
+    if (g_app.trail.empty()) {
+        g_app.panelDirty = false;
+        return;
+    }
 
     const Node& cur = *g_app.trail.back();
     switch (g_app.panel) {
@@ -632,6 +644,10 @@ static void RefreshPanel() {
             // every navigation, because finding them reads files.
             break;
     }
+    // Cleared last. Setting it first meant that if a walk above threw, the
+    // panel was left empty but marked clean, and stayed blank until the
+    // user happened to navigate.
+    g_app.panelDirty = false;
 }
 
 static void NavigateTo(const Node* node, const Rect& from) {
@@ -1455,6 +1471,23 @@ static void Render() {
 
     const D2D1_SIZE_F sz = g_app.rt->GetSize();
 
+    // BeginDraw and EndDraw must pair even when something between them
+    // throws. They did not: an allocation failure mid-frame unwound past
+    // EndDraw, and the next frame's BeginDraw then failed with
+    // D2DERR_WRONG_STATE for ever, so the window stopped updating
+    // permanently. The guard that was meant to make a dropped frame
+    // harmless was what made it terminal.
+    struct DrawScope {
+        ID2D1HwndRenderTarget* rt;
+        ~DrawScope() {
+            if (!rt) return;
+            const HRESULT hr = rt->EndDraw();
+            if (hr == static_cast<HRESULT>(D2DERR_RECREATE_TARGET)) {
+                DiscardDeviceResources();
+            }
+        }
+    } scope{g_app.rt.get()};
+
     g_app.rt->BeginDraw();
     g_app.rt->Clear(theme::Hex(theme::kInk));
 
@@ -1491,10 +1524,8 @@ static void Render() {
     DrawTreemap(map);
     DrawStatus(status);
 
-    const HRESULT hr = g_app.rt->EndDraw();
-    if (hr == static_cast<HRESULT>(D2DERR_RECREATE_TARGET)) {
-        DiscardDeviceResources();
-    }
+    // EndDraw runs in ~DrawScope, on the way out of this function by any
+    // route.
 }
 
 // ------------------------------------------------------------------ commands
@@ -1519,10 +1550,28 @@ static void CopyPathToClipboard(const std::wstring& path) {
 
 static void RevealInExplorer(const std::wstring& path) {
     if (path.empty()) return;
-    // Select the item inside its parent rather than opening it, so clicking a
-    // file lands you on the file.
-    const std::wstring arg = L"/select,\"" + path + L"\"";
-    ShellExecuteW(g_app.hwnd, L"open", L"explorer.exe", arg.c_str(), nullptr,
+
+    // Hand Explorer an item, not a command line. Building "/select,\"...\""
+    // meant a filename containing a quote could close the argument and
+    // append another - and explorer.exe opening a second item means running
+    // it, if that item is a program. Win32 forbids a quote in a name, but
+    // names here come off raw NTFS structures and out of a cache file, so
+    // "forbidden" is not the same as "cannot happen".
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0,
+                                     nullptr)) &&
+        pidl != nullptr) {
+        SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+        CoTaskMemFree(pidl);
+        return;
+    }
+    // Could not resolve it: open the containing folder rather than
+    // constructing a command line as a fallback.
+    const size_t slash = path.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return;
+    const std::wstring parent = path.substr(0, slash);
+    if (parent.find(L'"') != std::wstring::npos) return;
+    ShellExecuteW(g_app.hwnd, L"open", parent.c_str(), nullptr, nullptr,
                   SW_SHOWNORMAL);
 }
 
@@ -1733,27 +1782,35 @@ static void ShowAppMenu(POINT screenPt) {
 // processes holding the target open. Everything about this function is
 // about making that impossible to do by accident - the deletion itself is
 // three lines at the bottom.
-static void DoForceRemove(const std::wstring& path, const Node* node) {
-    if (path.empty() || !node) return;
+// Takes the node's figures by value rather than a Node*, so no caller can
+// reintroduce a pointer that outlives the tree across a modal dialog.
+static void DoForceRemove(const std::wstring& path, uint64_t nodeSize,
+                          uint32_t nodeFiles, bool nodeDir) {
+    if (path.empty()) return;
 
     // First gate: the paths that are never removable, whatever anyone
     // clicks. ForceRemove refuses these again on its own.
     if (IsProtectedSystemPath(path)) {
         MessageBoxW(g_app.hwnd,
-                    (L"Spindle will not force-remove this:\n\n" + path +
-                     L"\n\nIt is a drive root or part of Windows itself. "
-                     L"Removing it would leave the machine unbootable.")
+                    (L"Spindle will not force-remove this:\n\n" +
+                     SanitizeForDisplay(path) +
+                     L"\n\nIt is a drive root or part of Windows itself, or "
+                     L"it is spelled in a way that resolves somewhere else.")
                         .c_str(),
                     L"Spindle", MB_OK | MB_ICONERROR);
         return;
     }
 
     // Second gate: say plainly what is about to happen, with the scale.
+    // The path is sanitised: a filename carrying a right-to-left override
+    // renders as something else entirely, and this is the dialog where the
+    // user decides whether to destroy it.
     std::wstring warn =
         L"PERMANENTLY DELETE this? It does NOT go to the Recycle Bin and "
-        L"cannot be undone.\n\n" + path + L"\n\n" + FormatSize(node->size);
-    if (node->dir) {
-        warn += L" across " + FormatCount(node->files) + L" files";
+        L"cannot be undone.\n\n" + SanitizeForDisplay(path) + L"\n\n" +
+        FormatSize(nodeSize);
+    if (nodeDir) {
+        warn += L" across " + FormatCount(nodeFiles) + L" files";
     }
     if (MessageBoxW(g_app.hwnd, warn.c_str(), L"Force remove",
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
@@ -1839,6 +1896,16 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
     if (!node) return;
     const std::wstring path = CellPath(cellIndex);
 
+    // Snapshot everything the dialogs below need. TrackPopupMenu and
+    // MessageBoxW each run a modal message loop that dispatches posted
+    // messages, and WM_SCAN_DONE is posted - so a rescan landing while the
+    // menu is open frees the tree this node lives in. Reading a size out of
+    // that freed memory to fill a delete confirmation is the worst place in
+    // the program to be wrong.
+    const uint64_t nodeSize  = node->size;
+    const uint32_t nodeFiles = node->files;
+    const bool     nodeDir   = node->dir;
+
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
 
@@ -1865,21 +1932,23 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
     } else if (cmd == 2) {
         CopyPathToClipboard(path);
     } else if (cmd == 3) {
-        // Refuse anything that is not clearly below a drive root. "C:\" is
-        // four characters with the terminator; a shorter or root-equal path
-        // would hand the whole volume to the shell.
-        if (path.size() < 4) {
-            MessageBoxW(g_app.hwnd, L"That path is a drive root. Spindle will "
-                                    L"not delete a whole volume.",
+        // The same refusal the permanent path uses. The reversible option
+        // guarding less than the irreversible one was backwards: the shell
+        // canonicalises identically, and a folder recycled by mistake is
+        // still a folder gone from where it was.
+        if (IsProtectedSystemPath(path)) {
+            MessageBoxW(g_app.hwnd,
+                        L"Spindle will not recycle this. It is a drive root "
+                        L"or part of Windows itself.",
                         L"Spindle", MB_OK | MB_ICONWARNING);
             return;
         }
 
         const std::wstring prompt =
-            L"Move this to the Recycle Bin?\n\n" + path + L"\n\n" +
-            FormatSize(node->size) +
-            (node->dir ? L" across " + FormatCount(node->files) + L" files"
-                       : L"");
+            L"Move this to the Recycle Bin?\n\n" +
+            SanitizeForDisplay(path) + L"\n\n" + FormatSize(nodeSize) +
+            (nodeDir ? L" across " + FormatCount(nodeFiles) + L" files"
+                     : L"");
         if (MessageBoxW(g_app.hwnd, prompt.c_str(), L"Spindle",
                         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
             return;
@@ -1888,10 +1957,10 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
         // A folder is a recursive delete, and one Yes is too cheap for
         // that. Folders ask twice, with the scale restated and No the
         // default both times.
-        if (node->dir) {
+        if (nodeDir) {
             const std::wstring again =
-                L"That folder holds " + FormatCount(node->files) +
-                L" files (" + FormatSize(node->size) +
+                L"That folder holds " + FormatCount(nodeFiles) +
+                L" files (" + FormatSize(nodeSize) +
                 L").\n\nMove all of it to the Recycle Bin?";
             if (MessageBoxW(g_app.hwnd, again.c_str(), L"Spindle",
                             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) !=
@@ -1921,7 +1990,7 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
     } else if (cmd == 4) {
         DoExport();
     } else if (cmd == 5) {
-        DoForceRemove(path, node);
+        DoForceRemove(path, nodeSize, nodeFiles, nodeDir);
     }
 }
 
@@ -1982,13 +2051,41 @@ static void OnLeftClick(int x, int y) {
     // through the same flag a scan uses.
     if (g_app.dupeButton.w > 0.0f && g_app.dupeButton.contains(fx, fy) &&
         !g_app.trail.empty() && g_app.result) {
-        g_app.progress.cancel.store(false, std::memory_order_relaxed);
+        // Not while a scan is running. This blocks the UI thread, and
+        // sharing the scanner's Progress would have the two writing each
+        // other's counters and cancelling each other.
+        if (g_app.scanning) {
+            MessageBoxW(g_app.hwnd,
+                        L"Wait for the scan to finish first - reading every "
+                        L"candidate file while the scan is still running "
+                        L"would fight it for the disk.",
+                        L"Spindle", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
         SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-        g_app.dupes = FindDuplicates(*g_app.trail.back(),
-                                     TrailPath(g_app.trail),
-                                     kDefaultDupMinSize, &g_app.progress);
+        // Its own progress, and its own cancel flag.
+        g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
+        // Reading a whole subtree allocates; a bad_alloc escaping a window
+        // procedure unwinds through the kernel callback boundary and takes
+        // the process with it, which is the invariant this program already
+        // learned once on the scan thread.
+        try {
+            g_app.dupes = FindDuplicates(*g_app.trail.back(),
+                                         TrailPath(g_app.trail),
+                                         kDefaultDupMinSize,
+                                         &g_app.dupeProgress);
+            g_app.dupesRun = true;
+        } catch (...) {
+            g_app.dupes = DupReport{};
+            g_app.dupesRun = false;
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            MessageBoxW(g_app.hwnd,
+                        L"Ran out of memory looking for duplicates here. "
+                        L"Try a smaller folder.",
+                        L"Spindle", MB_OK | MB_ICONWARNING);
+            return;
+        }
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        g_app.dupesRun = true;
         InvalidateRect(g_app.hwnd, nullptr, FALSE);
         return;
     }
@@ -2284,13 +2381,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             if (!g_app.progress.cancel.load(std::memory_order_relaxed)) {
+                // Drop every pointer into the outgoing tree BEFORE it is
+                // freed. When a cached map is on screen the user has been
+                // hovering and clicking a tree that is about to disappear
+                // under them, so this is the ordinary path, not a race.
+                DropTreeReferences();
                 g_app.result = std::move(res);
-                g_app.trail.clear();
                 g_app.trail.push_back(&g_app.result->root);
                 RebuildTreemap();
-                // The panel lists were dropped when the scan started; without
-                // this they stay empty (or worse, would describe the old tree)
-                // until the user next changes view.
+                // The panel lists were dropped above; without this they
+                // stay empty until the user next changes view.
                 g_app.panelDirty   = true;
                 g_app.showingCache = false;
                 g_app.zoomFrom = g_app.mapBounds;

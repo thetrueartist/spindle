@@ -58,6 +58,27 @@ private:
 
 bool IsPowerOfTwo(uint32_t v) { return v != 0 && (v & (v - 1)) == 0; }
 
+// A name off the disk becomes a path component, and a path component is
+// later joined with separators and handed to the Win32 file APIs. NTFS's
+// POSIX namespace permits characters Win32 does not - a backslash, a colon,
+// a NUL - so a crafted volume could otherwise name a file "..\..\Windows"
+// and have the join produce a path pointing somewhere else entirely.
+// Rejected here, at the point the bytes arrive, rather than anywhere later.
+bool IsSafeName(const std::wstring& name) {
+    if (name.empty()) return false;
+    if (name == L"." || name == L"..") return false;
+    for (wchar_t c : name) {
+        if (c < 0x20) return false;               // NUL and other controls
+        if (c == L'\\' || c == L'/' || c == L':') return false;
+        if (c == L'*' || c == L'?' || c == L'"') return false;
+        if (c == L'<' || c == L'>' || c == L'|') return false;
+    }
+    // Win32 silently trims these from a component, so a name ending in one
+    // resolves to a different object than the one enumerated.
+    if (name.back() == L' ' || name.back() == L'.') return false;
+    return true;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------- boot sector
@@ -315,6 +336,20 @@ RecordInfo ParseRecord(const uint8_t* record, size_t len) {
                                    : (nameSpace == 0) ? 1
                                    : 2;
                     if (rank > bestNamespace) {
+                        std::wstring candidate;
+                        candidate.reserve(nameChars);
+                        for (size_t i = 0; i < nameChars; ++i) {
+                            candidate.push_back(static_cast<wchar_t>(
+                                r.U16(base + size_t{0x42} + i * 2)));
+                        }
+                        // A name that cannot be a path component is not
+                        // used, and does not displace a safe one.
+                        if (!IsSafeName(candidate)) {
+                            off += attrLen;
+                            if (off >= limit) break;
+                            continue;
+                        }
+
                         bestNamespace = rank;
                         info.parent = static_cast<uint32_t>(
                             r.U64(base) & 0x0000FFFFFFFFFFFFull);

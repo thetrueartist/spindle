@@ -659,6 +659,10 @@ DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
             break;
         }
 
+        // Names are validated where they enter (IsSafeNodeName), so f.path
+        // cannot carry a separator, colon or NUL - but the join is still
+        // done through the extended-length form, which stops Win32 from
+        // reinterpreting anything that did get through.
         std::wstring full = rootPath;
         if (!full.empty() && full.back() != L'\\') full += L'\\';
         full += f.path;
@@ -684,6 +688,40 @@ DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
                 ++rep.skippedUnread;
             }
             continue;
+        }
+
+        // Re-check on the handle, not on what the scan recorded. The scan
+        // may have been the MFT path, which cannot see cloud or reparse
+        // attributes at all, and in any case a file can become a
+        // placeholder or be swapped for a link between the scan and here.
+        // This is the only check that describes the object actually opened.
+        {
+            FILE_ATTRIBUTE_TAG_INFO tag{};
+            if (GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag,
+                                             sizeof(tag))) {
+                const DWORD deny =
+                    FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+                    FILE_ATTRIBUTE_OFFLINE;
+                if ((tag.FileAttributes & deny) != 0) {
+                    ++rep.skippedCloud;   // reading it would fetch it
+                    CloseHandle(h);
+                    continue;
+                }
+                if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                    // A symlink would have us hash whatever it points at -
+                    // an oracle for the contents of files only an elevated
+                    // process can read.
+                    ++rep.skippedUnread;
+                    CloseHandle(h);
+                    continue;
+                }
+                if ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    ++rep.skippedUnread;
+                    CloseHandle(h);
+                    continue;
+                }
+            }
         }
 
         Hasher hasher;
@@ -737,6 +775,22 @@ DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
 // checked first and re-checked per directory entry, because the recursion
 // below walks whatever the disk hands it.
 
+// The image file name of a running process, or empty if it cannot be
+// determined. This is the name the critical-process list is written in.
+static std::wstring ProcessImageName(uint32_t pid) {
+    const HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                 static_cast<DWORD>(pid));
+    if (!h) return {};
+    wchar_t buf[MAX_PATH] = {};
+    DWORD len = MAX_PATH;
+    std::wstring name;
+    if (QueryFullProcessImageNameW(h, 0, buf, &len) && len > 0) {
+        name.assign(buf, len);
+    }
+    CloseHandle(h);
+    return name;
+}
+
 std::vector<Locker> FindLockers(const std::wstring& path) {
     std::vector<Locker> out;
     if (path.empty()) return out;
@@ -765,7 +819,28 @@ std::vector<Locker> FindLockers(const std::wstring& path) {
                     Locker l;
                     l.pid  = info[i].Process.dwProcessId;
                     l.name = info[i].strAppName;
-                    l.critical = IsCriticalProcess(l.name, l.pid);
+                    l.startTime =
+                        (static_cast<uint64_t>(
+                             info[i].Process.ProcessStartTime.dwHighDateTime)
+                         << 32) |
+                        info[i].Process.ProcessStartTime.dwLowDateTime;
+
+                    // strAppName is a *display* name taken from the version
+                    // resource - lsass.exe presents as "Local Security
+                    // Authority Process", which matches nothing in a list
+                    // written as image names. Ask the process itself.
+                    l.image = ProcessImageName(l.pid);
+
+                    // The Restart Manager's own classification comes first:
+                    // it knows which processes it must not be asked to
+                    // stop, whatever they are called.
+                    l.critical =
+                        info[i].ApplicationType == RmCritical ||
+                        info[i].ApplicationType == RmService ||
+                        IsCriticalProcess(l.image, l.pid) ||
+                        IsCriticalProcess(l.name, l.pid);
+                    if (l.image.empty()) l.critical = true;   // unidentified
+                    if (l.name.empty()) l.name = l.image;
                     out.push_back(std::move(l));
                 }
             }
@@ -822,59 +897,86 @@ bool TakeOwnershipAndGrant(const std::wstring& path) {
         return false;
     }
 
-    std::vector<wchar_t> mutablePath(path.begin(), path.end());
-    mutablePath.push_back(L'\0');
+    // Everything below acts on a HANDLE, never on the path again. The
+    // path-based calls resolve reparse points, so aiming a junction at a
+    // system directory and denying delete on the junction itself was enough
+    // to have this rewrite the target's owner and permissions.
+    // FILE_FLAG_OPEN_REPARSE_POINT means we can only ever act on the link.
+    const HANDLE h = CreateFileW(
+        path.c_str(), READ_CONTROL | WRITE_OWNER | WRITE_DAC,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
 
-    if (SetNamedSecurityInfoW(mutablePath.data(), SE_FILE_OBJECT,
-                              OWNER_SECURITY_INFORMATION, admins, nullptr,
-                              nullptr, nullptr) != ERROR_SUCCESS) {
+    if (SetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                        admins, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+        CloseHandle(h);
         return false;
     }
 
     EXPLICIT_ACCESS_W ea{};
     ea.grfAccessPermissions = GENERIC_ALL;
     ea.grfAccessMode        = GRANT_ACCESS;
-    ea.grfInheritance       = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    ea.grfInheritance       = NO_INHERITANCE;
     ea.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
     ea.Trustee.TrusteeType  = TRUSTEE_IS_GROUP;
     ea.Trustee.ptstrName    = static_cast<LPWSTR>(admins);
 
+    // Merge into the existing DACL rather than replacing it. Passing a null
+    // old ACL produced a one-ACE DACL, discarding every explicit entry the
+    // object had - including DENY aces - and left it that way when the
+    // delete then failed anyway.
+    PACL oldAcl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    GetSecurityInfo(h, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                    nullptr, &oldAcl, nullptr, &sd);
+
     PACL newAcl = nullptr;
-    if (SetEntriesInAclW(1, &ea, nullptr, &newAcl) != ERROR_SUCCESS) {
-        return false;
+    bool ok = false;
+    if (SetEntriesInAclW(1, &ea, oldAcl, &newAcl) == ERROR_SUCCESS) {
+        ok = SetSecurityInfo(h, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                             nullptr, nullptr, newAcl,
+                             nullptr) == ERROR_SUCCESS;
     }
-    const DWORD rc =
-        SetNamedSecurityInfoW(mutablePath.data(), SE_FILE_OBJECT,
-                              DACL_SECURITY_INFORMATION, nullptr, nullptr,
-                              newAcl, nullptr);
     if (newAcl) LocalFree(newAcl);
-    return rc == ERROR_SUCCESS;
+    if (sd) LocalFree(sd);
+    CloseHandle(h);
+    return ok;
 }
 
 // Delete one file, escalating only as far as it has to.
-bool DeleteOneFile(const std::wstring& path, DWORD& lastError) {
+bool DeleteOneFile(const std::wstring& path, DWORD& lastError,
+                   bool isReparse) {
     if (DeleteFileW(path.c_str())) return true;
     lastError = GetLastError();
 
     if (lastError == ERROR_ACCESS_DENIED) {
         ClearBlockingAttributes(path);
         if (DeleteFileW(path.c_str())) return true;
-        TakeOwnershipAndGrant(path);
-        if (DeleteFileW(path.c_str())) return true;
+        // A link's own ACL is not why the delete failed, and escalating on
+        // one is how an attacker aims this at whatever it points to.
+        if (!isReparse) {
+            TakeOwnershipAndGrant(path);
+            if (DeleteFileW(path.c_str())) return true;
+        }
         lastError = GetLastError();
     }
     return false;
 }
 
-bool RemoveOneDirectory(const std::wstring& path, DWORD& lastError) {
+bool RemoveOneDirectory(const std::wstring& path, DWORD& lastError,
+                        bool isReparse) {
     if (RemoveDirectoryW(path.c_str())) return true;
     lastError = GetLastError();
 
     if (lastError == ERROR_ACCESS_DENIED) {
         ClearBlockingAttributes(path);
         if (RemoveDirectoryW(path.c_str())) return true;
-        TakeOwnershipAndGrant(path);
-        if (RemoveDirectoryW(path.c_str())) return true;
+        if (!isReparse) {
+            TakeOwnershipAndGrant(path);
+            if (RemoveDirectoryW(path.c_str())) return true;
+        }
         lastError = GetLastError();
     }
     return false;
@@ -901,8 +1003,25 @@ bool DeleteTreeIterative(const std::wstring& root, uint64_t& deleted,
         Frame frame = stack.back();
         stack.pop_back();
 
-        const DWORD attrs = GetFileAttributesW(frame.path.c_str());
-        if (attrs == INVALID_FILE_ATTRIBUTES) continue;   // already gone
+        // Extended-length form for every filesystem call below. It lifts
+        // the 260-character limit - the scanner uses it, so it indexes and
+        // displays paths this could not otherwise touch - and, more
+        // importantly, it disables Win32's path canonicalisation, so what
+        // is deleted is the literal name that was checked.
+        const std::wstring wide = ExtendedPath(frame.path);
+
+        const DWORD attrs = GetFileAttributesW(wide.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            const DWORD err = GetLastError();
+            // Only these two mean "already gone". Anything else is a
+            // failure, and reporting a whole tree deleted when nothing was
+            // is worse than reporting the error.
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                allOk = false;
+                lastError = err;
+            }
+            continue;
+        }
 
         const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const bool isLink = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
@@ -913,8 +1032,8 @@ bool DeleteTreeIterative(const std::wstring& root, uint64_t& deleted,
         if (!isDir || isLink) {
             DWORD err = 0;
             const bool ok = isLink && isDir
-                                ? RemoveOneDirectory(frame.path, err)
-                                : DeleteOneFile(frame.path, err);
+                                ? RemoveOneDirectory(wide, err, isLink)
+                                : DeleteOneFile(wide, err, isLink);
             if (ok) {
                 ++deleted;
             } else {
@@ -935,7 +1054,7 @@ bool DeleteTreeIterative(const std::wstring& root, uint64_t& deleted,
             stack.push_back({frame.path, true});   // remove after children
 
             WIN32_FIND_DATAW fd{};
-            const std::wstring pattern = frame.path + L"\\*";
+            const std::wstring pattern = wide + L"\\*";
             const HANDLE h = FindFirstFileExW(pattern.c_str(),
                                               FindExInfoBasic, &fd,
                                               FindExSearchNameMatch, nullptr,
@@ -959,7 +1078,7 @@ bool DeleteTreeIterative(const std::wstring& root, uint64_t& deleted,
         }
 
         DWORD err = 0;
-        if (RemoveOneDirectory(frame.path, err)) {
+        if (RemoveOneDirectory(wide, err, false)) {
             ++deleted;
         } else {
             allOk = false;
@@ -988,11 +1107,47 @@ ForceRemoveResult ForceRemove(const std::wstring& path,
                 res.remaining.push_back(l);
                 continue;   // never, whatever the user clicked
             }
-            const HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, l.pid);
+            // SYNCHRONIZE so the wait below actually waits, and
+            // QUERY_LIMITED_INFORMATION so the identity can be re-checked
+            // on the handle that is about to be killed.
+            const HANDLE h = OpenProcess(
+                PROCESS_TERMINATE | SYNCHRONIZE |
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                FALSE, l.pid);
             if (!h) {
                 res.remaining.push_back(l);
                 continue;
             }
+
+            // A PID is reused as soon as its process exits, and a dialog
+            // stood between the listing and this line. Confirm the handle
+            // still refers to the process that was listed, by creation
+            // time, before doing anything irreversible to it.
+            bool sameProcess = true;
+            FILETIME created{}, exited{}, kernel{}, user{};
+            if (GetProcessTimes(h, &created, &exited, &kernel, &user)) {
+                const uint64_t now =
+                    (static_cast<uint64_t>(created.dwHighDateTime) << 32) |
+                    created.dwLowDateTime;
+                if (l.startTime != 0 && now != l.startTime) {
+                    sameProcess = false;
+                }
+            }
+            // And re-check the image name on the handle itself rather than
+            // trusting the name recorded earlier.
+            if (sameProcess) {
+                const std::wstring image = ProcessImageName(l.pid);
+                if (image.empty() || IsCriticalProcess(image, l.pid)) {
+                    sameProcess = false;
+                }
+            }
+
+            if (!sameProcess) {
+                res.remaining.push_back(l);
+                CloseHandle(h);
+                continue;
+            }
+
             if (!TerminateProcess(h, 1)) {
                 res.remaining.push_back(l);
             } else {

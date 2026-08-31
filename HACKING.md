@@ -12,7 +12,7 @@ scan take well under a second.
 
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
-make test       797 assertions under ASan, UBSan and ThreadSanitizer
+make test       915 assertions under ASan, UBSan and ThreadSanitizer
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
 make icon       regenerate spindle.ico (prints each frame's encoding)
@@ -135,6 +135,35 @@ and reads raw disk structures while elevated.
   gates: the protected-path refusal, a permanent-deletion warning stating
   the size and file count, and a named list of the processes that would be
   ended. No is the default on every one.
+**Names off the disk are not path components until they are checked.**
+`IsSafeNodeName` refuses a backslash, a forward slash, a colon, a NUL, the
+Win32-reserved characters, `.`/`..`, and a trailing dot or space — applied in
+`ntfs.cpp` where `$FILE_NAME` is read and in `ReadRecord` where the cache is.
+NTFS's POSIX namespace permits every one of those, and the cache file is
+writable without elevation while being read with it, so a name could
+otherwise carry a separator and aim a later delete somewhere it was never
+displayed. An embedded NUL is the sharpest version: the panel draws the whole
+string, `CreateFileW` stops at the NUL, and the two are different files.
+
+**The protected-path check and the Win32 name resolver must agree.**
+`IsProtectedSystemPath` compares strings, but every caller hands the same
+string to an API that re-parses it — so any spelling Win32 resolves
+differently is a bypass. Forward slashes, `.`/`..` components, trailing dots
+or spaces (`C:\Windows ` opens `C:\Windows`), 8.3 aliases (`PROGRA~1`),
+drive-relative forms (`C:Windows`, which resolves against a current directory
+that is System32 under UAC) and embedded NULs are all refused outright rather
+than normalised. Deletion then runs on the `\\?\` form, which disables
+canonicalisation so the object deleted is the one that was checked.
+
+**Trees are bounded in depth wherever they are built.** `Node` owns its
+children by value, so the compiler's destructor recurses once per level: a
+tree deeper than the stack can unwind cannot be *freed*, and that crash is
+not catchable. The walker's `kMaxDepth` was not enough — the cache reader and
+the MFT builder both produce trees too, and both now stop at
+`kMaxTreeDepth`. The cache also caps the running total of declared children
+against the declared node count, because per-record bounds allowed a chain of
+directories to reserve gigabytes from a small file.
+
 - What force removal may never touch lives in `core.cpp`, not in the dialog:
   `IsProtectedSystemPath` (drive roots, UNC, `\Windows`, `System Volume
   Information`, `$Recycle.Bin`, `Recovery`, `Boot`, the boot files at and
@@ -143,7 +172,24 @@ and reads raw disk structures while elevated.
   smss/csrss/wininit/winlogon/services/lsass/svchost/dwm, and spindle itself).
   Both are host-tested, `ForceRemove` re-checks the path itself so no caller
   can route around the dialog, and the tree walk re-checks per directory
-  because it is following names off the disk.
+  because it is following names off the disk. The Recycle Bin path runs the
+  same refusal: the reversible option guarding less than the permanent one
+  was backwards.
+- A locking process is identified by its **image name**, never by the Restart
+  Manager's `strAppName`. That field is a display string from the version
+  resource — `lsass.exe` presents as "Local Security Authority Process" — so
+  a list written in image names matched none of the processes it existed to
+  protect. The Restart Manager's own `RmCritical`/`RmService` classification
+  is trusted first, the image name is re-read from the handle about to be
+  killed, and the process creation time is compared so a recycled PID cannot
+  redirect the kill.
+- Taking ownership acts on a **handle opened `FILE_FLAG_OPEN_REPARSE_POINT`**,
+  never on a path, and it **merges** into the existing DACL. The path-based
+  form followed junctions, so a link aimed at a system directory plus a deny
+  ACE on the link was enough to rewrite the target's owner and permissions;
+  passing a null old ACL then discarded every existing entry, DENY aces
+  included. Escalation is skipped entirely for reparse points: a link's own
+  ACL is not why a delete failed.
 - Reparse points are removed as links, never followed — the deletion walk
   inherits the scanner's rule, where breaking it would delete the target.
 - The Explorer folder-menu entry is the one registry write in the program.

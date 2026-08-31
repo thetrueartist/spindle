@@ -1415,6 +1415,80 @@ static void TestScanCache() {
     CacheMeta cm;
     CHECK(!DeserializeScan(nullptr, 0, r, cm), "null input refused");
 
+    // A hand-built cache, which is what an attacker writes: the file lives
+    // in the user's profile and is read by an elevated process. The
+    // byte-flip sweep above starts from a valid file and structurally
+    // cannot express either of these shapes.
+    {
+        // Header, then a chain of directories each owning one child. Node
+        // owns its children by value, so the compiler-generated destructor
+        // recurses - a tree deeper than the stack cannot be freed, and that
+        // crash is not catchable. Depth must be refused on the way in.
+        auto Put = [](std::vector<uint8_t>& v, uint64_t x, int bytes) {
+            for (int i = 0; i < bytes; ++i) {
+                v.push_back(static_cast<uint8_t>(x >> (i * 8)));
+            }
+        };
+        const uint64_t depth = 100000;
+        std::vector<uint8_t> deep;
+        Put(deep, 0x434E5053, 4);   // magic
+        Put(deep, 2, 4);            // version
+        Put(deep, 0, 8);            // savedUnixMs
+        Put(deep, 0, 4);            // volumeSerial
+        Put(deep, 0, 4);            // reserved
+        Put(deep, 0, 8);            // bytes
+        Put(deep, 0, 8);            // fileCount
+        Put(deep, 0, 8);            // dirCount
+        Put(deep, 0, 8);            // hardlinkFiles
+        Put(deep, 0, 8);            // hardlinkBytes
+        Put(deep, 0, 8);            // cloudFiles
+        Put(deep, 0, 8);            // cloudBytes
+        Put(deep, depth, 8);        // nodeCount
+        for (uint64_t i = 0; i < depth; ++i) {
+            Put(deep, 0, 2);                        // nameLen
+            deep.push_back(1);                      // flags: directory
+            deep.push_back(0);                      // cat
+            Put(deep, 0, 8);                        // size
+            Put(deep, 0, 4);                        // files
+            Put(deep, (i + 1 < depth) ? 1 : 0, 4);  // childCount
+        }
+        ScanResult deepOut;
+        CacheMeta deepMeta;
+        CHECK(!DeserializeScan(deep.data(), deep.size(), deepOut, deepMeta),
+              "a 100000-deep chain is refused, not built and then freed");
+    }
+    {
+        // Every directory in a chain claiming an enormous child count. Each
+        // live frame holds its parent's reserved vector, so without a
+        // running total this reserves gigabytes from a small file and the
+        // bad_alloc lands on a thread with no handler.
+        auto Put = [](std::vector<uint8_t>& v, uint64_t x, int bytes) {
+            for (int i = 0; i < bytes; ++i) {
+                v.push_back(static_cast<uint8_t>(x >> (i * 8)));
+            }
+        };
+        std::vector<uint8_t> greedy;
+        Put(greedy, 0x434E5053, 4);
+        Put(greedy, 2, 4);
+        for (int i = 0; i < 10; ++i) Put(greedy, 0, 8);   // meta + counters
+        Put(greedy, 0, 4);
+        Put(greedy, 4, 8);      // nodeCount says four...
+        for (int i = 0; i < 3; ++i) {
+            Put(greedy, 0, 2);
+            greedy.push_back(1);
+            greedy.push_back(0);
+            Put(greedy, 0, 8);
+            Put(greedy, 0, 4);
+            Put(greedy, 1000000000u, 4);   // ...each record claims a billion
+        }
+        greedy.resize(greedy.size() + 4096, 0);   // room so the per-record
+                                                  // byte bound is satisfied
+        ScanResult g;
+        CacheMeta gm;
+        CHECK(!DeserializeScan(greedy.data(), greedy.size(), g, gm),
+              "child counts exceeding the declared node total are refused");
+    }
+
     // An empty-but-valid tree: bare root, nothing else.
     ScanResult bare;
     bare.root = MakeDir(L"", {});
@@ -1769,6 +1843,49 @@ static void TestForceRemovalGuards() {
           "Program Files Backup allowed");
     CHECK(!IsProtectedSystemPath(L"\\\\?\\D:\\Media\\video.mkv"),
           "extended prefix stripped, then allowed");
+
+    // Spellings that Win32 resolves differently than a string compare reads.
+    // Each of these once reached the deletion walk pointing at something the
+    // comparisons below never saw.
+    CHECK(IsProtectedSystemPath(L"C:\\..."), "dot-run component refused");
+    CHECK(IsProtectedSystemPath(L"C:\\Windows "),
+          "trailing space refused (Win32 trims it)");
+    CHECK(IsProtectedSystemPath(L"D:\\System Volume Information "),
+          "trailing space on a decoy refused");
+    CHECK(IsProtectedSystemPath(L"C:\\Windows."), "trailing dot refused");
+    CHECK(IsProtectedSystemPath(L"C:/Windows/System32"),
+          "forward slashes refused");
+    CHECK(IsProtectedSystemPath(L"C:\\..\\..\\Windows"),
+          "parent traversal refused");
+    CHECK(IsProtectedSystemPath(L"C:\\.\\Windows"), "dot component refused");
+    CHECK(IsProtectedSystemPath(L"C:\\PROGRA~1"), "8.3 alias refused");
+    CHECK(IsProtectedSystemPath(L"D:\\SYSTEM~1"), "8.3 alias on any volume");
+    CHECK(IsProtectedSystemPath(L"C:Windows\\System32"),
+          "drive-relative refused");
+    CHECK(IsProtectedSystemPath(std::wstring(L"C:\\bootmgr\0aaa", 13)),
+          "embedded NUL refused");
+    CHECK(IsProtectedSystemPath(L"C:\\a\"b"), "embedded quote refused");
+    CHECK(IsProtectedSystemPath(L"abc"), "non-drive path refused");
+
+    // ...while ordinary paths with dots in them are still fine.
+    CHECK(!IsProtectedSystemPath(L"D:\\Games\\v1.2.3\\data.pak"),
+          "dots inside components are fine");
+    CHECK(!IsProtectedSystemPath(L"D:\\my.folder\\file.bin"),
+          "dotted folder allowed");
+
+    // Node names become path components, so a name that is not one at all
+    // must be refused where it enters.
+    CHECK(IsSafeNodeName(L"ordinary.txt"), "ordinary name accepted");
+    CHECK(IsSafeNodeName(L"with spaces and (punctuation)!"), "punctuation ok");
+    CHECK(!IsSafeNodeName(L""), "empty name refused");
+    CHECK(!IsSafeNodeName(L"."), "dot refused");
+    CHECK(!IsSafeNodeName(L".."), "dotdot refused");
+    CHECK(!IsSafeNodeName(L"..\\..\\Windows"), "separator refused");
+    CHECK(!IsSafeNodeName(L"a/b"), "forward slash refused");
+    CHECK(!IsSafeNodeName(L"name:stream"), "colon refused (ADS)");
+    CHECK(!IsSafeNodeName(std::wstring(L"boot\0evil", 9)), "NUL refused");
+    CHECK(!IsSafeNodeName(L"trailing "), "trailing space refused");
+    CHECK(!IsSafeNodeName(L"trailing."), "trailing dot refused");
 
     // Processes that must never be killed to break a lock.
     CHECK(IsCriticalProcess(L"anything.exe", 0), "pid 0 critical");

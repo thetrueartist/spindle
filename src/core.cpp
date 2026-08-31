@@ -696,7 +696,18 @@ std::vector<FileHit> FindByName(const Node& root, const std::wstring& needle,
 namespace {
 
 void CsvField(std::wstring& out, const std::wstring& raw) {
-    const std::wstring v = SanitizeForDisplay(raw);
+    std::wstring v = SanitizeForDisplay(raw);
+
+    // A field beginning =, +, - or @ is evaluated as a formula by Excel and
+    // LibreOffice, quoted or not. The point of this function is that a
+    // hostile filename cannot carry out of this program and into theirs; a
+    // spoofed glyph and an executing formula are the same boundary. The
+    // leading apostrophe is what spreadsheets read as "this is text".
+    if (!v.empty() && (v[0] == L'=' || v[0] == L'+' || v[0] == L'-' ||
+                       v[0] == L'@')) {
+        v.insert(v.begin(), L'\'');
+    }
+
     const bool needsQuote =
         v.find(L',') != std::wstring::npos ||
         v.find(L'"') != std::wstring::npos ||
@@ -859,6 +870,13 @@ bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount) {
     for (uint16_t i = 0; i < nameLen; ++i) {
         n.name.push_back(static_cast<wchar_t>(r.U16()));
     }
+    // The cache file lives in the user's profile and is writable without
+    // elevation, while this reads it elevated. A name is a path component
+    // once the tree is joined up, so one containing a separator, a colon or
+    // a NUL is a way to aim a later delete somewhere it was never shown.
+    // The root's own name is a path and is exempt; the caller overwrites it
+    // with the volume it actually asked for.
+    if (!n.name.empty() && !IsSafeNodeName(n.name)) return false;
     return true;
 }
 
@@ -944,6 +962,13 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
     uint32_t rootKids = 0;
     if (!ReadRecord(r, out.root, rootKids)) return false;
     if (!out.root.dir) return false;
+    // A valid file declares exactly nodeCount-1 children in total. Tracking
+    // the running sum caps every reserve together: without it, a chain of
+    // directories each claiming the per-record maximum reserves gigabytes
+    // from a file of a few hundred kilobytes, and the resulting bad_alloc
+    // arrives on the UI thread where nothing catches it.
+    uint64_t reserved = rootKids;
+    if (reserved >= nodeCount) return false;
 
     // Frames hold a pointer into the parent's children vector; the exact
     // reserve() below is what keeps those pointers valid while the frame is
@@ -953,8 +978,10 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
         uint32_t remaining;
     };
     std::vector<Frame> stack;
-    out.root.children.reserve(rootKids);
-    if (rootKids > 0) stack.push_back({&out.root, rootKids});
+    if (rootKids > 0) {
+        out.root.children.reserve(rootKids);
+        stack.push_back({&out.root, rootKids});
+    }
 
     uint64_t seen = 1;
     while (!stack.empty()) {
@@ -973,8 +1000,16 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
 
         top.node->children.push_back(std::move(child));
         Node& placed = top.node->children.back();
-        placed.children.reserve(kids);
-        if (kids > 0) stack.push_back({&placed, kids});
+        if (kids > 0) {
+            reserved += kids;
+            if (reserved >= nodeCount) return false;
+            // Depth is bounded because ~Node recurses: a tree deeper than
+            // the stack cannot be destroyed, and the crash would happen
+            // when the tree is released rather than when it is read.
+            if (stack.size() >= kMaxTreeDepth) return false;
+            placed.children.reserve(kids);
+            stack.push_back({&placed, kids});
+        }
     }
 
     if (seen != nodeCount) return false;
@@ -1116,7 +1151,14 @@ std::vector<DupGroup> GroupByDigest(const std::vector<DupFile>& hashed) {
             DupGroup g;
             g.size = refs[i]->size;
             // Keeping one copy is the point; the rest is what is recoverable.
-            g.wasted = refs[i]->size * (count - 1);
+            // Sizes come off a disk that may be lying, and every other size
+            // computation here saturates rather than wrapping - this one
+            // was the exception, and wrapping turns a huge total into a
+            // small one, which is the failure the rule exists to prevent.
+            const uint64_t copies = count - 1;
+            g.wasted = (copies != 0 && refs[i]->size > UINT64_MAX / copies)
+                           ? UINT64_MAX
+                           : refs[i]->size * copies;
             g.files.reserve(count);
             for (size_t k = i; k < j; ++k) g.files.push_back(*refs[k]);
             groups.push_back(std::move(g));
@@ -1264,6 +1306,13 @@ std::vector<const Node*> SortedChildren(const Node& n) {
     return out;
 }
 
+// |delta| without ever negating in the signed domain: SignedDelta clamps to
+// INT64_MIN, and -INT64_MIN is undefined behaviour.
+uint64_t Magnitude(int64_t delta) {
+    return (delta < 0) ? (~static_cast<uint64_t>(delta) + 1u)
+                       : static_cast<uint64_t>(delta);
+}
+
 int64_t SignedDelta(uint64_t before, uint64_t after) {
     // Both sides are file sizes, so the difference can exceed int64 only on
     // a volume reporting nonsense. Clamp rather than wrap.
@@ -1316,17 +1365,16 @@ DiffReport DiffTrees(const Node& before, const Node& after,
             if (c.delta >= 0) {
                 rep.grewBy = SatAdd(rep.grewBy, static_cast<uint64_t>(c.delta));
             } else {
-                rep.shrankBy = SatAdd(rep.shrankBy,
-                                      static_cast<uint64_t>(-c.delta));
+                rep.shrankBy = SatAdd(rep.shrankBy, Magnitude(c.delta));
             }
             rep.changes.push_back(std::move(c));
             continue;
         }
 
         const int64_t delta = SignedDelta(f.a->size, f.b->size);
-        const uint64_t magnitude = (delta < 0)
-                                       ? static_cast<uint64_t>(-delta)
-                                       : static_cast<uint64_t>(delta);
+        // Negated in the unsigned domain: SignedDelta clamps to INT64_MIN,
+        // and -INT64_MIN is undefined behaviour in the signed one.
+        const uint64_t magnitude = Magnitude(delta);
 
         // A file, or a directory small enough to report whole: record it and
         // stop. Descending further would list the same bytes twice.
@@ -1408,12 +1456,8 @@ DiffReport DiffTrees(const Node& before, const Node& after,
 
     std::sort(rep.changes.begin(), rep.changes.end(),
               [](const Change& x, const Change& y) {
-                  const uint64_t mx = (x.delta < 0)
-                                          ? static_cast<uint64_t>(-x.delta)
-                                          : static_cast<uint64_t>(x.delta);
-                  const uint64_t my = (y.delta < 0)
-                                          ? static_cast<uint64_t>(-y.delta)
-                                          : static_cast<uint64_t>(y.delta);
+                  const uint64_t mx = Magnitude(x.delta);
+                  const uint64_t my = Magnitude(y.delta);
                   if (mx != my) return mx > my;
                   return x.path < y.path;   // stable for equal deltas
               });
@@ -1423,6 +1467,23 @@ DiffReport DiffTrees(const Node& before, const Node& after,
 }
 
 // ----------------------------------------------------------- force removal
+
+bool IsSafeNodeName(const std::wstring& name) {
+    if (name.empty()) return false;
+    if (name == L"." || name == L"..") return false;
+    for (wchar_t c : name) {
+        // A NUL truncates the string the moment it reaches a Win32 API, so
+        // what is displayed and what is opened stop being the same thing.
+        if (c < 0x20) return false;
+        if (c == L'\\' || c == L'/' || c == L':') return false;
+        if (c == L'*' || c == L'?' || c == L'"') return false;
+        if (c == L'<' || c == L'>' || c == L'|') return false;
+    }
+    // Win32 trims these from a component, so the name enumerated and the
+    // object opened would differ.
+    if (name.back() == L' ' || name.back() == L'.') return false;
+    return true;
+}
 
 namespace {
 
@@ -1480,13 +1541,49 @@ bool IsProtectedSystemPath(const std::wstring& path) {
         p.pop_back();
     }
 
+    // Everything below compares strings, but every caller hands the same
+    // string to a Win32 API that re-parses and re-canonicalises it. Any
+    // spelling Win32 resolves differently than this function reads is a
+    // bypass, so the awkward spellings are refused outright rather than
+    // normalised - there is no requirement to delete a path written in a
+    // way that needs untangling.
+    for (wchar_t c : p) {
+        if (c == L'/') return true;    // Win32 accepts it, the compare does not
+        if (c < 0x20) return true;     // NUL truncates at the API boundary
+        if (c == L'"') return true;
+    }
+    {
+        // Reject any "." or ".." component, and any component with a
+        // trailing dot or space: Win32 trims those, so "C:\Windows " opens
+        // C:\Windows while comparing as something else entirely.
+        size_t start = 0;
+        while (start <= p.size()) {
+            const size_t sep = p.find(L'\\', start);
+            const size_t end = (sep == std::wstring::npos) ? p.size() : sep;
+            const std::wstring part = p.substr(start, end - start);
+            if (part == L"." || part == L"..") return true;
+            if (!part.empty() &&
+                (part.back() == L' ' || part.back() == L'.')) {
+                return true;
+            }
+            if (sep == std::wstring::npos) break;
+            start = sep + 1;
+        }
+    }
+    // A short name ("PROGRA~1") aliases a long one the comparisons below
+    // would not match. Refusing every component containing a tilde costs a
+    // few legitimate names and closes the whole class.
+    if (p.find(L'~') != std::wstring::npos) return true;
+
     const std::wstring lower = LowerAscii(p);
 
-    // A drive root: "C:", "C:\". Deleting one is deleting the volume.
-    if (lower.size() <= 3) {
-        return lower.size() < 2 || lower[1] == L':';
-    }
-    if (lower[1] != L':') return true;   // not a drive-letter path: refuse
+    // Only "X:\something" is ever a candidate for deletion. That refuses the
+    // drive roots ("C:", "C:\"), the drive-relative form ("C:Windows",
+    // which resolves against a current directory that is System32 for a
+    // UAC-elevated launch), and anything else that is not plainly a path on
+    // a lettered volume.
+    if (lower.size() < 4) return true;
+    if (lower[1] != L':' || lower[2] != L'\\') return true;
 
     // Tier one: the operating system itself. Nothing inside these is ever a
     // legitimate target for a disk cleaner, so they are refused at and below

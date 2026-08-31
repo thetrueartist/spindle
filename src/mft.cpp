@@ -302,7 +302,13 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     }
 
     const uint64_t recordCount = mftBytes / bi.bytesPerRecord;
-    if (recordCount == 0 || recordCount > kMaxRecords) return false;
+    // kRootRecord (5) is indexed unconditionally by the tree build below, so
+    // a table that does not contain it is not merely empty - it would read
+    // past the end of every vector sized from this count. A volume claiming
+    // a handful of records is malformed or hostile either way.
+    if (recordCount <= ntfs::kRootRecord || recordCount > kMaxRecords) {
+        return false;
+    }
 
     std::vector<Entry> entries;
     try {
@@ -312,7 +318,14 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     }
 
     NamePool pool;
-    pool.data.reserve(static_cast<size_t>(recordCount) * 12);
+    // Inside a try for the same reason `entries` is: this is hundreds of
+    // megabytes on a large volume, and failing to get it should fall back
+    // to the directory walk rather than end the scan.
+    try {
+        pool.data.reserve(static_cast<size_t>(recordCount) * 12);
+    } catch (...) {
+        return false;
+    }
 
     // ---- pass one: read the MFT and parse every record -------------------
     //
@@ -470,9 +483,13 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
 
     // Breadth-first from the root record. Recursion here would be bounded by
     // directory nesting depth, which a hostile volume controls.
-    struct Pending { uint32_t record; Node* node; };
+    // Depth travels with the frame: `Node` owns its children by value, so a
+    // tree deeper than the stack can unwind cannot be destroyed, and that
+    // crash would land when the tree is released rather than when the
+    // hostile volume was read.
+    struct Pending { uint32_t record; Node* node; uint32_t depth; };
     std::vector<Pending> queue;
-    queue.push_back(Pending{ntfs::kRootRecord, &out.root});
+    queue.push_back(Pending{ntfs::kRootRecord, &out.root, 0});
 
     // Guards against a parent cycle, which a corrupt MFT can express and
     // which would otherwise expand for ever.
@@ -506,6 +523,7 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         const uint32_t first = childStart[p.record];
         const uint32_t last  = childStart[p.record + 1];
         if (last <= first) continue;
+        if (p.depth >= kMaxTreeDepth) continue;   // stop, do not descend
 
         p.node->children.reserve(last - first);
 
@@ -540,7 +558,8 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         for (size_t i = 0; i < added.size() && i < p.node->children.size();
              ++i) {
             if (entries[added[i]].isDir) {
-                queue.push_back(Pending{added[i], &p.node->children[i]});
+                queue.push_back(
+                    Pending{added[i], &p.node->children[i], p.depth + 1});
             }
         }
     }

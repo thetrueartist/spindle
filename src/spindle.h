@@ -118,6 +118,13 @@ inline constexpr size_t   kMaxCacheBytes   = size_t{1} << 30;
 inline constexpr size_t   kMaxCacheNameLen = 4096;          // UTF-16 units
 inline constexpr uint64_t kMaxCacheNodes   = uint64_t{1} << 26;
 
+// Maximum directory nesting any tree may reach, whatever produced it. The
+// directory walker already stops here; the cache reader and the MFT builder
+// must too, because `Node` owns its children by value and so the compiler's
+// destructor recurses once per level. A tree deeper than the stack can
+// unwind cannot be freed without crashing, and nothing can catch that.
+inline constexpr size_t   kMaxTreeDepth    = 512;
+
 void SerializeScan(const ScanResult& in, const CacheMeta& meta,
                    std::vector<uint8_t>& out);
 bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
@@ -319,6 +326,14 @@ const wchar_t* ChangeKindName(ChangeKind k);
 // them the machine.
 bool IsProtectedSystemPath(const std::wstring& path);
 
+// True when `name` is usable as a single path component. Names arrive from
+// the MFT and from the cache file, and both are attacker-controlled: NTFS's
+// POSIX namespace allows a backslash or a colon, and the cache is writable
+// without elevation while being read with it. A name carrying a separator,
+// a colon or a NUL would let a later join aim a path somewhere it was never
+// displayed, so it is refused where it enters rather than where it bites.
+bool IsSafeNodeName(const std::wstring& name);
+
 // True for processes that must never be terminated to break a file lock.
 // Killing any of these is an instant bugcheck or a broken session.
 bool IsCriticalProcess(const std::wstring& exeName, uint32_t pid);
@@ -326,8 +341,13 @@ bool IsCriticalProcess(const std::wstring& exeName, uint32_t pid);
 // A process holding a file open, as reported by the Restart Manager.
 struct Locker {
     uint32_t     pid = 0;
-    std::wstring name;      // image name, e.g. "steam.exe"
-    bool         critical = false;   // IsCriticalProcess: never terminate
+    std::wstring name;      // display name, e.g. "Steam Client Bootstrapper"
+    std::wstring image;     // image file name, e.g. "steam.exe"
+    bool         critical = false;   // never terminate
+    // Creation time, as the Restart Manager reported it. A PID is reused
+    // the moment a process exits, so terminating by PID alone can hit
+    // whatever inherited the number between listing and killing.
+    uint64_t     startTime = 0;
 };
 
 // Which processes have the file or folder open. Empty when nothing does, or
