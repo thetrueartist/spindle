@@ -30,3 +30,26 @@ jobs:
           name: spindle-exe
           path: build/spindle.exe
           retention-days: 14
+
+  # Windows on ARM. llvm-mingw is the only toolchain that targets it, and it
+  # is not packaged, so CI fetches a pinned release. Marked non-blocking:
+  # nothing here can run an ARM64 binary to prove it works, so a green tick
+  # means "it compiles and links", not "it is tested".
+  cross-build-arm64:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch llvm-mingw
+        run: |
+          curl -fsSL -o llvm-mingw.tar.xz \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20250114/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64.tar.xz
+          tar -xf llvm-mingw.tar.xz
+          echo "$PWD/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Cross-compile for ARM64
+        run: make ARCH=aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindle-exe-arm64
+          path: build/spindle.exe
+          retention-days: 14

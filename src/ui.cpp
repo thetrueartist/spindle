@@ -144,7 +144,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.2.0";
+constexpr const wchar_t* kAppVersion = L"1.3.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -216,10 +216,16 @@ struct App {
     // Side panel. Every comparable tool carries these two views next to the
     // map: which kinds of file are consuming the volume, and which individual
     // files are the biggest. The treemap answers "where", these answer "what".
-    enum class Panel { Kinds, Largest, Search };
+    enum class Panel { Kinds, Largest, Search, Dupes };
     Panel                 panel = Panel::Kinds;
     std::vector<ExtStat>  extStats;
     std::vector<FileHit>  fileList;
+    // Duplicate results. Held separately from fileList because finding them
+    // reads every candidate file and must never happen just because a panel
+    // was drawn - it runs when asked, and only then.
+    DupReport             dupes;
+    bool                  dupesRun = false;
+    Rect                  dupeButton;
     std::vector<Rect>     panelTabs;
     std::vector<Rect>     rowHits;
     bool                  panelDirty = true;
@@ -506,6 +512,9 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     g_app.extStats.clear();
     g_app.fileList.clear();
     g_app.rowHits.clear();
+    // DupFile also holds Node pointers into the tree about to be freed.
+    g_app.dupes = DupReport{};
+    g_app.dupesRun = false;
     g_app.result.reset();
     g_app.showingCache = false;
 
@@ -617,6 +626,10 @@ static void RefreshPanel() {
         case App::Panel::Search:
             g_app.fileList =
                 FindMatching(cur, ParseQuery(g_app.query), 200);
+            break;
+        case App::Panel::Dupes:
+            // Nothing to refresh: duplicates are found on request, not on
+            // every navigation, because finding them reads files.
             break;
     }
 }
@@ -737,11 +750,11 @@ static void DrawSidebar(const Rect& area) {
     y += 10.0f;
 
     // --- tabs
-    const wchar_t* labels[3] = {L"Kinds", L"Largest", L"Find"};
-    const float tabW = (area.w - layout::kPad * 2.0f) / 3.0f;
+    const wchar_t* labels[4] = {L"Kinds", L"Largest", L"Find", L"Dupes"};
+    const float tabW = (area.w - layout::kPad * 2.0f) / 4.0f;
     g_app.panelTabs.clear();
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         const Rect tab{area.x + layout::kPad + tabW * static_cast<float>(i), y,
                        tabW, 24.0f};
         g_app.panelTabs.push_back(tab);
@@ -771,6 +784,77 @@ static void DrawSidebar(const Rect& area) {
 
     const float rowW = area.w - layout::kPad * 2.0f;
     g_app.rowHits.clear();
+    g_app.dupeButton = Rect{};
+
+    // --- duplicates
+    if (g_app.panel == App::Panel::Dupes) {
+        if (!g_app.dupesRun) {
+            // Deliberately not automatic. Everything else in this program
+            // reads directory entries; this reads file contents, and doing
+            // that to a whole volume because a tab was clicked would be a
+            // surprise with a real cost.
+            g_app.dupeButton = Rect{area.x + layout::kPad, y, rowW, 26.0f};
+            FillRound(g_app.dupeButton, 4.0f, theme::kSlabHi);
+            DrawText(L"Find duplicates here", g_app.fmtSmall.get(),
+                     Rect{g_app.dupeButton.x, g_app.dupeButton.y + 5.0f,
+                          rowW, layout::kLineSmall},
+                     theme::kType, 1.0f, false,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+            y += 32.0f;
+            DrawText(L"Reads the files that share a size with another. "
+                     L"Cloud files are never downloaded.",
+                     g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall * 2.0f},
+                     theme::kMute);
+            return;
+        }
+
+        std::wstring head = FormatSize(g_app.dupes.totalWasted) +
+                            L" recoverable in " +
+                            FormatCount(g_app.dupes.groups.size()) +
+                            L" sets";
+        DrawText(head, g_app.fmtSmall.get(),
+                 Rect{area.x + layout::kPad, y, rowW, layout::kLineSmall},
+                 theme::kSignal, 1.0f, true);
+        y += 20.0f;
+
+        if (g_app.dupes.skippedCloud > 0 || g_app.dupes.skippedUnread > 0) {
+            DrawText(L"skipped " +
+                         FormatCount(g_app.dupes.skippedCloud) +
+                         L" cloud, " +
+                         FormatCount(g_app.dupes.skippedUnread) +
+                         L" unreadable",
+                     g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall},
+                     theme::kMute, 0.9f, true);
+            y += 18.0f;
+        }
+
+        for (const DupGroup& g : g_app.dupes.groups) {
+            if (y + 34.0f > area.bottom() - layout::kPad) break;
+            DrawText(FormatSize(g.size) + L"  x" +
+                         FormatCount(g.files.size()) + L"  (" +
+                         FormatSize(g.wasted) + L" spare)",
+                     g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall},
+                     theme::kType);
+            y += 16.0f;
+            for (size_t i = 0; i < g.files.size() && i < 3; ++i) {
+                if (y + 16.0f > area.bottom() - layout::kPad) break;
+                DrawText(SanitizeForDisplay(g.files[i].path),
+                         g_app.fmtSmall.get(),
+                         Rect{area.x + layout::kPad + 10.0f, y,
+                              rowW - 10.0f, layout::kLineSmall},
+                         theme::kMute, 0.85f, true);
+                y += 15.0f;
+            }
+            y += 6.0f;
+        }
+        return;
+    }
 
     // --- search box
     if (g_app.panel == App::Panel::Search) {
@@ -1203,6 +1287,15 @@ static void DrawStatus(const Rect& area) {
                             FormatCount(s.dirCount) + L" folders  \u00B7  " +
                             FormatSize(s.bytes) + L"  \u00B7  " + elapsed;
         if (s.usedMft) line += L"  \u00B7  MFT";
+        // Bytes that look reclaimable and are not. Saying nothing here is
+        // how a tool promises 8 GB back from WinSxS and delivers none of it.
+        if (s.hardlinkBytes > 0) {
+            line += L"  \u00B7  " + FormatSize(s.hardlinkBytes) +
+                    L" hardlinked";
+        }
+        if (s.cloudBytes > 0) {
+            line += L"  \u00B7  " + FormatSize(s.cloudBytes) + L" in cloud";
+        }
         if (s.deniedCount > 0) {
             line += L"  \u00B7  " + FormatCount(s.deniedCount) +
                     L" unreadable";
@@ -1487,6 +1580,61 @@ static void DoExport() {
     }
 }
 
+// What changed since the cache was written. The cache holds the previous
+// finished scan, so this costs nothing but the comparison itself.
+static void ShowDiffAgainstCache() {
+    if (!g_app.result || g_app.selected < 0 ||
+        g_app.selected >= static_cast<int>(g_app.volumes.size())) {
+        MessageBoxW(g_app.hwnd, L"Scan a drive first.", L"Spindle",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring volume =
+        g_app.volumes[static_cast<size_t>(g_app.selected)].path;
+
+    ScanResult previous;
+    CacheMeta meta;
+    if (!LoadScanCache(volume, previous, meta)) {
+        MessageBoxW(g_app.hwnd,
+                    L"There is no cached scan of this drive to compare "
+                    L"against yet. Scan it once more and the comparison "
+                    L"will have something to work from.",
+                    L"Spindle", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // 1 MB floor: below that a listing is noise rather than an answer.
+    const DiffReport diff =
+        DiffTrees(previous.root, g_app.result->root, 1u << 20);
+
+    std::wstring text = L"Since the cached scan (" +
+                        FormatAge(meta.savedUnixMs) + L"):\n\n";
+    if (diff.changes.empty()) {
+        text += L"Nothing moved by more than a megabyte.";
+    } else {
+        text += L"grew " + FormatSize(diff.grewBy) + L", shrank " +
+                FormatSize(diff.shrankBy) + L"\n\n";
+        for (size_t i = 0; i < diff.changes.size() && i < 20; ++i) {
+            const Change& c = diff.changes[i];
+            const uint64_t mag = (c.delta < 0)
+                                     ? static_cast<uint64_t>(-c.delta)
+                                     : static_cast<uint64_t>(c.delta);
+            text += (c.delta < 0 ? L"  -" : L"  +");
+            text += FormatSize(mag);
+            text += L"  ";
+            text += ChangeKindName(c.kind);
+            text += L"  ";
+            text += SanitizeForDisplay(c.path.empty() ? volume : c.path);
+            text += L'\n';
+        }
+        if (diff.changes.size() > 20) {
+            text += L"\n...and " + FormatCount(diff.changes.size() - 20) +
+                    L" more.";
+        }
+    }
+    MessageBoxW(g_app.hwnd, text.c_str(), L"Since last scan", MB_OK);
+}
+
 // Everything that is not the map: about, the key list, and the only two
 // settings the program actually has. A native popup, not a dialog - the
 // same chrome budget as the rest of the interface.
@@ -1503,6 +1651,11 @@ static void ShowAppMenu(POINT screenPt) {
     AppendMenuW(menu,
                 MF_STRING | (g_app.settings.resumeOnLaunch ? MF_CHECKED : 0u),
                 4, L"Resume last drive at launch");
+    AppendMenuW(menu,
+                MF_STRING | (ShellVerbRegistered() ? MF_CHECKED : 0u), 7,
+                L"Show in Explorer's folder menu");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 8, L"Compare with the cached scan...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 5, L"Open cache folder");
     AppendMenuW(menu, MF_STRING, 6, L"Clear scan caches");
@@ -1555,6 +1708,21 @@ static void ShowAppMenu(POINT screenPt) {
         }
         case 6:
             ClearScanCaches();
+            break;
+        case 7: {
+            // The only registry write in the program, and only ever because
+            // this was ticked. Unticking removes exactly what it added.
+            const bool on = ShellVerbRegistered();
+            const bool ok = on ? UnregisterShellVerb() : RegisterShellVerb();
+            if (!ok) {
+                MessageBoxW(g_app.hwnd,
+                            L"Could not change the Explorer menu entry.",
+                            L"Spindle", MB_OK | MB_ICONWARNING);
+            }
+            break;
+        }
+        case 8:
+            ShowDiffAgainstCache();
             break;
         default:
             break;
@@ -1806,6 +1974,22 @@ static void OnLeftClick(int x, int y) {
         POINT pt{x, y};
         ClientToScreen(g_app.hwnd, &pt);
         ShowAppMenu(pt);
+        return;
+    }
+
+    // Running the duplicate hunt is an explicit act, and it blocks: it is
+    // reading files. The wait cursor is the honest signal, and Esc cancels
+    // through the same flag a scan uses.
+    if (g_app.dupeButton.w > 0.0f && g_app.dupeButton.contains(fx, fy) &&
+        !g_app.trail.empty() && g_app.result) {
+        g_app.progress.cancel.store(false, std::memory_order_relaxed);
+        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        g_app.dupes = FindDuplicates(*g_app.trail.back(),
+                                     TrailPath(g_app.trail),
+                                     kDefaultDupMinSize, &g_app.progress);
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        g_app.dupesRun = true;
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
         return;
     }
 

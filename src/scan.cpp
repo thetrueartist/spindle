@@ -1020,6 +1020,69 @@ ForceRemoveResult ForceRemove(const std::wstring& path,
 
 std::wstring CacheDirPath() { return CacheDir(); }
 
+// ----------------------------------------------------- shell integration
+//
+// HKCU\Software\Classes\Directory\shell\Spindle. Per-user, so it needs no
+// elevation and cannot affect anyone else on the machine; three keys, all
+// of which Unregister deletes.
+
+static const wchar_t* const kVerbKey =
+    L"Software\\Classes\\Directory\\shell\\Spindle";
+static const wchar_t* const kVerbCommandKey =
+    L"Software\\Classes\\Directory\\shell\\Spindle\\command";
+
+bool RegisterShellVerb() {
+    wchar_t exe[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0) return false;
+
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kVerbKey, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    const wchar_t* label = L"Scan with Spindle";
+    RegSetValueExW(key, nullptr, 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(label),
+                   static_cast<DWORD>((wcslen(label) + 1) * sizeof(wchar_t)));
+    // Explorer draws the executable's own icon beside the entry.
+    const std::wstring icon = std::wstring(exe) + L",0";
+    RegSetValueExW(key, L"Icon", 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(icon.c_str()),
+                   static_cast<DWORD>((icon.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+
+    // "%1" quoted: a folder name containing a space is otherwise delivered
+    // as several arguments, and the parser refuses more than one path.
+    const std::wstring command = L"\"" + std::wstring(exe) + L"\" \"%1\"";
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kVerbCommandKey, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    const LSTATUS rc = RegSetValueExW(
+        key, nullptr, 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(command.c_str()),
+        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
+
+bool UnregisterShellVerb() {
+    // Deepest first: a key with subkeys will not delete.
+    RegDeleteKeyW(HKEY_CURRENT_USER, kVerbCommandKey);
+    const LSTATUS rc = RegDeleteKeyW(HKEY_CURRENT_USER, kVerbKey);
+    return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+}
+
+bool ShellVerbRegistered() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kVerbCommandKey, 0, KEY_READ,
+                      &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    RegCloseKey(key);
+    return true;
+}
+
 void ClearScanCaches() {
     const std::wstring dir = CacheDir();
     if (dir.empty()) return;

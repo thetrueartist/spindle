@@ -5,9 +5,15 @@
 #   make analyze    cppcheck + clang-tidy
 #   make clean
 
-CXX_WIN  := x86_64-w64-mingw32-g++
+# ARCH selects the Windows target: x86_64 (the default) or aarch64 for
+# Windows on ARM. The aarch64 triple is only provided by llvm-mingw, which
+# is not packaged anywhere -- CI fetches a pinned release. Nothing here can
+# execute an ARM64 binary, so that build is compile-and-link only.
+ARCH     ?= x86_64
+
+CXX_WIN  := $(ARCH)-w64-mingw32-g++
 CXX_HOST := g++
-WINDRES  := x86_64-w64-mingw32-windres
+WINDRES  := $(ARCH)-w64-mingw32-windres
 
 SRC      := src/core.cpp src/ntfs.cpp src/mft.cpp src/scan.cpp src/ui.cpp
 RC       := res/spindle.rc

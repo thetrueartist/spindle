@@ -132,6 +132,15 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res);
 std::wstring CacheDirPath();
 void ClearScanCaches();
 
+// Explorer's "Scan with Spindle" on a folder's right-click menu. This is
+// the only thing in the program that writes to the registry, it is off by
+// default, and it writes under HKCU only - no elevation, nothing
+// machine-wide, and Unregister removes every key it created. Kept honest in
+// the security notes rather than quietly added.
+bool RegisterShellVerb();
+bool UnregisterShellVerb();
+bool ShellVerbRegistered();
+
 // -------------------------------------------------------------- duplicates
 //
 // Finding duplicates means reading file contents, which is the one thing the

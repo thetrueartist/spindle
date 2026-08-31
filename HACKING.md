@@ -146,7 +146,18 @@ and reads raw disk structures while elevated.
   because it is following names off the disk.
 - Reparse points are removed as links, never followed — the deletion walk
   inherits the scanner's rule, where breaking it would delete the target.
-- **No network, registry-write, process-creation or injection APIs.**
+- The Explorer folder-menu entry is the one registry write in the program.
+  It is off by default, ticked on from the menu, writes three keys under
+  `HKCU\Software\Classes\Directory\shell\Spindle` (per-user, no elevation,
+  nothing machine-wide), and unticking deletes exactly what it created. The
+  command is written with `"%1"` quoted, because a folder name with a space
+  otherwise arrives as several arguments.
+- Finding duplicates is the only thing that reads file *contents*, so it
+  never runs on its own: it is a button, not a panel refresh. Only files
+  sharing an exact size with another are opened, cloud placeholders are
+  excluded and the handle is opened `FILE_FLAG_OPEN_NO_RECALL` besides, so
+  a placeholder cannot be silently downloaded to be hashed.
+- **No network, process-creation or injection APIs.**
   `ShellExecuteW` is present for exactly one thing: opening Explorer at a
   path. `LoadLibraryW`/`VirtualProtect`/`CryptGenRandom` appear in the import
   table but are not called by any line of Spindle — they come from the MinGW
@@ -167,8 +178,10 @@ and reads raw disk structures while elevated.
 ## Known limits
 
 - Sizes are logical file length, so compressed, sparse and deduplicated files
-  read larger than their footprint. WinSxS is heavily hardlinked and its
-  apparent size is not reclaimable.
+  read larger than their footprint. Hardlinked files are counted once and
+  marked as such on the MFT path, which is where the link count is free; the
+  directory walker cannot see it without opening a handle per file, so a
+  walked scan still double-counts a hardlink.
 - Memory is roughly 90 bytes plus the filename per node — around 170 MB for a
   1.6M-file volume. A string pool and index-based tree would cut that
   substantially and is the obvious next optimisation.
