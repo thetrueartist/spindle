@@ -178,8 +178,20 @@ and reads raw disk structures while elevated.
 - Cache revalidation is a full rescan running behind the cached view, not an
   incremental diff. Reading the NTFS USN journal to patch the cached tree in
   place is the obvious next step, and needs a real volume to develop against.
-- Not implemented: duplicate detection, scan scheduling, network share
-  discovery.
+- A mapped network drive (one with a letter) is enumerated and scans like any
+  other volume, over the directory walker rather than the MFT. What is not
+  implemented is *discovery*: there is no way to browse to a UNC path like
+  `\\server\share` that has not been mapped.
+- Not implemented: duplicate detection, scan scheduling, UNC browsing,
+  cloud-storage awareness, and any export format other than CSV.
+- The binary is not code-signed, so a fresh download gets a SmartScreen
+  warning until enough people run it. Signing needs a certificate, which
+  needs a legal identity and an annual fee.
+- x86-64 only. No 32-bit build, and no ARM64 build for Windows on ARM.
+- The interface is drawn rather than composed from Win32 controls, so there
+  is no screen-reader support: no UI Automation tree, no keyboard focus
+  model beyond the search box. That is a real accessibility gap, not an
+  oversight to rediscover later.
 
 ## Conventions
 
