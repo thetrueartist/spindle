@@ -131,7 +131,8 @@ constexpr float kLegendRowH = 22.0f;
 // Must match res/spindle.rc.
 constexpr WORD IDI_APPICON = 1;
 
-constexpr UINT WM_SCAN_DONE = WM_APP + 1;
+constexpr UINT WM_SCAN_DONE  = WM_APP + 1;
+constexpr UINT WM_DUPES_DONE = WM_APP + 2;
 constexpr UINT_PTR kTimerId = 1;
 
 // Durations. Deliberately short: the job of these is to show what moved, not
@@ -144,7 +145,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.3.1";
+constexpr const wchar_t* kAppVersion = L"1.3.2";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -229,6 +230,12 @@ struct App {
     // Separate from the scanner's, so the two never write each other's
     // counters or cancel one another.
     Progress              dupeProgress;
+    // The hunt runs on its own thread: it reads every candidate file, and
+    // doing that on the UI thread froze the window and made the documented
+    // Esc-to-cancel impossible to deliver.
+    HANDLE                dupeWorker = nullptr;
+    bool                  dupeRunning = false;
+    std::atomic<uint64_t> dupeGen{0};
     std::vector<Rect>     panelTabs;
     std::vector<Rect>     rowHits;
     bool                  panelDirty = true;
@@ -454,6 +461,8 @@ static void DropTreeReferences() {
     g_app.dupesRun = false;
 }
 
+static void JoinDupeWorker();
+
 static void JoinWorker() {
     if (g_app.worker) {
         g_app.progress.cancel.store(true, std::memory_order_relaxed);
@@ -516,6 +525,45 @@ unsigned __stdcall ScanThread(void* param) {
 // Scan an explicit path. `volumeIndex` is the drive card to light up, or -1
 // when the target is not one of the enumerated volumes - a UNC share or a
 // folder handed over on the command line.
+// The duplicate hunt, off the UI thread. It is handed owned paths only -
+// every Node pointer is stripped before the request is built - so a rescan
+// replacing the tree while it runs cannot invalidate anything it holds.
+struct DupRequest {
+    std::vector<DupFile> candidates;
+    std::wstring         rootPath;
+    HWND                 hwnd = nullptr;
+    uint64_t             gen  = 0;
+};
+
+unsigned __stdcall DupeThread(void* param) {
+    std::unique_ptr<DupRequest> req(static_cast<DupRequest*>(param));
+    try {
+        auto rep = std::make_unique<DupReport>(
+            HashCandidates(std::move(req->candidates), req->rootPath,
+                           &g_app.dupeProgress));
+        if (PostMessageW(req->hwnd, WM_DUPES_DONE,
+                         static_cast<WPARAM>(req->gen),
+                         reinterpret_cast<LPARAM>(rep.get()))) {
+            static_cast<void>(rep.release());  // NOLINT
+        }
+    } catch (...) {
+        // Same contract as the scan thread: report failure rather than
+        // letting an exception escape and call std::terminate.
+        PostMessageW(req->hwnd, WM_DUPES_DONE,
+                     static_cast<WPARAM>(req->gen), 0);
+    }
+    return 0;
+}
+
+static void JoinDupeWorker() {
+    if (!g_app.dupeWorker) return;
+    g_app.dupeProgress.cancel.store(true, std::memory_order_relaxed);
+    WaitForSingleObject(g_app.dupeWorker, INFINITE);
+    CloseHandle(g_app.dupeWorker);
+    g_app.dupeWorker = nullptr;
+    g_app.dupeRunning = false;
+}
+
 static void StartScanPath(const std::wstring& root, int volumeIndex,
                           bool useCache) {
     if (root.empty()) return;
@@ -804,6 +852,31 @@ static void DrawSidebar(const Rect& area) {
 
     // --- duplicates
     if (g_app.panel == App::Panel::Dupes) {
+        if (g_app.dupeRunning) {
+            // Live counters, so a long hunt visibly progresses instead of
+            // looking like a hang - which is what it was before it moved
+            // off this thread.
+            DrawText(L"Reading candidates\u2026", g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall},
+                     theme::kSignal, 1.0f, true);
+            y += 20.0f;
+            const uint64_t nf =
+                g_app.dupeProgress.files.load(std::memory_order_relaxed);
+            const uint64_t nb =
+                g_app.dupeProgress.bytes.load(std::memory_order_relaxed);
+            DrawText(FormatCount(nf) + L" files  \u00B7  " + FormatSize(nb),
+                     g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall},
+                     theme::kMute, 1.0f, true);
+            y += 20.0f;
+            DrawText(L"Esc to stop", g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall},
+                     theme::kMute, 0.85f, true);
+            return;
+        }
         if (!g_app.dupesRun) {
             // Deliberately not automatic. Everything else in this program
             // reads directory entries; this reads file contents, and doing
@@ -830,6 +903,10 @@ static void DrawSidebar(const Rect& area) {
                             L" recoverable in " +
                             FormatCount(g_app.dupes.groups.size()) +
                             L" sets";
+        // A stopped hunt has seen only part of the tree, and presenting a
+        // partial answer as a complete one is the kind of quiet lie this
+        // program tries not to tell.
+        if (g_app.dupes.cancelled) head += L"  (stopped early)";
         DrawText(head, g_app.fmtSmall.get(),
                  Rect{area.x + layout::kPad, y, rowW, layout::kLineSmall},
                  theme::kSignal, 1.0f, true);
@@ -2051,9 +2128,7 @@ static void OnLeftClick(int x, int y) {
     // through the same flag a scan uses.
     if (g_app.dupeButton.w > 0.0f && g_app.dupeButton.contains(fx, fy) &&
         !g_app.trail.empty() && g_app.result) {
-        // Not while a scan is running. This blocks the UI thread, and
-        // sharing the scanner's Progress would have the two writing each
-        // other's counters and cancelling each other.
+        // Not while a scan is running: the two would fight for the disk.
         if (g_app.scanning) {
             MessageBoxW(g_app.hwnd,
                         L"Wait for the scan to finish first - reading every "
@@ -2062,30 +2137,48 @@ static void OnLeftClick(int x, int y) {
                         L"Spindle", MB_OK | MB_ICONINFORMATION);
             return;
         }
-        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-        // Its own progress, and its own cancel flag.
-        g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
-        // Reading a whole subtree allocates; a bad_alloc escaping a window
-        // procedure unwinds through the kernel callback boundary and takes
-        // the process with it, which is the invariant this program already
-        // learned once on the scan thread.
+        if (g_app.dupeRunning) return;   // already hunting
+
+        // Choose the candidates here, on the thread that owns the tree, and
+        // strip every Node pointer before handing the list over. What the
+        // worker receives is owned strings and sizes, so it cannot be
+        // invalidated by anything the interface does while it runs.
+        auto req = std::make_unique<DupRequest>();
         try {
-            g_app.dupes = FindDuplicates(*g_app.trail.back(),
-                                         TrailPath(g_app.trail),
-                                         kDefaultDupMinSize,
-                                         &g_app.dupeProgress);
-            g_app.dupesRun = true;
+            req->candidates =
+                DuplicateCandidates(*g_app.trail.back(), kDefaultDupMinSize);
         } catch (...) {
-            g_app.dupes = DupReport{};
-            g_app.dupesRun = false;
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             MessageBoxW(g_app.hwnd,
                         L"Ran out of memory looking for duplicates here. "
                         L"Try a smaller folder.",
                         L"Spindle", MB_OK | MB_ICONWARNING);
             return;
         }
-        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        for (DupFile& f : req->candidates) f.node = nullptr;
+        req->rootPath = TrailPath(g_app.trail);
+        req->hwnd     = g_app.hwnd;
+        req->gen      = g_app.dupeGen.fetch_add(1) + 1;
+
+        g_app.dupes = DupReport{};
+        g_app.dupesRun = false;
+        g_app.dupeProgress.files.store(0);
+        g_app.dupeProgress.bytes.store(0);
+        g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
+
+        const uintptr_t h =
+            _beginthreadex(nullptr, 0, DupeThread, req.get(), 0, nullptr);
+        if (h == 0) {
+            MessageBoxW(g_app.hwnd,
+                        L"Could not start the duplicate search: the system "
+                        L"refused a new thread.",
+                        L"Spindle", MB_OK | MB_ICONERROR);
+            return;
+        }
+        static_cast<void>(req.release());  // the thread owns it now
+        g_app.dupeWorker  = reinterpret_cast<HANDLE>(h);
+        g_app.dupeRunning = true;
+        // Repaint on the timer so the count climbs while it works.
+        SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
         InvalidateRect(g_app.hwnd, nullptr, FALSE);
         return;
     }
@@ -2343,7 +2436,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_TIMER: {
             if (wp != kTimerId) break;
-            if (g_app.scanning || g_app.zoom.Running() ||
+            if (g_app.scanning || g_app.dupeRunning || g_app.zoom.Running() ||
                 g_app.reveal.Running() || g_app.hoverFade.Running() ||
                 g_app.tabSlide.Running()) {
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -2397,6 +2490,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.zoom.Begin(0);
                 g_app.reveal.Begin(g_app.motion ? kRevealMs : 0);
                 SetTimer(hwnd, kTimerId, kFrameMs, nullptr);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_DUPES_DONE: {
+            // Adopt first, so a superseded report is freed rather than
+            // leaked, then discard it if it is not the one being awaited.
+            std::unique_ptr<DupReport> rep(
+                reinterpret_cast<DupReport*>(lp));
+
+            if (static_cast<uint64_t>(wp) != g_app.dupeGen.load()) return 0;
+
+            if (g_app.dupeWorker) {
+                WaitForSingleObject(g_app.dupeWorker, INFINITE);
+                CloseHandle(g_app.dupeWorker);
+                g_app.dupeWorker = nullptr;
+            }
+            g_app.dupeRunning = false;
+
+            if (rep) {
+                g_app.dupes = std::move(*rep);
+                g_app.dupesRun = true;
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -2515,6 +2631,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         g_app.progress.cancel.store(true,
                                                     std::memory_order_relaxed);
                     }
+                    // Reachable now that the hunt has its own thread; while
+                    // it ran on this one the key could never be dispatched.
+                    if (g_app.dupeRunning) {
+                        g_app.dupeProgress.cancel.store(
+                            true, std::memory_order_relaxed);
+                    }
                     break;
                 case VK_F5:
                     if (g_app.selected >= 0) StartScan(g_app.selected);
@@ -2534,6 +2656,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_CLOSE:
+            JoinDupeWorker();
             JoinWorker();
             DestroyWindow(hwnd);
             return 0;

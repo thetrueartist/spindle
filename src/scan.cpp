@@ -641,11 +641,10 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
 
 // -------------------------------------------------------------- duplicates
 
-DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
-                         uint64_t minSize, Progress* progress) {
+DupReport HashCandidates(std::vector<DupFile> candidates,
+                         const std::wstring& rootPath, Progress* progress) {
     DupReport rep;
 
-    std::vector<DupFile> candidates = DuplicateCandidates(root, minSize);
     std::vector<DupFile> hashed;
     hashed.reserve(candidates.size());
 
@@ -767,6 +766,15 @@ DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
         rep.totalWasted = SatAdd(rep.totalWasted, g.wasted);
     }
     return rep;
+}
+
+DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
+                         uint64_t minSize, Progress* progress) {
+    // Choosing candidates walks the tree; hashing them reads the disk. The
+    // split exists so a caller with an interface to keep alive can do the
+    // first here and the second on a worker thread.
+    return HashCandidates(DuplicateCandidates(root, minSize), rootPath,
+                          progress);
 }
 
 // ------------------------------------------------------------ force removal

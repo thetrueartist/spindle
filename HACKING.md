@@ -90,6 +90,16 @@ bounded twice over.
 **Reparse points are never traversed.** Junctions and symlinks would loop or
 double-count.
 
+**Anything that reads the disk runs off the UI thread.** The scan always
+did; the duplicate hunt did not, and a window that never pumps its message
+loop is a window Windows paints a spinning cursor over and marks Not
+Responding - including the Esc-to-cancel the panel advertised, which could
+never be delivered. Candidates are chosen on the UI thread (a tree walk,
+fast, and it owns the tree), every `Node*` is stripped from them, and only
+owned paths cross to the worker. Completion arrives as `WM_DUPES_DONE`
+carrying a generation number, so a superseded report is freed rather than
+adopted.
+
 **Nothing that holds a `Node*` may survive a tree swap.** `StartScan` clears
 the panel caches (`fileList`, `extStats`, `rowHits`) and hover state before
 `result.reset()`, and adopting a fresh tree marks the panel dirty. The

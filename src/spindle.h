@@ -240,8 +240,17 @@ inline constexpr uint64_t kDefaultDupMinSize = 1u << 20;   // 1 MB
 // here and the duplicate hunt reads the same cancel flag a scan does.
 struct Progress;
 
+// Hash an already-chosen candidate list. This is the slow half - it opens
+// and reads files - and it touches nothing but its own arguments, so it is
+// safe to run on a worker thread while the interface stays live. Candidates
+// carry owned paths and no Node pointers, so a rescan replacing the tree
+// underneath cannot invalidate anything here.
+DupReport HashCandidates(std::vector<DupFile> candidates,
+                         const std::wstring& rootPath, Progress* progress);
+
 // Run a full duplicate hunt under `root`, whose files live under
-// `rootPath`. Windows-only: this is the part that opens and reads files.
+// `rootPath`. Blocks until finished, so it belongs on a worker thread or in
+// the headless command-line path. Windows-only: it opens and reads files.
 // Opens read-only, sharing everything, never follows a cloud placeholder,
 // and stops promptly when `progress->cancel` is set.
 DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
