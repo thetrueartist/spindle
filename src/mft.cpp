@@ -169,6 +169,7 @@ struct Entry {
     uint16_t nameLen  = 0;
     bool     isDir    = false;
     bool     used     = false;
+    bool     hardlink = false;   // more than one name points at this record
     uint64_t size     = 0;
 };
 
@@ -353,6 +354,7 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     }
 
     uint64_t files = 0, dirs = 0, bytes = 0;
+    uint64_t hardlinkFiles = 0, hardlinkBytes = 0;
 
     // Declared after `vol` on purpose: destruction runs in reverse, so an
     // in-flight read is drained before the handle it targets closes.
@@ -419,12 +421,21 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
             e.isDir  = info.isDir;
             e.size   = info.isDir ? 0 : info.size;
             e.nameOff = pool.Add(info.name, e.nameLen);
+            // One record is one file however many names point at it, so the
+            // totals here are already right - this only records that the
+            // file is reachable from somewhere else too, which is what
+            // decides whether deleting it frees anything.
+            e.hardlink = !info.isDir && info.links > 1;
 
             if (info.isDir) {
                 ++dirs;
             } else {
                 ++files;
                 bytes = SatAdd(bytes, info.size);
+                if (e.hardlink) {
+                    ++hardlinkFiles;
+                    hardlinkBytes = SatAdd(hardlinkBytes, info.size);
+                }
             }
         }
 
@@ -511,6 +522,7 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
 
             const Entry& e = entries[id];
             Node child(pool.Get(e.nameOff, e.nameLen), e.isDir);
+            child.hardlink = e.hardlink;
             if (e.isDir) {
                 child.cat = Cat::Directory;
             } else {
@@ -533,8 +545,10 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         }
     }
 
-    out.stats.fileCount = files;
-    out.stats.dirCount  = dirs;
+    out.stats.fileCount     = files;
+    out.stats.dirCount      = dirs;
+    out.stats.hardlinkFiles = hardlinkFiles;
+    out.stats.hardlinkBytes = hardlinkBytes;
     out.stats.bytes     = 0;   // filled in by the caller's roll-up
     return true;
 }

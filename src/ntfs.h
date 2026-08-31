@@ -74,6 +74,10 @@ struct RecordInfo {
     bool     isExtension = false;  // continuation of another record
     uint64_t size      = 0;      // unnamed $DATA logical size
     uint32_t parent    = 0;      // parent directory's MFT index
+    // Number of directory entries pointing at this record. Above one the
+    // file exists in several places at once and deleting any single one of
+    // them frees nothing -- which is the whole of the WinSxS illusion.
+    uint16_t links     = 0;
     std::wstring name;
 };
 

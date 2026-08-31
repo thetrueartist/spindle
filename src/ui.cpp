@@ -207,6 +207,10 @@ struct App {
     std::vector<Rect>     crumbHits;
     Rect                  menuHit;   // the "···" beside the title
     Settings              settings;
+    // A path given on the command line or by a shell verb. Scanned at
+    // startup instead of the remembered drive, and the way a UNC share is
+    // reached at all, since only lettered volumes are enumerated.
+    std::wstring          startPath;
     size_t                crumbFirst = 0;   // trail index of crumbHits[0]
 
     // Side panel. Every comparable tool carries these two views next to the
@@ -480,11 +484,12 @@ unsigned __stdcall ScanThread(void* param) {
     return 0;
 }
 
-static void StartScan(int volumeIndex, bool useCache = true) {
-    if (volumeIndex < 0 ||
-        volumeIndex >= static_cast<int>(g_app.volumes.size())) {
-        return;
-    }
+// Scan an explicit path. `volumeIndex` is the drive card to light up, or -1
+// when the target is not one of the enumerated volumes - a UNC share or a
+// folder handed over on the command line.
+static void StartScanPath(const std::wstring& root, int volumeIndex,
+                          bool useCache) {
+    if (root.empty()) return;
     JoinWorker();
 
     // Order matters: everything that points into the old tree is dropped
@@ -511,8 +516,9 @@ static void StartScan(int volumeIndex, bool useCache = true) {
     if (useCache && g_app.settings.keepCaches) {
         auto cached = std::make_unique<ScanResult>();
         CacheMeta meta;
-        if (LoadScanCache(g_app.volumes[static_cast<size_t>(volumeIndex)].path,
-                          *cached, meta)) {
+        // A UNC path has no drive letter to key a cache to, so this simply
+        // misses and the ordinary scan runs.
+        if (LoadScanCache(root, *cached, meta)) {
             g_app.result = std::move(cached);
             g_app.trail.push_back(&g_app.result->root);
             RebuildTreemap();
@@ -530,7 +536,7 @@ static void StartScan(int volumeIndex, bool useCache = true) {
     g_app.scanning = true;
 
     auto req = std::make_unique<ScanRequest>();
-    req->root      = g_app.volumes[static_cast<size_t>(volumeIndex)].path;
+    req->root      = root;
     req->hwnd      = g_app.hwnd;
     req->gen       = g_app.scanGen.fetch_add(1) + 1;
     req->keepCache = g_app.settings.keepCaches;
@@ -549,6 +555,15 @@ static void StartScan(int volumeIndex, bool useCache = true) {
     g_app.worker = reinterpret_cast<HANDLE>(h);
 
     SetTimer(g_app.hwnd, kTimerId, 33, nullptr);
+}
+
+static void StartScan(int volumeIndex, bool useCache = true) {
+    if (volumeIndex < 0 ||
+        volumeIndex >= static_cast<int>(g_app.volumes.size())) {
+        return;
+    }
+    StartScanPath(g_app.volumes[static_cast<size_t>(volumeIndex)].path,
+                  volumeIndex, useCache);
 }
 
 // The layout is area-proportional, so scaling every cell by the same factor
@@ -1931,11 +1946,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.volumes  = EnumerateVolumes();
             g_app.settings = LoadSettings();
 
-            // Open where the user left off: the drive with the freshest
-            // cache comes up mapped immediately and revalidates behind the
-            // map. Only that one - auto-scanning every disk on launch would
-            // spin up hardware nobody asked about, which is exactly what
-            // this program promises not to do.
+            // An explicit target beats everything: it is what the user
+            // typed, or the folder they right-clicked.
+            if (!g_app.startPath.empty()) {
+                int match = -1;
+                for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+                    if (g_app.volumes[i].path == g_app.startPath) {
+                        match = static_cast<int>(i);
+                        break;
+                    }
+                }
+                StartScanPath(g_app.startPath, match, true);
+                return 0;
+            }
+
+            // Otherwise open where the user left off: the drive with the
+            // freshest cache comes up mapped immediately and revalidates
+            // behind the map. Only that one - auto-scanning every disk on
+            // launch would spin up hardware nobody asked about, which is
+            // exactly what this program promises not to do.
             if (g_app.settings.resumeOnLaunch && g_app.settings.keepCaches) {
                 int      best = -1;
                 FILETIME bestTime{};
@@ -2376,9 +2405,89 @@ static void OnTerminate() {
 
 // ---------------------------------------------------------------- entry point
 
+// Write a line to the console that launched us, if there was one. A GUI
+// binary has no console of its own, so --help from a prompt would otherwise
+// print into the void.
+static void ConsoleLine(const std::wstring& text) {
+    static bool attached = false;
+    if (!attached) {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+        attached = true;
+    }
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out == nullptr || out == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    const std::wstring line = text + L"\r\n";
+    WriteConsoleW(out, line.c_str(), static_cast<DWORD>(line.size()),
+                  &written, nullptr);
+}
+
+// Headless scan-and-export. No window, no cache, an exit code Task
+// Scheduler can act on - which is what makes an external scheduler a
+// complete answer rather than an excuse.
+static int RunHeadlessExport(const CommandLine& cl) {
+    SYSTEM_INFO si{};
+    GetNativeSystemInfo(&si);
+
+    Progress progress;
+    ScanResult res = Scan(cl.path, si.dwNumberOfProcessors, &progress);
+    if (res.root.size == 0 && res.stats.fileCount == 0) {
+        ConsoleLine(L"spindle: nothing scanned at " + cl.path);
+        return 1;
+    }
+
+    if (!ExportCsv(res.root, cl.path, cl.csvOut)) {
+        ConsoleLine(L"spindle: could not write " + cl.csvOut);
+        return 1;
+    }
+
+    ConsoleLine(L"spindle: " + FormatCount(res.stats.fileCount) +
+                L" files, " + FormatSize(res.stats.bytes) + L" -> " +
+                cl.csvOut);
+
+    if (cl.wantDuplicates) {
+        const DupReport dup =
+            FindDuplicates(res.root, cl.path, cl.minDup, &progress);
+        ConsoleLine(L"spindle: " + FormatCount(dup.groups.size()) +
+                    L" duplicate sets, " + FormatSize(dup.totalWasted) +
+                    L" recoverable");
+    }
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     SetUnhandledExceptionFilter(CrashHandler);
     std::set_terminate(OnTerminate);
+
+    // Command line before anything graphical is created, so the headless
+    // modes never touch Direct2D or open a window.
+    CommandLine cl;
+    {
+        int argc = 0;
+        std::vector<std::wstring> args;
+        if (LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
+            for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
+            LocalFree(argv);
+        }
+        cl = ParseCommandLine(args);
+    }
+    if (!cl.valid) {
+        ConsoleLine(L"spindle: " + cl.error);
+        ConsoleLine(CommandLineHelp());
+        return 2;
+    }
+    if (cl.mode == CommandLine::Mode::Help) {
+        ConsoleLine(CommandLineHelp());
+        return 0;
+    }
+    if (cl.mode == CommandLine::Mode::Version) {
+        ConsoleLine(std::wstring(L"spindle ") + kAppVersion);
+        return 0;
+    }
+    if (cl.mode == CommandLine::Mode::Export) {
+        return RunHeadlessExport(cl);
+    }
+    g_app.startPath = cl.path;
 
     // Per-monitor DPI v2 where available. Resolved at runtime so the binary
     // still starts on builds that predate the API.

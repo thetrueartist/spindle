@@ -759,9 +759,21 @@ bool ExportCsv(const Node& root, const std::wstring& rootPath,
 namespace {
 
 constexpr uint32_t kCacheMagic   = 0x434E5053;   // "SPNC"
-constexpr uint32_t kCacheVersion = 1;
-constexpr size_t   kCacheHeader  = 4 + 4 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
+// Version 2 added the hardlink and cloud flags, and the counts that go with
+// them. A version 1 file is refused rather than reinterpreted: the flags
+// byte used to be a plain 0/1 directory marker, and guessing wrong about it
+// would mislabel every node in the tree.
+constexpr uint32_t kCacheVersion = 2;
+constexpr size_t   kCacheHeader  =
+    4 + 4 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8;
 constexpr size_t   kCacheRecord  = 2 + 1 + 1 + 8 + 4 + 4;   // before the name
+
+// Node flags, as stored. Bit 0 was the whole byte in version 1.
+constexpr uint8_t kFlagDir       = 1u << 0;
+constexpr uint8_t kFlagHardlink  = 1u << 1;
+constexpr uint8_t kFlagCloudOnly = 1u << 2;
+constexpr uint8_t kFlagsKnown    =
+    kFlagDir | kFlagHardlink | kFlagCloudOnly;
 
 void Put16(std::vector<uint8_t>& out, uint16_t v) {
     out.push_back(static_cast<uint8_t>(v));
@@ -813,15 +825,20 @@ private:
 bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount) {
     if (!r.Has(kCacheRecord)) return false;
     const uint16_t nameLen = r.U16();
-    const uint8_t  dir     = r.U8();
+    const uint8_t  flags   = r.U8();
     const uint8_t  cat     = r.U8();
     n.size  = r.U64();
     n.files = r.U32();
     childCount = r.U32();
 
     if (nameLen > kMaxCacheNameLen) return false;
-    if (dir > 1) return false;
-    n.dir = (dir == 1);
+    if ((flags & ~kFlagsKnown) != 0) return false;   // bits we cannot mean
+    n.dir       = (flags & kFlagDir) != 0;
+    n.hardlink  = (flags & kFlagHardlink) != 0;
+    n.cloudOnly = (flags & kFlagCloudOnly) != 0;
+    // A directory is not a hardlinked file; the combination is meaningless
+    // and only arrives from a corrupt or hand-made file.
+    if (n.dir && n.hardlink) return false;
     if (!n.dir && childCount != 0) return false;
     if (childCount > r.Left() / kCacheRecord) return false;
 
@@ -863,6 +880,10 @@ void SerializeScan(const ScanResult& in, const CacheMeta& meta,
     Put64(out, in.stats.bytes);
     Put64(out, in.stats.fileCount);
     Put64(out, in.stats.dirCount);
+    Put64(out, in.stats.hardlinkFiles);
+    Put64(out, in.stats.hardlinkBytes);
+    Put64(out, in.stats.cloudFiles);
+    Put64(out, in.stats.cloudBytes);
     Put64(out, nodeCount);
 
     // Preorder, explicit stack: nesting depth comes off the disk, so this
@@ -875,7 +896,10 @@ void SerializeScan(const ScanResult& in, const CacheMeta& meta,
 
         const size_t nameLen = std::min(n->name.size(), kMaxCacheNameLen);
         Put16(out, static_cast<uint16_t>(nameLen));
-        out.push_back(n->dir ? 1 : 0);
+        out.push_back(static_cast<uint8_t>(
+            (n->dir ? kFlagDir : 0u) |
+            (n->hardlink ? kFlagHardlink : 0u) |
+            (n->cloudOnly ? kFlagCloudOnly : 0u)));
         out.push_back(static_cast<uint8_t>(n->cat));
         Put64(out, n->size);
         Put32(out, n->files);
@@ -905,9 +929,13 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
     meta.savedUnixMs  = r.U64();
     meta.volumeSerial = r.U32();
     static_cast<void>(r.U32());   // reserved
-    out.stats.bytes     = r.U64();
-    out.stats.fileCount = r.U64();
-    out.stats.dirCount  = r.U64();
+    out.stats.bytes         = r.U64();
+    out.stats.fileCount     = r.U64();
+    out.stats.dirCount      = r.U64();
+    out.stats.hardlinkFiles = r.U64();
+    out.stats.hardlinkBytes = r.U64();
+    out.stats.cloudFiles    = r.U64();
+    out.stats.cloudBytes    = r.U64();
     const uint64_t nodeCount = r.U64();
 
     if (nodeCount == 0 || nodeCount > kMaxCacheNodes) return false;
@@ -952,6 +980,446 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
     if (seen != nodeCount) return false;
     if (r.Left() != 0) return false;   // trailing bytes: not our file
     return true;
+}
+
+// ------------------------------------------------------------- duplicates
+
+// A 128-bit mixing function in the xxHash/splitmix family. Every byte
+// contributes to both lanes, and the length is folded in at the end so that
+// a file of zeros does not collide with a shorter file of zeros.
+namespace {
+
+constexpr uint64_t kHashPrime1 = 0x9E3779B185EBCA87ull;
+constexpr uint64_t kHashPrime2 = 0xC2B2AE3D27D4EB4Full;
+
+// Assembled byte by byte rather than by casting the pointer: read buffers
+// carry no alignment guarantee, and a misaligned 64-bit load is undefined
+// behaviour the sanitisers rightly complain about.
+uint64_t Load64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int k = 7; k >= 0; --k) {
+        v = (v << 8) | static_cast<uint64_t>(p[static_cast<size_t>(k)]);
+    }
+    return v;
+}
+
+}  // namespace
+
+void Hasher::Block(uint64_t v) {
+    h1_ ^= v * kHashPrime1;
+    h1_ = (h1_ << 31) | (h1_ >> 33);
+    h1_ *= kHashPrime2;
+
+    h2_ += v ^ (h2_ >> 29);
+    h2_ *= kHashPrime1;
+}
+
+void Hasher::Update(const uint8_t* data, size_t len) {
+    if (data == nullptr || len == 0) return;
+    len_ += len;
+
+    size_t i = 0;
+    // Finish the block the previous call left half-full before anything
+    // else, so block boundaries follow the file and not the read size.
+    if (tailLen_ > 0) {
+        while (tailLen_ < 8 && i < len) tail_[tailLen_++] = data[i++];
+        if (tailLen_ < 8) return;   // still not a whole block
+        Block(Load64(tail_));
+        tailLen_ = 0;
+    }
+    for (; i + 8 <= len; i += 8) Block(Load64(data + i));
+    while (i < len) tail_[tailLen_++] = data[i++];
+}
+
+Digest Hasher::Finish() const {
+    uint64_t a = h1_;
+    uint64_t b = h2_;
+
+    // Whatever did not fill a final block. Folded here rather than in
+    // Update so that Finish stays const and repeatable.
+    for (size_t i = 0; i < tailLen_; ++i) {
+        a ^= static_cast<uint64_t>(tail_[i]) + 0x9E3779B9ull;
+        a *= kHashPrime2;
+        b = (b ^ static_cast<uint64_t>(tail_[i])) * kHashPrime1;
+    }
+
+    // Length last, so a file of zeros cannot collide with a shorter one.
+    a ^= len_;
+    b ^= len_ * 0x9E3779B97F4A7C15ull;
+
+    // Final avalanche, so a one-byte difference reaches every output bit.
+    a ^= a >> 33; a *= 0xFF51AFD7ED558CCDull; a ^= a >> 33;
+    b ^= b >> 33; b *= 0xC4CEB9FE1A85EC53ull; b ^= b >> 33;
+    a += b;
+    b ^= a >> 17;
+    return Digest{a, b};
+}
+
+std::vector<DupFile> DuplicateCandidates(const Node& root, uint64_t minSize) {
+    // Collect every eligible file with its path, then keep only those whose
+    // size is shared. Two files of different lengths cannot be identical, so
+    // this is exact - it discards nothing that could have matched.
+    std::vector<DupFile> all;
+    ForEachNodeWithPath(root, [&](const Node& n, const std::wstring& prefix) {
+        if (n.dir) return;
+        if (n.size < minSize) return;
+        // A cloud placeholder would have to be downloaded to be read, and a
+        // hardlink is already the same bytes as its twin - calling either a
+        // duplicate would be a lie that costs the user bandwidth or data.
+        if (n.cloudOnly || n.hardlink) return;
+
+        DupFile f;
+        f.node = &n;
+        f.path = JoinRel(prefix, n.name);
+        f.size = n.size;
+        all.push_back(std::move(f));
+    });
+
+    std::vector<uint64_t> sizes;
+    sizes.reserve(all.size());
+    for (const DupFile& f : all) sizes.push_back(f.size);
+    std::sort(sizes.begin(), sizes.end());
+
+    std::vector<DupFile> out;
+    out.reserve(all.size());
+    for (DupFile& f : all) {
+        // A size appearing once in the whole subtree cannot be a duplicate.
+        const auto lo = std::lower_bound(sizes.begin(), sizes.end(), f.size);
+        const auto hi = std::upper_bound(sizes.begin(), sizes.end(), f.size);
+        if (hi - lo >= 2) out.push_back(std::move(f));
+    }
+    return out;
+}
+
+std::vector<DupGroup> GroupByDigest(const std::vector<DupFile>& hashed) {
+    // Sort by (size, digest) so identical files land next to each other.
+    std::vector<const DupFile*> refs;
+    refs.reserve(hashed.size());
+    for (const DupFile& f : hashed) refs.push_back(&f);
+
+    std::sort(refs.begin(), refs.end(),
+              [](const DupFile* a, const DupFile* b) {
+                  if (a->size != b->size) return a->size < b->size;
+                  return a->digest < b->digest;
+              });
+
+    std::vector<DupGroup> groups;
+    size_t i = 0;
+    while (i < refs.size()) {
+        size_t j = i + 1;
+        while (j < refs.size() && refs[j]->size == refs[i]->size &&
+               refs[j]->digest == refs[i]->digest) {
+            ++j;
+        }
+        const size_t count = j - i;
+        if (count >= 2) {
+            DupGroup g;
+            g.size = refs[i]->size;
+            // Keeping one copy is the point; the rest is what is recoverable.
+            g.wasted = refs[i]->size * (count - 1);
+            g.files.reserve(count);
+            for (size_t k = i; k < j; ++k) g.files.push_back(*refs[k]);
+            groups.push_back(std::move(g));
+        }
+        i = j;
+    }
+
+    // Biggest recoverable saving first: that is the order the question is
+    // actually asked in.
+    std::sort(groups.begin(), groups.end(),
+              [](const DupGroup& a, const DupGroup& b) {
+                  return a.wasted > b.wasted;
+              });
+    return groups;
+}
+
+// ------------------------------------------------------------ command line
+
+const wchar_t* CommandLineHelp() {
+    return
+        L"spindle.exe [options] [path]\n"
+        L"\n"
+        L"  path                  volume, folder or \\\\server\\share to open\n"
+        L"  --csv <file>          scan, write CSV, exit (no window)\n"
+        L"  --duplicates [bytes]  include duplicates, minimum size\n"
+        L"  --version             print the version and exit\n"
+        L"  --help                this text\n"
+        L"\n"
+        L"With --csv nothing is shown and the exit code is 0 on success, 1\n"
+        L"on failure, so Task Scheduler can run it on whatever schedule you\n"
+        L"like rather than Spindle keeping a service alive to do it.\n";
+}
+
+CommandLine ParseCommandLine(const std::vector<std::wstring>& args) {
+    CommandLine cl;
+
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::wstring& a = args[i];
+        if (a.empty()) continue;
+
+        // Options are long-form only. A single dash is how a path starting
+        // with a dash would be mistaken for a flag, so it is not accepted.
+        if (a.size() > 2 && a[0] == L'-' && a[1] == L'-') {
+            const std::wstring flag = a.substr(2);
+            if (flag == L"help") {
+                cl.mode = CommandLine::Mode::Help;
+                return cl;
+            }
+            if (flag == L"version") {
+                cl.mode = CommandLine::Mode::Version;
+                return cl;
+            }
+            if (flag == L"csv") {
+                if (i + 1 >= args.size() || args[i + 1].empty()) {
+                    cl.valid = false;
+                    cl.error = L"--csv needs a file to write to";
+                    return cl;
+                }
+                cl.csvOut = args[++i];
+                cl.mode   = CommandLine::Mode::Export;
+                continue;
+            }
+            if (flag == L"duplicates") {
+                cl.wantDuplicates = true;
+                cl.minDup = kDefaultDupMinSize;
+                // The size is optional; only consume the next argument if it
+                // is actually a number, or "--duplicates C:\" would eat the
+                // path.
+                if (i + 1 < args.size() && !args[i + 1].empty()) {
+                    const std::wstring& n = args[i + 1];
+                    bool allDigits = true;
+                    for (wchar_t c : n) {
+                        if (c < L'0' || c > L'9') { allDigits = false; break; }
+                    }
+                    if (allDigits) {
+                        uint64_t v = 0;
+                        bool overflow = false;
+                        for (wchar_t c : n) {
+                            const uint64_t d =
+                                static_cast<uint64_t>(c - L'0');
+                            if (v > (UINT64_MAX - d) / 10) {
+                                overflow = true;
+                                break;
+                            }
+                            v = v * 10 + d;
+                        }
+                        if (!overflow) cl.minDup = v;
+                        ++i;
+                    }
+                }
+                continue;
+            }
+            cl.valid = false;
+            cl.error = L"unknown option: " + a;
+            return cl;
+        }
+
+        // Anything else beginning with a dash is a mistyped flag, not a
+        // path. Silently scanning a volume because "-csv" looked like a
+        // filename is the kind of surprise this refuses to provide; a file
+        // genuinely named that way can be reached as ".\-name".
+        if (a[0] == L'-') {
+            cl.valid = false;
+            cl.error = L"unknown option: " + a;
+            return cl;
+        }
+
+        if (!cl.path.empty()) {
+            cl.valid = false;
+            cl.error = L"more than one path given";
+            return cl;
+        }
+        cl.path = a;
+    }
+
+    if (cl.mode == CommandLine::Mode::Export && cl.path.empty()) {
+        cl.valid = false;
+        cl.error = L"--csv needs a path to scan";
+    }
+    return cl;
+}
+
+// -------------------------------------------------------------- comparison
+
+const wchar_t* ChangeKindName(ChangeKind k) {
+    switch (k) {
+        case ChangeKind::Added:   return L"added";
+        case ChangeKind::Removed: return L"removed";
+        case ChangeKind::Grown:   return L"grown";
+        case ChangeKind::Shrunk:  return L"shrunk";
+    }
+    return L"changed";
+}
+
+namespace {
+
+// Children by name, for pairing two directories. Built per directory rather
+// than once for the whole tree: only the levels actually reached get one.
+std::vector<const Node*> SortedChildren(const Node& n) {
+    std::vector<const Node*> out;
+    out.reserve(n.children.size());
+    for (const Node& c : n.children) out.push_back(&c);
+    std::sort(out.begin(), out.end(),
+              [](const Node* a, const Node* b) { return a->name < b->name; });
+    return out;
+}
+
+int64_t SignedDelta(uint64_t before, uint64_t after) {
+    // Both sides are file sizes, so the difference can exceed int64 only on
+    // a volume reporting nonsense. Clamp rather than wrap.
+    if (after >= before) {
+        const uint64_t d = after - before;
+        return (d > static_cast<uint64_t>(INT64_MAX))
+                   ? INT64_MAX : static_cast<int64_t>(d);
+    }
+    const uint64_t d = before - after;
+    return (d > static_cast<uint64_t>(INT64_MAX))
+               ? INT64_MIN : -static_cast<int64_t>(d);
+}
+
+}  // namespace
+
+DiffReport DiffTrees(const Node& before, const Node& after,
+                     uint64_t minDelta) {
+    DiffReport rep;
+
+    // Iterative, like every other tree walk here: nesting depth comes off
+    // the disk and a deep pair of trees must not blow the stack.
+    struct Frame {
+        const Node*  a;      // in `before`, may be null
+        const Node*  b;      // in `after`, may be null
+        std::wstring path;
+    };
+    std::vector<Frame> stack;
+    stack.push_back({&before, &after, std::wstring()});
+
+    constexpr size_t kMaxPending = 1u << 20;
+
+    while (!stack.empty()) {
+        const Frame f = stack.back();
+        stack.pop_back();
+
+        // A whole subtree that appeared or vanished: report it at its root
+        // and do not descend. Listing every file inside a deleted folder
+        // answers a question nobody asked.
+        if (f.a == nullptr || f.b == nullptr) {
+            const Node* n = (f.a != nullptr) ? f.a : f.b;
+            if (n->size < minDelta) continue;
+            Change c;
+            c.kind   = (f.a == nullptr) ? ChangeKind::Added
+                                        : ChangeKind::Removed;
+            c.path   = f.path;
+            c.dir    = n->dir;
+            c.before = (f.a != nullptr) ? n->size : 0;
+            c.after  = (f.b != nullptr) ? n->size : 0;
+            c.delta  = SignedDelta(c.before, c.after);
+            if (c.delta >= 0) {
+                rep.grewBy = SatAdd(rep.grewBy, static_cast<uint64_t>(c.delta));
+            } else {
+                rep.shrankBy = SatAdd(rep.shrankBy,
+                                      static_cast<uint64_t>(-c.delta));
+            }
+            rep.changes.push_back(std::move(c));
+            continue;
+        }
+
+        const int64_t delta = SignedDelta(f.a->size, f.b->size);
+        const uint64_t magnitude = (delta < 0)
+                                       ? static_cast<uint64_t>(-delta)
+                                       : static_cast<uint64_t>(delta);
+
+        // A file, or a directory small enough to report whole: record it and
+        // stop. Descending further would list the same bytes twice.
+        const bool bothDirs = f.a->dir && f.b->dir;
+        if (!bothDirs) {
+            if (magnitude >= minDelta && magnitude > 0) {
+                Change c;
+                c.kind   = (delta >= 0) ? ChangeKind::Grown
+                                        : ChangeKind::Shrunk;
+                c.path   = f.path;
+                c.dir    = f.b->dir;
+                c.before = f.a->size;
+                c.after  = f.b->size;
+                c.delta  = delta;
+                if (delta >= 0) {
+                    rep.grewBy = SatAdd(rep.grewBy, magnitude);
+                } else {
+                    rep.shrankBy = SatAdd(rep.shrankBy, magnitude);
+                }
+                rep.changes.push_back(std::move(c));
+            }
+            continue;
+        }
+
+        // Both are directories. Pair the children by name; anything only on
+        // one side is an addition or a removal.
+        const std::vector<const Node*> ca = SortedChildren(*f.a);
+        const std::vector<const Node*> cb = SortedChildren(*f.b);
+
+        size_t i = 0, j = 0;
+        bool descended = false;
+        while (i < ca.size() || j < cb.size()) {
+            if (stack.size() >= kMaxPending) break;
+
+            const bool takeA =
+                (j >= cb.size()) ||
+                (i < ca.size() && ca[i]->name < cb[j]->name);
+            const bool takeB =
+                (i >= ca.size()) ||
+                (j < cb.size() && cb[j]->name < ca[i]->name);
+
+            std::wstring childPath;
+            if (takeA) {
+                childPath = JoinRel(f.path, ca[i]->name);
+                stack.push_back({ca[i], nullptr, std::move(childPath)});
+                ++i;
+            } else if (takeB) {
+                childPath = JoinRel(f.path, cb[j]->name);
+                stack.push_back({nullptr, cb[j], std::move(childPath)});
+                ++j;
+            } else {
+                childPath = JoinRel(f.path, ca[i]->name);
+                stack.push_back({ca[i], cb[j], std::move(childPath)});
+                ++i;
+                ++j;
+            }
+            descended = true;
+        }
+
+        // A directory whose own total moved but which has no children to
+        // explain it - an empty pair, or a truncated walk - is still worth
+        // one line rather than vanishing from the report.
+        if (!descended && magnitude >= minDelta && magnitude > 0) {
+            Change c;
+            c.kind   = (delta >= 0) ? ChangeKind::Grown : ChangeKind::Shrunk;
+            c.path   = f.path;
+            c.dir    = true;
+            c.before = f.a->size;
+            c.after  = f.b->size;
+            c.delta  = delta;
+            if (delta >= 0) {
+                rep.grewBy = SatAdd(rep.grewBy, magnitude);
+            } else {
+                rep.shrankBy = SatAdd(rep.shrankBy, magnitude);
+            }
+            rep.changes.push_back(std::move(c));
+        }
+    }
+
+    std::sort(rep.changes.begin(), rep.changes.end(),
+              [](const Change& x, const Change& y) {
+                  const uint64_t mx = (x.delta < 0)
+                                          ? static_cast<uint64_t>(-x.delta)
+                                          : static_cast<uint64_t>(x.delta);
+                  const uint64_t my = (y.delta < 0)
+                                          ? static_cast<uint64_t>(-y.delta)
+                                          : static_cast<uint64_t>(y.delta);
+                  if (mx != my) return mx > my;
+                  return x.path < y.path;   // stable for equal deltas
+              });
+
+    rep.netDelta = SignedDelta(before.size, after.size);
+    return rep;
 }
 
 // ----------------------------------------------------------- force removal

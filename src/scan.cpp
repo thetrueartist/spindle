@@ -72,6 +72,8 @@ struct Shared {
     std::atomic<uint64_t>     dirCount{0};
     std::atomic<uint64_t>     fileCount{0};
     std::atomic<uint64_t>     byteCount{0};
+    std::atomic<uint64_t>     cloudFiles{0};
+    std::atomic<uint64_t>     cloudBytes{0};
     // Set if a worker aborted on an exception, so the caller can say so
     // rather than silently returning a truncated tree.
     std::atomic<bool>         faulted{false};
@@ -121,12 +123,15 @@ void ScanOne(const Task& task, Shared& sh) {
         std::wstring name;
         uint64_t     size = 0;
         bool         dir  = false;
+        bool         cloud = false;
     };
     std::vector<Entry> entries;
     entries.reserve(64);
 
     uint64_t localFiles = 0;
     uint64_t localBytes = 0;
+    uint64_t localCloudFiles = 0;
+    uint64_t localCloudBytes = 0;
 
     do {
         const wchar_t* n = fd.cFileName;
@@ -147,11 +152,23 @@ void ScanOne(const Task& task, Shared& sh) {
         Entry e;
         e.name = n;
         e.dir  = isDir;
+        // A cloud placeholder reports a full size but is not stored here.
+        // Recognised from the attributes alone - reading one would make
+        // Windows fetch the whole file over the network, which is the
+        // rudest thing a disk usage tool could do.
+        e.cloud = (fd.dwFileAttributes &
+                   (FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+                    FILE_ATTRIBUTE_OFFLINE)) != 0;
         if (!isDir) {
             e.size = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) |
                      static_cast<uint64_t>(fd.nFileSizeLow);
             localBytes = SatAdd(localBytes, e.size);
             ++localFiles;
+            if (e.cloud) {
+                localCloudBytes = SatAdd(localCloudBytes, e.size);
+                ++localCloudFiles;
+            }
         }
         entries.push_back(std::move(e));
     } while (FindNextFileW(h, &fd));
@@ -169,6 +186,7 @@ void ScanOne(const Task& task, Shared& sh) {
 
     for (Entry& e : entries) {
         Node child(std::move(e.name), e.dir);
+        child.cloudOnly = e.cloud;
         if (e.dir) {
             child.cat = Cat::Directory;
         } else {
@@ -189,6 +207,10 @@ void ScanOne(const Task& task, Shared& sh) {
 
     sh.fileCount.fetch_add(localFiles, std::memory_order_relaxed);
     sh.byteCount.fetch_add(localBytes, std::memory_order_relaxed);
+    if (localCloudFiles > 0) {
+        sh.cloudFiles.fetch_add(localCloudFiles, std::memory_order_relaxed);
+        sh.cloudBytes.fetch_add(localCloudBytes, std::memory_order_relaxed);
+    }
     sh.dirCount.fetch_add(1, std::memory_order_relaxed);
 
     if (sh.progress) {
@@ -378,6 +400,8 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
     result.stats.dirCount    = sh.dirCount.load();
     result.stats.deniedCount = sh.deniedCount.load();
     result.stats.faulted     = sh.faulted.load();
+    result.stats.cloudFiles  = sh.cloudFiles.load();
+    result.stats.cloudBytes  = sh.cloudBytes.load();
 
     {
         Held h(sh.deniedLock);
@@ -613,6 +637,98 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
         return false;
     }
     return true;
+}
+
+// -------------------------------------------------------------- duplicates
+
+DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
+                         uint64_t minSize, Progress* progress) {
+    DupReport rep;
+
+    std::vector<DupFile> candidates = DuplicateCandidates(root, minSize);
+    std::vector<DupFile> hashed;
+    hashed.reserve(candidates.size());
+
+    // One reusable buffer. 1 MB keeps the read count low on a spinning disk
+    // without the allocation itself being a spike.
+    std::vector<uint8_t> buf(1u << 20);
+
+    for (DupFile& f : candidates) {
+        if (progress && progress->cancel.load(std::memory_order_relaxed)) {
+            rep.cancelled = true;
+            break;
+        }
+
+        std::wstring full = rootPath;
+        if (!full.empty() && full.back() != L'\\') full += L'\\';
+        full += f.path;
+        const std::wstring extended = ExtendedPath(full);
+
+        // FILE_FLAG_OPEN_NO_RECALL is the belt to the placeholder check's
+        // braces: if a file became a cloud placeholder between the scan and
+        // now, this refuses to pull it down rather than silently costing
+        // the user a multi-gigabyte download.
+        const HANDLE h = CreateFileW(
+            extended.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            const DWORD err = GetLastError();
+            // A placeholder that would need fetching reports this rather
+            // than downloading itself, which is exactly what was wanted.
+            if (err == ERROR_CLOUD_FILE_ACCESS_DENIED ||
+                err == ERROR_NOT_READY) {
+                ++rep.skippedCloud;
+            } else {
+                ++rep.skippedUnread;
+            }
+            continue;
+        }
+
+        Hasher hasher;
+        bool ok = true;
+        uint64_t read = 0;
+        for (;;) {
+            if (progress && progress->cancel.load(std::memory_order_relaxed)) {
+                ok = false;
+                rep.cancelled = true;
+                break;
+            }
+            DWORD got = 0;
+            if (!ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got,
+                          nullptr)) {
+                ok = false;
+                break;
+            }
+            if (got == 0) break;   // end of file
+            hasher.Update(buf.data(), got);
+            read += got;
+        }
+        CloseHandle(h);
+
+        if (!ok) {
+            if (!rep.cancelled) ++rep.skippedUnread;
+            if (rep.cancelled) break;
+            continue;
+        }
+
+        f.digest = hasher.Finish();
+        rep.bytesHashed = SatAdd(rep.bytesHashed, read);
+        ++rep.filesHashed;
+        hashed.push_back(f);
+
+        if (progress) {
+            progress->files.store(rep.filesHashed, std::memory_order_relaxed);
+            progress->bytes.store(rep.bytesHashed, std::memory_order_relaxed);
+        }
+    }
+
+    rep.groups = GroupByDigest(hashed);
+    for (const DupGroup& g : rep.groups) {
+        rep.totalWasted = SatAdd(rep.totalWasted, g.wasted);
+    }
+    return rep;
 }
 
 // ------------------------------------------------------------ force removal

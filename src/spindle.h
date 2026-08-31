@@ -41,6 +41,18 @@ struct Node {
     uint32_t     files = 0;   // file count in subtree
     bool         dir   = false;
     Cat          cat   = Cat::Other;
+
+    // The file has more than one directory entry pointing at it, so it also
+    // exists elsewhere on the volume and deleting this one frees nothing
+    // until the last link goes. Only the MFT path can see this; the
+    // directory walker would have to open a handle per file to find out,
+    // which is exactly what the scanner refuses to do.
+    bool         hardlink  = false;
+    // A cloud placeholder (OneDrive and friends): it has a size on paper but
+    // occupies little or nothing locally, and touching its contents would
+    // make Windows download it.
+    bool         cloudOnly = false;
+
     std::vector<Node> children;
 
     Node() = default;
@@ -67,6 +79,15 @@ struct ScanStats {
     bool     faulted     = false;
     // The scan read the Master File Table rather than walking directories.
     bool     usedMft     = false;
+
+    // Bytes that look like free space on the map but are not. Hardlinked
+    // bytes exist once however many names point at them; cloud-only bytes
+    // are not on this disk at all. Reporting a total without these is how a
+    // tool promises 8 GB back from WinSxS and delivers nothing.
+    uint64_t hardlinkBytes = 0;
+    uint64_t hardlinkFiles = 0;
+    uint64_t cloudBytes    = 0;
+    uint64_t cloudFiles    = 0;
 };
 
 struct ScanResult {
@@ -110,6 +131,165 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
 bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res);
 std::wstring CacheDirPath();
 void ClearScanCaches();
+
+// -------------------------------------------------------------- duplicates
+//
+// Finding duplicates means reading file contents, which is the one thing the
+// scanner never does. So it is a separate, explicit operation, and it is
+// bounded hard: only files that share an exact size with another file are
+// ever opened, because two files of different lengths cannot be identical.
+// On a normal volume that eliminates almost everything before a byte is read.
+
+// A 128-bit content digest. Not a cryptographic hash and not presented as
+// one: it answers "are these two files the same", where the alternative
+// being defended against is coincidence, not an attacker crafting a
+// collision to make you delete your own file. Full verification is
+// available separately for anyone who wants it.
+struct Digest {
+    uint64_t a = 0;
+    uint64_t b = 0;
+    bool operator==(const Digest& o) const { return a == o.a && b == o.b; }
+    bool operator!=(const Digest& o) const { return !(*this == o); }
+    bool operator<(const Digest& o) const {
+        return (a != o.a) ? (a < o.a) : (b < o.b);
+    }
+};
+
+// Streaming digest, so a 40 GB disk image is hashed without being held in
+// memory. Feed it chunks in order; Finish() is stable for identical input
+// regardless of how the input was divided into chunks.
+class Hasher {
+public:
+    void Update(const uint8_t* data, size_t len);
+    Digest Finish() const;
+
+private:
+    void Block(uint64_t v);
+
+    uint64_t h1_ = 0x9E3779B97F4A7C15ull;
+    uint64_t h2_ = 0xBF58476D1CE4E5B9ull;
+    uint64_t len_ = 0;
+    // Bytes left over from the previous chunk. Without this the digest would
+    // depend on where the reads happened to split, so the same file hashed
+    // in 1 MB chunks and in one go would disagree.
+    uint8_t  tail_[8] = {};
+    size_t   tailLen_ = 0;
+};
+
+// One file that is a candidate for, or a confirmed member of, a duplicate
+// set. `path` is relative to the scanned subtree, as in FileHit.
+struct DupFile {
+    const Node*  node = nullptr;
+    std::wstring path;
+    uint64_t     size = 0;
+    Digest       digest;
+};
+
+// A set of files with identical content. `wasted` is what deleting all but
+// one of them would return: (count - 1) * size.
+struct DupGroup {
+    uint64_t             size = 0;
+    uint64_t             wasted = 0;
+    std::vector<DupFile> files;
+};
+
+// Everything a duplicate hunt needs to report, including what it refused to
+// look at and why - a report that silently skipped half a drive would be
+// worse than no report.
+struct DupReport {
+    std::vector<DupGroup> groups;
+    uint64_t totalWasted   = 0;
+    uint64_t filesHashed   = 0;
+    uint64_t bytesHashed   = 0;
+    uint64_t skippedCloud  = 0;   // would have been downloaded to read
+    uint64_t skippedUnread = 0;   // permission denied, locked, vanished
+    bool     cancelled     = false;
+};
+
+// Which files could possibly be duplicates: everything whose size is shared
+// with at least one other file, above `minSize`, excluding directories,
+// cloud placeholders and hardlinks (a hardlink is not a duplicate - it is
+// already the same bytes, and "deduplicating" it frees nothing).
+//
+// Portable and host-tested: the caller supplies the reading.
+std::vector<DupFile> DuplicateCandidates(const Node& root, uint64_t minSize);
+
+// Group candidates that have been given digests into confirmed sets.
+// Candidates with no digest (unreadable, skipped) are dropped.
+std::vector<DupGroup> GroupByDigest(const std::vector<DupFile>& hashed);
+
+inline constexpr uint64_t kDefaultDupMinSize = 1u << 20;   // 1 MB
+
+// Defined below, with the scanner it belongs to; only a pointer is needed
+// here and the duplicate hunt reads the same cancel flag a scan does.
+struct Progress;
+
+// Run a full duplicate hunt under `root`, whose files live under
+// `rootPath`. Windows-only: this is the part that opens and reads files.
+// Opens read-only, sharing everything, never follows a cloud placeholder,
+// and stops promptly when `progress->cancel` is set.
+DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
+                         uint64_t minSize, Progress* progress);
+
+// ----------------------------------------------------------- command line
+//
+// A command line turns Spindle into something Task Scheduler can run, which
+// is a better answer to "does it have scheduling" than shipping a service
+// that has to be kept alive and secured. It is also how a shell verb and a
+// UNC path get in.
+
+struct CommandLine {
+    enum class Mode { Gui, Help, Version, Export };
+    Mode         mode = Mode::Gui;
+    std::wstring path;      // volume, folder or UNC path; empty means ask
+    std::wstring csvOut;    // --csv destination, for Mode::Export
+    uint64_t     minDup = 0;   // --duplicates threshold, 0 = not requested
+    bool         wantDuplicates = false;
+    bool         valid = true;
+    std::wstring error;
+};
+
+// Parse already-split arguments, excluding argv[0]. Pure and host-tested:
+// the Windows side only supplies the splitting.
+CommandLine ParseCommandLine(const std::vector<std::wstring>& args);
+
+// The text shown by --help, also used in the About/Controls box.
+const wchar_t* CommandLineHelp();
+
+// ------------------------------------------------------------- comparison
+//
+// What changed between two scans of the same volume. The cache already
+// stores finished scans, so this answers "what ate my disk this week"
+// without needing anything new on disk.
+
+enum class ChangeKind : uint8_t { Added, Removed, Grown, Shrunk };
+
+struct Change {
+    ChangeKind   kind = ChangeKind::Added;
+    std::wstring path;      // relative to the compared root
+    bool         dir = false;
+    uint64_t     before = 0;
+    uint64_t     after  = 0;
+    // Signed delta, widened so a full-size shrink cannot wrap. Positive for
+    // growth, negative for loss.
+    int64_t      delta = 0;
+};
+
+struct DiffReport {
+    std::vector<Change> changes;   // largest absolute delta first
+    uint64_t grewBy    = 0;
+    uint64_t shrankBy  = 0;
+    int64_t  netDelta  = 0;
+};
+
+// Compare two trees, reporting only entries whose size moved by at least
+// `minDelta`. A directory that changed only because its children did is
+// reported once, at the directory, and its children are not walked - the
+// answer to "what grew" is a place to look, not ten thousand rows.
+DiffReport DiffTrees(const Node& before, const Node& after,
+                     uint64_t minDelta);
+
+const wchar_t* ChangeKindName(ChangeKind k);
 
 // ------------------------------------------------------------ force removal
 //

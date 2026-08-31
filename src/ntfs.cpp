@@ -259,6 +259,7 @@ RecordInfo ParseRecord(const uint8_t* record, size_t len) {
     const uint16_t flags = r.U16(0x16);
     info.inUse = (flags & 0x0001) != 0;
     info.isDir = (flags & 0x0002) != 0;
+    info.links = r.U16(0x12);
 
     // A non-zero base reference means this record continues another one. Its
     // attributes belong to the base record, not to a file of its own.

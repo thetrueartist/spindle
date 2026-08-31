@@ -3,6 +3,7 @@
 
 #include "../src/spindle.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1289,6 +1290,8 @@ static bool TreesEqual(const Node& a, const Node& b) {
         if (p.x->name != p.y->name || p.x->size != p.y->size ||
             p.x->files != p.y->files || p.x->dir != p.y->dir ||
             p.x->cat != p.y->cat ||
+            p.x->hardlink != p.y->hardlink ||
+            p.x->cloudOnly != p.y->cloudOnly ||
             p.x->children.size() != p.y->children.size()) {
             return false;
         }
@@ -1316,6 +1319,15 @@ static void TestScanCache() {
     in.stats.bytes     = in.root.size;
     in.stats.fileCount = 4;
     in.stats.dirCount  = 5;
+    in.stats.hardlinkFiles = 2;
+    in.stats.hardlinkBytes = 4096;
+    in.stats.cloudFiles    = 1;
+    in.stats.cloudBytes    = 900;
+
+    // The flags have to survive the round trip too, or a cached scan quietly
+    // forgets that half of WinSxS is hardlinked.
+    in.root.children[0].children[0].hardlink  = true;
+    in.root.children[3].cloudOnly             = true;
 
     CacheMeta m;
     m.savedUnixMs  = 1725100000000ULL;
@@ -1333,7 +1345,14 @@ static void TestScanCache() {
     CHECK(out.stats.bytes == in.stats.bytes, "byte total survives");
     CHECK(out.stats.fileCount == in.stats.fileCount, "file count survives");
     CHECK(out.stats.dirCount == in.stats.dirCount, "dir count survives");
+    CHECK(out.stats.hardlinkBytes == in.stats.hardlinkBytes,
+          "hardlink bytes survive");
+    CHECK(out.stats.cloudBytes == in.stats.cloudBytes,
+          "cloud bytes survive");
     CHECK(TreesEqual(in.root, out.root), "tree survives byte-identically");
+    CHECK(out.root.children[0].children[0].hardlink,
+          "hardlink flag survives");
+    CHECK(out.root.children[3].cloudOnly, "cloud flag survives");
 
     // Every strict prefix must be refused: a torn write may leave one behind.
     bool anyPrefixParsed = false;
@@ -1363,12 +1382,22 @@ static void TestScanCache() {
         CHECK(!DeserializeScan(t.data(), t.size(), r, cm), "version checked");
     }
     {   // A root that claims to be a file is structurally meaningless.
+        // 88-byte header (magic, version, meta, four totals, four
+        // hardlink/cloud counters, node count), then the root record's
+        // 2-byte nameLen, then its flags byte.
+        constexpr size_t kFlagsByte = 88 + 2;
         std::vector<uint8_t> t = buf;
-        t[56 + 2] = 0;   // header, then nameLen; the dir byte follows
+        t[kFlagsByte] = 0;   // clear the directory bit
         ScanResult r;
         CacheMeta cm;
         CHECK(!DeserializeScan(t.data(), t.size(), r, cm),
               "file-as-root refused");
+
+        // And a flags byte carrying bits the format does not define.
+        t = buf;
+        t[kFlagsByte] = 0xF8;
+        CHECK(!DeserializeScan(t.data(), t.size(), r, cm),
+              "undefined flag bits refused");
     }
 
     // Flip every byte in turn: any answer is fine, crashing is not. The
@@ -1393,6 +1422,288 @@ static void TestScanCache() {
     CHECK(DeserializeScan(buf.data(), buf.size(), out, om),
           "bare root round-trips");
     CHECK(out.root.children.empty(), "bare root stays bare");
+}
+
+// -------------------------------------------------------------- duplicates
+
+static Digest HashOf(const std::string& s) {
+    Hasher h;
+    h.Update(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+    return h.Finish();
+}
+
+static void TestHasher() {
+    std::printf("Content hashing\n");
+
+    CHECK(HashOf("") == HashOf(""), "empty is stable");
+    CHECK(HashOf("hello") == HashOf("hello"), "same input, same digest");
+    CHECK(HashOf("hello") != HashOf("hellp"), "one bit apart differs");
+    CHECK(HashOf("hello") != HashOf("olleh"), "order matters");
+    // std::string("\0") is empty - the length has to be given explicitly.
+    CHECK(HashOf("") != HashOf(std::string("\0", 1)), "length is folded in");
+    CHECK(HashOf(std::string(16, '\0')) != HashOf(std::string(32, '\0')),
+          "runs of zeros of different length differ");
+
+    // Chunking must not change the answer: files are read a megabyte at a
+    // time and the boundaries fall wherever they fall.
+    const std::string data(5000, 'x');
+    Hasher whole;
+    whole.Update(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    Hasher split;
+    for (size_t off = 0; off < data.size(); off += 7) {
+        const size_t n = std::min<size_t>(7, data.size() - off);
+        split.Update(reinterpret_cast<const uint8_t*>(data.data() + off), n);
+    }
+    CHECK(whole.Finish() == split.Finish(), "chunking is irrelevant");
+
+    Hasher nul;
+    nul.Update(nullptr, 100);
+    CHECK(nul.Finish() == Hasher().Finish(), "null feed is ignored");
+
+    // A weak mixer collides trivially on near-identical short inputs; sweep
+    // a few thousand and insist they stay distinct.
+    std::vector<Digest> seen;
+    for (int i = 0; i < 4000; ++i) {
+        seen.push_back(HashOf("file_" + std::to_string(i) + ".bin"));
+    }
+    std::sort(seen.begin(), seen.end());
+    const size_t before = seen.size();
+    seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+    CHECK(seen.size() == before, "4000 similar strings, no collisions");
+}
+
+static void TestDuplicates() {
+    std::printf("Duplicate detection\n");
+
+    // Three 100-byte files, two 200-byte files, one lonely 50.
+    // Three 100s waste 200; the 500 pair wastes 500. Deliberately not a tie,
+    // so the "biggest saving first" ordering is actually being tested.
+    Node root = MakeDir(L"", {
+        MakeDir(L"a", {MakeFile(L"one.bin", 100), MakeFile(L"two.bin", 500)}),
+        MakeDir(L"b", {MakeFile(L"three.bin", 100),
+                       MakeFile(L"four.bin", 500),
+                       MakeFile(L"lonely.bin", 50)}),
+        MakeFile(L"five.bin", 100),
+    });
+
+    // minSize 0 so the tiny fixtures qualify.
+    std::vector<DupFile> cand = DuplicateCandidates(root, 0);
+    CHECK(cand.size() == 5, "only files sharing a size are candidates");
+    bool sawLonely = false;
+    for (const DupFile& f : cand) {
+        if (f.node->name == L"lonely.bin") sawLonely = true;
+    }
+    CHECK(!sawLonely, "a unique size is never read");
+
+    // The size floor keeps small files out entirely.
+    CHECK(DuplicateCandidates(root, 150).size() == 2, "minSize respected");
+    CHECK(DuplicateCandidates(root, 100000).empty(), "high floor finds none");
+
+    // Paths must be relative to the subtree, as the caller will join them.
+    for (const DupFile& f : cand) {
+        if (f.node->name == L"three.bin") {
+            CHECK(Narrow(f.path) == "b\\three.bin", "relative path built");
+        }
+    }
+
+    // Hardlinks and cloud placeholders are excluded: neither is a duplicate
+    // that deleting would recover anything from.
+    Node tricky = MakeDir(L"", {
+        MakeFile(L"real.bin", 100), MakeFile(L"copy.bin", 100),
+        MakeFile(L"linked.bin", 100), MakeFile(L"cloudy.bin", 100),
+    });
+    tricky.children[2].hardlink  = true;
+    tricky.children[3].cloudOnly = true;
+    CHECK(DuplicateCandidates(tricky, 0).size() == 2,
+          "hardlink and cloud placeholder excluded");
+
+    // Grouping: give matching digests to the two 100s, distinct to the rest.
+    std::vector<DupFile> hashed = DuplicateCandidates(root, 0);
+    for (DupFile& f : hashed) {
+        if (f.size == 100) {
+            f.digest = HashOf("same-100");
+        } else {
+            f.digest = HashOf(Narrow(f.path));
+        }
+    }
+    std::vector<DupGroup> groups = GroupByDigest(hashed);
+    CHECK(groups.size() == 1, "one confirmed group");
+    CHECK(groups[0].files.size() == 3, "all three 100-byte files matched");
+    CHECK(groups[0].size == 100, "group size recorded");
+    CHECK(groups[0].wasted == 200, "keeping one copy, 200 recoverable");
+
+    // Same size but different content must not group.
+    for (DupFile& f : hashed) f.digest = HashOf(Narrow(f.path));
+    CHECK(GroupByDigest(hashed).empty(),
+          "same size, different content is not a duplicate");
+
+    // Groups come back biggest-saving first.
+    std::vector<DupFile> mixed = DuplicateCandidates(root, 0);
+    for (DupFile& f : mixed) {
+        f.digest = (f.size == 100) ? HashOf("g100") : HashOf("g500");
+    }
+    std::vector<DupGroup> ordered = GroupByDigest(mixed);
+    CHECK(ordered.size() == 2, "two groups");
+    CHECK(ordered[0].wasted >= ordered[1].wasted, "sorted by saving");
+    CHECK(ordered[0].wasted == 500 && ordered[0].size == 500,
+          "the 500-byte pair wastes most, and leads");
+    CHECK(ordered[1].wasted == 200, "the 100-byte trio follows");
+
+    CHECK(GroupByDigest({}).empty(), "no candidates, no groups");
+}
+
+// ------------------------------------------------------------ command line
+
+static CommandLine Parse(std::vector<const wchar_t*> argv) {
+    std::vector<std::wstring> args;
+    for (const wchar_t* a : argv) args.push_back(a);
+    return ParseCommandLine(args);
+}
+
+static void TestCommandLine() {
+    std::printf("Command line\n");
+
+    const CommandLine none = Parse({});
+    CHECK(none.valid && none.mode == CommandLine::Mode::Gui,
+          "no arguments opens the window");
+    CHECK(none.path.empty(), "and picks no drive");
+
+    const CommandLine path = Parse({L"D:\\"});
+    CHECK(path.valid && path.mode == CommandLine::Mode::Gui, "bare path");
+    CHECK(Narrow(path.path) == "D:\\", "path kept");
+
+    const CommandLine unc = Parse({L"\\\\server\\share"});
+    CHECK(unc.valid && Narrow(unc.path) == "\\\\server\\share",
+          "UNC path accepted");
+
+    CHECK(Parse({L"--help"}).mode == CommandLine::Mode::Help, "--help");
+    CHECK(Parse({L"--version"}).mode == CommandLine::Mode::Version,
+          "--version");
+
+    const CommandLine csv = Parse({L"--csv", L"out.csv", L"D:\\"});
+    CHECK(csv.valid && csv.mode == CommandLine::Mode::Export, "--csv mode");
+    CHECK(Narrow(csv.csvOut) == "out.csv", "csv target");
+    CHECK(Narrow(csv.path) == "D:\\", "and the path");
+
+    CHECK(!Parse({L"--csv"}).valid, "--csv with no file is refused");
+    CHECK(!Parse({L"--csv", L"out.csv"}).valid,
+          "--csv with no path to scan is refused");
+    CHECK(!Parse({L"--nonsense"}).valid, "unknown option refused");
+    CHECK(!Parse({L"C:\\", L"D:\\"}).valid, "two paths refused");
+
+    // --duplicates takes an optional size, and must not swallow a path.
+    const CommandLine d1 = Parse({L"--duplicates", L"D:\\"});
+    CHECK(d1.valid && d1.wantDuplicates, "--duplicates alone");
+    CHECK(Narrow(d1.path) == "D:\\", "path not eaten by --duplicates");
+    CHECK(d1.minDup == kDefaultDupMinSize, "default threshold applied");
+
+    const CommandLine d2 = Parse({L"--duplicates", L"4096", L"D:\\"});
+    CHECK(d2.valid && d2.minDup == 4096, "explicit threshold");
+    CHECK(Narrow(d2.path) == "D:\\", "path still found after a number");
+
+    // A threshold too large to represent must not wrap into something small.
+    const CommandLine huge =
+        Parse({L"--duplicates", L"99999999999999999999999", L"D:\\"});
+    CHECK(huge.valid && huge.minDup == kDefaultDupMinSize,
+          "overflowing threshold falls back to the default");
+
+    // Anything dash-led is a mistyped flag, never a path to scan.
+    CHECK(!Parse({L"--"}).valid, "bare -- refused");
+    CHECK(!Parse({L"-csv", L"out.csv"}).valid, "single-dash flag refused");
+    CHECK(!Parse({L"-"}).valid, "bare - refused");
+}
+
+// -------------------------------------------------------------- comparison
+
+static int64_t SignedDeltaExpected(uint64_t before, uint64_t after) {
+    return (after >= before) ? static_cast<int64_t>(after - before)
+                             : -static_cast<int64_t>(before - after);
+}
+
+static const Change* FindChange(const DiffReport& r, const char* path) {
+    for (const Change& c : r.changes) {
+        if (Narrow(c.path) == path) return &c;
+    }
+    return nullptr;
+}
+
+static void TestDiff() {
+    std::printf("Scan comparison\n");
+
+    Node before = MakeDir(L"", {
+        MakeDir(L"games", {MakeFile(L"a.pak", 1000)}),
+        MakeDir(L"docs",  {MakeFile(L"old.txt", 500)}),
+        MakeFile(L"steady.bin", 700),
+    });
+    Node after = MakeDir(L"", {
+        MakeDir(L"games", {MakeFile(L"a.pak", 3000)}),      // grew 2000
+        MakeDir(L"media", {MakeFile(L"new.mp4", 4000)}),    // added
+        MakeFile(L"steady.bin", 700),                       // unchanged
+    });                                                     // docs removed
+
+    const DiffReport r = DiffTrees(before, after, 1);
+
+    const Change* grown = FindChange(r, "games\\a.pak");
+    CHECK(grown != nullptr, "growth found");
+    if (grown) {
+        CHECK(grown->kind == ChangeKind::Grown, "classified as grown");
+        CHECK(grown->delta == 2000, "delta is the increase");
+        CHECK(grown->before == 1000 && grown->after == 3000, "both sizes");
+    }
+
+    const Change* added = FindChange(r, "media");
+    CHECK(added != nullptr, "addition found at its root");
+    if (added) {
+        CHECK(added->kind == ChangeKind::Added, "classified as added");
+        CHECK(added->delta == 4000, "whole subtree counted");
+        CHECK(added->dir, "recorded as a directory");
+    }
+    CHECK(FindChange(r, "media\\new.mp4") == nullptr,
+          "does not also list what is inside a new folder");
+
+    const Change* removed = FindChange(r, "docs");
+    CHECK(removed != nullptr, "removal found");
+    if (removed) {
+        CHECK(removed->kind == ChangeKind::Removed, "classified as removed");
+        CHECK(removed->delta == -500, "loss is negative");
+    }
+
+    CHECK(FindChange(r, "steady.bin") == nullptr, "unchanged file omitted");
+
+    // Largest movement first.
+    CHECK(!r.changes.empty() && r.changes[0].delta == 4000,
+          "biggest change leads");
+
+    CHECK(r.grewBy == 6000, "total growth");
+    CHECK(r.shrankBy == 500, "total loss");
+    CHECK(r.netDelta == SignedDeltaExpected(before.size, after.size),
+          "net matches the roots");
+
+    // The threshold hides noise.
+    const DiffReport coarse = DiffTrees(before, after, 3000);
+    CHECK(coarse.changes.size() == 1, "minDelta filters small movement");
+    CHECK(coarse.changes[0].delta == 4000, "only the big one survives");
+
+    // Identical trees produce nothing at all.
+    CHECK(DiffTrees(before, before, 1).changes.empty(),
+          "no change between a tree and itself");
+    CHECK(DiffTrees(before, before, 1).netDelta == 0, "net zero");
+
+    // A file replaced by a directory of the same name still reports.
+    Node fileVer = MakeDir(L"", {MakeFile(L"thing", 100)});
+    Node dirVer  = MakeDir(L"", {MakeDir(L"thing", {MakeFile(L"x", 900)})});
+    const DiffReport swap = DiffTrees(fileVer, dirVer, 1);
+    CHECK(!swap.changes.empty(), "file becoming a directory is reported");
+
+    // Deep nesting must not recurse.
+    Node deepA = MakeFile(L"leaf", 1);
+    Node deepB = MakeFile(L"leaf", 2);
+    for (int i = 0; i < 2000; ++i) {
+        deepA = MakeDir(L"d", {std::move(deepA)});
+        deepB = MakeDir(L"d", {std::move(deepB)});
+    }
+    CHECK(!DiffTrees(deepA, deepB, 1).changes.empty(),
+          "2000 levels deep without a stack overflow");
 }
 
 // ---------------------------------------------------------- force removal
@@ -1549,6 +1860,10 @@ int main() {
     TestScanCache();
     TestSettings();
     TestForceRemovalGuards();
+    TestHasher();
+    TestDuplicates();
+    TestDiff();
+    TestCommandLine();
 
     std::printf("\n=== %d passed, %d failed ===\n\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
