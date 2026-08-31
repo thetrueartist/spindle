@@ -57,17 +57,95 @@ private:
     HANDLE h_;
 };
 
+// Synchronous read on the overlapped volume handle, for the small one-off
+// reads (boot sector, run list). Its own event, so it can never mistake a
+// pipelined read's completion for its own. Volume reads are returned in
+// whole sectors, so a short read is a genuine failure, not a retry.
 bool ReadAt(HANDLE h, uint64_t offset, void* buf, uint32_t bytes) {
-    LARGE_INTEGER li;
-    li.QuadPart = static_cast<LONGLONG>(offset);
-    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) return false;
+    const HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) return false;
 
-    // Volume reads must be sector-aligned and are returned in whole sectors,
-    // so a short read is a genuine failure rather than something to loop on.
+    OVERLAPPED ov{};
+    ov.Offset     = static_cast<DWORD>(offset);
+    ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    ov.hEvent     = ev;
+
     DWORD got = 0;
-    if (!ReadFile(h, buf, bytes, &got, nullptr)) return false;
-    return got == bytes;
+    bool ok = true;
+    if (!ReadFile(h, buf, bytes, nullptr, &ov)) {
+        ok = (GetLastError() == ERROR_IO_PENDING);
+    }
+    if (ok) ok = GetOverlappedResult(h, &ov, &got, TRUE) != 0;
+    CloseHandle(ev);
+    return ok && got == bytes;
 }
+
+// One in-flight overlapped read with its own buffer and event. Two of these
+// alternate in the MFT loop, so the disk is filling the next chunk while the
+// CPU parses this one; the read and the parse each cost real time, and there
+// is no reason to pay for them in sequence.
+class AsyncRead {
+public:
+    AsyncRead(HANDLE vol, uint32_t bufBytes)
+        : vol_(vol), event_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {
+        try {
+            buf_.resize(bufBytes);
+        } catch (...) {
+            buf_.clear();   // Ready() reports it; the caller falls back
+        }
+    }
+    ~AsyncRead() {
+        // An in-flight read writes into buf_; both must outlive it.
+        Drain();
+        if (event_) CloseHandle(event_);
+    }
+    AsyncRead(const AsyncRead&) = delete;
+    AsyncRead& operator=(const AsyncRead&) = delete;
+
+    bool Ready() const { return event_ != nullptr && !buf_.empty(); }
+    uint8_t* Data() { return buf_.data(); }   // fixups patch in place
+
+    bool Issue(uint64_t offset, uint32_t bytes) {
+        if (!Ready() || inFlight_ || bytes > buf_.size()) return false;
+        ResetEvent(event_);
+        ov_ = OVERLAPPED{};
+        ov_.Offset     = static_cast<DWORD>(offset);
+        ov_.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        ov_.hEvent     = event_;
+        want_ = bytes;
+        if (!ReadFile(vol_, buf_.data(), bytes, nullptr, &ov_) &&
+            GetLastError() != ERROR_IO_PENDING) {
+            return false;
+        }
+        inFlight_ = true;
+        return true;
+    }
+
+    // Wait out the issued read; true only if every requested byte arrived.
+    bool Wait() {
+        if (!inFlight_) return false;
+        inFlight_ = false;
+        DWORD got = 0;
+        if (!GetOverlappedResult(vol_, &ov_, &got, TRUE)) return false;
+        return got == want_;
+    }
+
+private:
+    void Drain() {
+        if (!inFlight_) return;
+        CancelIoEx(vol_, &ov_);
+        DWORD got = 0;
+        GetOverlappedResult(vol_, &ov_, &got, TRUE);
+        inFlight_ = false;
+    }
+
+    HANDLE               vol_;
+    HANDLE               event_;
+    std::vector<uint8_t> buf_;
+    OVERLAPPED           ov_{};
+    uint32_t             want_ = 0;
+    bool                 inFlight_ = false;
+};
 
 bool IsElevated() {
     HANDLE raw = nullptr;
@@ -202,9 +280,12 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
 
     // FILE_READ_DATA only, and sharing everything: this must never interfere
     // with a volume that is in active use.
+    // Overlapped, so the record loop below can keep one chunk read in
+    // flight while it parses the previous one.
     Handle vol(CreateFileW(volPath.c_str(), FILE_READ_DATA,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, 0, nullptr));
+                           nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
+                           nullptr));
     if (!vol.valid()) return false;
 
     std::vector<uint8_t> boot(512);
@@ -233,86 +314,124 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     pool.data.reserve(static_cast<size_t>(recordCount) * 12);
 
     // ---- pass one: read the MFT and parse every record -------------------
+    //
+    // The read plan comes first: every non-sparse run split into
+    // record-aligned chunks, each knowing which record number it starts at.
+    // Laying the plan out up front is what lets the loop keep the next
+    // chunk's read in flight while this one is parsed - the disk and the
+    // CPU work at the same time instead of taking turns.
 
-    std::vector<uint8_t> chunk(kChunkBytes);
-    uint64_t recordIndex = 0;
+    struct Segment {
+        uint64_t offset;
+        uint32_t bytes;
+        uint64_t firstRecord;
+    };
+    std::vector<Segment> segments;
+    {
+        uint64_t rec = 0;
+        for (const ntfs::DataRun& run : runs) {
+            if (run.sparse) {
+                // Unallocated stretch of the MFT: skip the record numbers
+                // it covers rather than misaligning everything after it.
+                rec += run.clusters * bi.bytesPerCluster / bi.bytesPerRecord;
+                if (rec >= recordCount) break;
+                continue;
+            }
+            uint64_t remaining = run.clusters * bi.bytesPerCluster;
+            uint64_t off = static_cast<uint64_t>(run.lcn) * bi.bytesPerCluster;
+            while (remaining > 0 && rec < recordCount) {
+                const uint32_t want = static_cast<uint32_t>(
+                    std::min<uint64_t>(remaining, kChunkBytes));
+                const uint32_t aligned = want - (want % bi.bytesPerRecord);
+                if (aligned == 0) break;
+                segments.push_back(Segment{off, aligned, rec});
+                off += aligned;
+                remaining -= aligned;
+                rec += aligned / bi.bytesPerRecord;
+            }
+        }
+    }
+
     uint64_t files = 0, dirs = 0, bytes = 0;
 
-    for (const ntfs::DataRun& run : runs) {
-        if (run.sparse) {
-            // Unallocated stretch of the MFT: skip the record numbers it
-            // covers rather than misaligning everything after it.
-            const uint64_t skip =
-                run.clusters * bi.bytesPerCluster / bi.bytesPerRecord;
-            recordIndex += skip;
-            if (recordIndex >= recordCount) break;
+    // Declared after `vol` on purpose: destruction runs in reverse, so an
+    // in-flight read is drained before the handle it targets closes.
+    AsyncRead ioA(vol.get(), kChunkBytes);
+    AsyncRead ioB(vol.get(), kChunkBytes);
+    AsyncRead* io[2] = {&ioA, &ioB};
+    if (!ioA.Ready() || !ioB.Ready()) return false;
+
+    size_t issued = 0;   // segments handed to the disk so far
+
+    for (size_t s = 0; s < segments.size(); ++s) {
+        if (progress && progress->cancel.load(std::memory_order_relaxed)) {
+            return false;   // AsyncRead destructors drain in-flight I/O
+        }
+
+        // Normally segment s went out an iteration ago; the first segment,
+        // or any whose Issue failed, is picked up synchronously here.
+        if (issued == s) {
+            if (io[s & 1]->Issue(segments[s].offset, segments[s].bytes)) {
+                ++issued;
+            }
+        }
+
+        AsyncRead& cur = *io[s & 1];
+        const bool ok = (issued > s) && cur.Wait();
+
+        // Fill the other buffer before touching this one.
+        if (issued == s + 1 && issued < segments.size()) {
+            if (io[issued & 1]->Issue(segments[issued].offset,
+                                      segments[issued].bytes)) {
+                ++issued;
+            }
+        }
+
+        const Segment& seg = segments[s];
+        if (!ok) {
+            // A bad sector mid-table is not fatal: skip the chunk and keep
+            // going. The result is incomplete, not wrong.
             continue;
         }
 
-        uint64_t remaining = run.clusters * bi.bytesPerCluster;
-        uint64_t offset = static_cast<uint64_t>(run.lcn) * bi.bytesPerCluster;
+        for (uint32_t p = 0, ri = 0; p + bi.bytesPerRecord <= seg.bytes;
+             p += bi.bytesPerRecord, ++ri) {
+            const uint64_t recordIndex = seg.firstRecord + ri;
+            if (recordIndex >= recordCount) break;
+            const size_t idx = static_cast<size_t>(recordIndex);
 
-        while (remaining > 0 && recordIndex < recordCount) {
-            if (progress && progress->cancel.load(std::memory_order_relaxed)) {
-                return false;
-            }
-
-            const uint32_t want = static_cast<uint32_t>(
-                std::min<uint64_t>(remaining, kChunkBytes));
-            const uint32_t aligned = want - (want % bi.bytesPerRecord);
-            if (aligned == 0) break;
-
-            if (!ReadAt(vol.get(), offset, chunk.data(), aligned)) {
-                // A bad sector mid-table is not fatal: skip the chunk and
-                // keep going. The result is incomplete, not wrong.
-                offset += aligned;
-                remaining -= aligned;
-                recordIndex += aligned / bi.bytesPerRecord;
+            uint8_t* r = cur.Data() + p;
+            if (std::memcmp(r, "FILE", 4) != 0) continue;
+            if (!ntfs::ApplyFixups(r, bi.bytesPerRecord,
+                                   bi.bytesPerSector)) {
                 continue;
             }
 
-            for (uint32_t p = 0; p + bi.bytesPerRecord <= aligned;
-                 p += bi.bytesPerRecord) {
-                if (recordIndex >= recordCount) break;
-                const size_t idx = static_cast<size_t>(recordIndex);
-                ++recordIndex;
+            const ntfs::RecordInfo info =
+                ntfs::ParseRecord(r, bi.bytesPerRecord);
+            if (!info.valid || !info.inUse || !info.hasName) continue;
+            if (info.isExtension) continue;
+            if (info.parent >= recordCount) continue;   // dangling parent
 
-                uint8_t* r = chunk.data() + p;
-                if (std::memcmp(r, "FILE", 4) != 0) continue;
-                if (!ntfs::ApplyFixups(r, bi.bytesPerRecord,
-                                       bi.bytesPerSector)) {
-                    continue;
-                }
+            Entry& e = entries[idx];
+            e.used   = true;
+            e.parent = info.parent;
+            e.isDir  = info.isDir;
+            e.size   = info.isDir ? 0 : info.size;
+            e.nameOff = pool.Add(info.name, e.nameLen);
 
-                const ntfs::RecordInfo info =
-                    ntfs::ParseRecord(r, bi.bytesPerRecord);
-                if (!info.valid || !info.inUse || !info.hasName) continue;
-                if (info.isExtension) continue;
-                if (info.parent >= recordCount) continue;   // dangling parent
-
-                Entry& e = entries[idx];
-                e.used   = true;
-                e.parent = info.parent;
-                e.isDir  = info.isDir;
-                e.size   = info.isDir ? 0 : info.size;
-                e.nameOff = pool.Add(info.name, e.nameLen);
-
-                if (info.isDir) {
-                    ++dirs;
-                } else {
-                    ++files;
-                    bytes = SatAdd(bytes, info.size);
-                }
+            if (info.isDir) {
+                ++dirs;
+            } else {
+                ++files;
+                bytes = SatAdd(bytes, info.size);
             }
+        }
 
-            offset += aligned;
-            remaining -= aligned;
-
-            if (progress) {
-                progress->files.store(files, std::memory_order_relaxed);
-                progress->dirs.store(dirs, std::memory_order_relaxed);
-                progress->bytes.store(bytes, std::memory_order_relaxed);
-            }
+        if (progress) {
+            progress->files.store(files, std::memory_order_relaxed);
+            progress->dirs.store(dirs, std::memory_order_relaxed);
+            progress->bytes.store(bytes, std::memory_order_relaxed);
         }
     }
 
