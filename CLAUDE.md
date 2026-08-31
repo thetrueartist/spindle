@@ -12,7 +12,7 @@ scan take well under a second.
 
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
-make test       747 assertions under ASan, UBSan and ThreadSanitizer
+make test       764 assertions under ASan, UBSan and ThreadSanitizer
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
 make icon       regenerate spindle.ico (prints each frame's encoding)
@@ -37,6 +37,7 @@ src/ui.cpp           Win32 window, Direct2D renderer, navigation, animation
 res/                 icon, version info, manifest
 tools/make_icon.py   icon generator, stdlib only
 tests/               core, ntfs, queue, stress
+docs/                README media, captured from the real binary under Wine
 ```
 
 The split is deliberate: **`core.cpp`, `ntfs.cpp` and `workqueue.h` contain no
@@ -89,6 +90,19 @@ bounded twice over.
 **Reparse points are never traversed.** Junctions and symlinks would loop or
 double-count.
 
+**Nothing that holds a `Node*` may survive a tree swap.** `StartScan` clears
+the panel caches (`fileList`, `extStats`, `rowHits`) and hover state before
+`result.reset()`, and adopting a fresh tree marks the panel dirty. The
+0xC0000005 that forced this rule was the side panel drawing the previous
+scan's file list mid-rescan, through pointers into the freed tree.
+
+**The scan cache is input, not state.** `%LOCALAPPDATA%\Spindle\*.spincache`
+is parsed with the same posture as `ntfs.cpp`: every length, count and enum
+validated, refusal bounds on totals, tree built iteratively with exact
+reserves. It is keyed to the volume serial, written only for clean
+uncancelled scans, and replaced atomically (temp + rename) so a torn file
+cannot exist.
+
 **Text rects are sized from `layout::kLine*`.** Formats set uniform line
 spacing to those constants; a rect shorter than its line box gets cropped by
 `DRAW_TEXT_OPTIONS_CLIP`. Paragraph alignment is centred so over-generous
@@ -133,6 +147,9 @@ and reads raw disk structures while elevated.
 - The MFT path has been verified by parser fuzzing and review, not by running
   against a real volume (the development environment is Linux). It falls back
   automatically on any failure.
+- Cache revalidation is a full rescan running behind the cached view, not an
+  incremental diff. Reading the NTFS USN journal to patch the cached tree in
+  place is the obvious next step, and needs a real volume to develop against.
 - Not implemented: duplicate detection, scan scheduling, network share
   discovery.
 

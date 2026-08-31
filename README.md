@@ -5,6 +5,8 @@ runtime and no third-party libraries.
 
 ![treemap](docs/screenshot.png)
 
+![scanning, zooming, searching](docs/demo.gif)
+
 ## Running it
 
 `spindle.exe` is self-contained. Double-click it.
@@ -40,6 +42,13 @@ is locked, nothing is read, and files held under an exclusive kernel lock —
 
 **Reparse points are never traversed.** Junctions and symlinks are recorded
 but not followed, so nothing loops and nothing is counted twice.
+
+**Click a drive you've scanned before, see it immediately.** Finished scans
+are cached under `%LOCALAPPDATA%\Spindle`, so revisiting a drive puts the
+last map up in milliseconds while a fresh scan revalidates behind it — the
+status bar reads `cached 2h ago · rescanning` until it has. The cache is
+keyed to the volume serial and parsed with the same suspicion as everything
+else that comes off a disk.
 
 **Filenames are treated as hostile input.** See below.
 
