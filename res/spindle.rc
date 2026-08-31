@@ -1,0 +1,39 @@
+// Spindle resources. Compiled by windres; -I res and -I build let the icon
+// and manifest be referenced by bare name (the icon is generated into build).
+
+#include <winver.h>
+
+// Must match IDI_APPICON in ui.cpp.
+1 ICON "spindle.ico"
+
+// CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24). Spelled as
+// numbers because the named constants live in winuser.h, which windres does
+// not need for anything else.
+1 24 "spindle.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "Spindle - disk space analyser"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "spindle"
+            VALUE "OriginalFilename", "spindle.exe"
+            VALUE "ProductName",      "Spindle"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
