@@ -12,7 +12,7 @@ scan take well under a second.
 
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
-make test       771 assertions under ASan, UBSan and ThreadSanitizer
+make test       797 assertions under ASan, UBSan and ThreadSanitizer
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
 make icon       regenerate spindle.ico (prints each frame's encoding)
@@ -123,15 +123,42 @@ and reads raw disk structures while elevated.
   in run-list sign extension, and a signed overflow accumulating the cluster
   delta.
 - The volume is opened `FILE_READ_DATA`, sharing read/write/delete.
-- Deletion is recycle-bin only, confirmed (twice for folders, No the default
-  both times), has no keyboard shortcut, and refuses anything that looks
-  like a volume root. The `SHFileOperationW` buffer is built with an explicit
-  double NUL. Nothing in the program deletes without that dialog chain.
+- Ordinary deletion is recycle-bin only, confirmed (twice for folders, No the
+  default both times), has no keyboard shortcut, and refuses anything that
+  looks like a volume root. The `SHFileOperationW` buffer is built with an
+  explicit double NUL.
+- **Force removal** is the one genuinely destructive feature: permanent
+  deletion, taking ownership when the ACL refuses, and terminating the
+  processes holding the target open. "Force" applies to locks and
+  permissions, never to the confirmations — it is a separate menu item below
+  the reversible one, never the default, has no shortcut, and passes three
+  gates: the protected-path refusal, a permanent-deletion warning stating
+  the size and file count, and a named list of the processes that would be
+  ended. No is the default on every one.
+- What force removal may never touch lives in `core.cpp`, not in the dialog:
+  `IsProtectedSystemPath` (drive roots, UNC, `\Windows`, `System Volume
+  Information`, `$Recycle.Bin`, `Recovery`, `Boot`, the boot files at and
+  below; the `Program Files`, `ProgramData`, `Users` and `PerfLogs` roots
+  themselves, their contents allowed) and `IsCriticalProcess` (pid ≤ 4,
+  smss/csrss/wininit/winlogon/services/lsass/svchost/dwm, and spindle itself).
+  Both are host-tested, `ForceRemove` re-checks the path itself so no caller
+  can route around the dialog, and the tree walk re-checks per directory
+  because it is following names off the disk.
+- Reparse points are removed as links, never followed — the deletion walk
+  inherits the scanner's rule, where breaking it would delete the target.
 - **No network, registry-write, process-creation or injection APIs.**
   `ShellExecuteW` is present for exactly one thing: opening Explorer at a
   path. `LoadLibraryW`/`VirtualProtect`/`CryptGenRandom` appear in the import
   table but are not called by any line of Spindle — they come from the MinGW
   runtime.
+- Force removal adds exactly two capabilities to that list, and no more:
+  `OpenProcess`/`TerminateProcess` to end a process holding a file open
+  (found via the documented Restart Manager — `RmStartSession`, no handle
+  table walking and no injection), and `SetNamedSecurityInfoW` /
+  `AdjustTokenPrivileges` to take ownership. The registry is still never
+  written: an uninstaller can map an application to its keys because it has
+  an uninstall database, and a treemap cannot. Guessing at keys from a
+  folder name would be a fast way to break a machine, so Spindle does not.
 - DEP, ASLR, high-entropy ASLR and NO_SEH are on. Control Flow Guard is not:
   it is MSVC-only (`/guard:cf`) and GCC cannot emit it.
 - A crash handler writes `spindle-crash.txt` with the fault address as a

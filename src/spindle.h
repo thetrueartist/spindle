@@ -111,6 +111,60 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res);
 std::wstring CacheDirPath();
 void ClearScanCaches();
 
+// ------------------------------------------------------------ force removal
+//
+// Force removal permanently deletes a file or folder, taking ownership and
+// terminating the processes holding it open if that is what it takes. It is
+// the one genuinely destructive thing in the program, so the decisions about
+// what it may touch live here, in portable code the tests can reach: the
+// Windows side must not be the only thing standing between a mis-click and
+// an unbootable machine.
+//
+// "Force" applies to locks and permissions, never to the confirmations.
+
+// True for anything force removal must refuse outright: volume roots, the
+// Windows directory and its contents, the Program Files and ProgramData
+// roots, the Users root, System Volume Information, and the boot files. The
+// check is deliberately blunt - refusing a path that would have been
+// survivable costs the user a manual delete; allowing one that is not costs
+// them the machine.
+bool IsProtectedSystemPath(const std::wstring& path);
+
+// True for processes that must never be terminated to break a file lock.
+// Killing any of these is an instant bugcheck or a broken session.
+bool IsCriticalProcess(const std::wstring& exeName, uint32_t pid);
+
+// A process holding a file open, as reported by the Restart Manager.
+struct Locker {
+    uint32_t     pid = 0;
+    std::wstring name;      // image name, e.g. "steam.exe"
+    bool         critical = false;   // IsCriticalProcess: never terminate
+};
+
+// Which processes have the file or folder open. Empty when nothing does, or
+// when the Restart Manager is unavailable - in which case the caller simply
+// proceeds and lets the delete fail on its own.
+std::vector<Locker> FindLockers(const std::wstring& path);
+
+struct ForceRemoveResult {
+    bool     ok            = false;
+    bool     blocked       = false;   // refused by IsProtectedSystemPath
+    uint64_t filesDeleted  = 0;
+    uint32_t lastError     = 0;
+    std::vector<Locker> remaining;    // still holding it when we gave up
+};
+
+// Permanently delete a file or folder: no Recycle Bin, no undo. Clears
+// read-only/hidden/system attributes and takes ownership when access is
+// denied. When `terminateLockers` is set, non-critical processes holding
+// the target open are terminated first - that is what makes it "force".
+//
+// Refuses outright if IsProtectedSystemPath says so, whatever the caller
+// asks for: the confirmations live in the interface, but the refusal lives
+// here so no future caller can route around it.
+ForceRemoveResult ForceRemove(const std::wstring& path,
+                              bool terminateLockers);
+
 // ------------------------------------------------------------------ settings
 //
 // Two booleans. Persisted as key=value lines beside the caches - the

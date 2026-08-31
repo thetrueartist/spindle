@@ -144,7 +144,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.1.1";
+constexpr const wchar_t* kAppVersion = L"1.2.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -1513,7 +1513,8 @@ static void ShowAppMenu(POINT screenPt) {
                         L"Click a block - descend into it\n"
                         L"Backspace - go up a level\n"
                         L"Click a breadcrumb - jump to that level\n"
-                        L"Right-click a block - Explorer, copy path, recycle\n"
+                        L"Right-click a block - Explorer, copy path,\n"
+                        L"                       recycle, force remove\n"
                         L"Ctrl+F - search names\n"
                         L"Ctrl+E - export CSV\n"
                         L"F5 - rescan\n"
@@ -1545,6 +1546,107 @@ static void ShowAppMenu(POINT screenPt) {
     }
 }
 
+// Force removal: permanent, no Recycle Bin, and it will terminate the
+// processes holding the target open. Everything about this function is
+// about making that impossible to do by accident - the deletion itself is
+// three lines at the bottom.
+static void DoForceRemove(const std::wstring& path, const Node* node) {
+    if (path.empty() || !node) return;
+
+    // First gate: the paths that are never removable, whatever anyone
+    // clicks. ForceRemove refuses these again on its own.
+    if (IsProtectedSystemPath(path)) {
+        MessageBoxW(g_app.hwnd,
+                    (L"Spindle will not force-remove this:\n\n" + path +
+                     L"\n\nIt is a drive root or part of Windows itself. "
+                     L"Removing it would leave the machine unbootable.")
+                        .c_str(),
+                    L"Spindle", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Second gate: say plainly what is about to happen, with the scale.
+    std::wstring warn =
+        L"PERMANENTLY DELETE this? It does NOT go to the Recycle Bin and "
+        L"cannot be undone.\n\n" + path + L"\n\n" + FormatSize(node->size);
+    if (node->dir) {
+        warn += L" across " + FormatCount(node->files) + L" files";
+    }
+    if (MessageBoxW(g_app.hwnd, warn.c_str(), L"Force remove",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+
+    // Third gate: name the processes that would have to die, and let the
+    // user stop here and close them properly instead. Critical processes
+    // are listed as refused rather than offered.
+    bool terminate = false;
+    const std::vector<Locker> lockers = FindLockers(path);
+    if (!lockers.empty()) {
+        std::wstring msg =
+            L"These programs currently have it open:\n\n";
+        size_t killable = 0;
+        for (size_t i = 0; i < lockers.size() && i < 12; ++i) {
+            msg += L"    " + SanitizeForDisplay(lockers[i].name);
+            if (lockers[i].critical) {
+                msg += L"  (system - will not be touched)";
+            } else {
+                ++killable;
+            }
+            msg += L'\n';
+        }
+        if (lockers.size() > 12) {
+            msg += L"    ...and " + FormatCount(lockers.size() - 12) +
+                   L" more\n";
+        }
+        msg += killable > 0
+                   ? L"\nEnd them and continue? Unsaved work in those "
+                     L"programs will be lost.\n\nNo is the safe answer: "
+                     L"close them yourself and try again."
+                   : L"\nAll of them are system processes that Spindle will "
+                     L"not end. The removal will probably fail.\n\n"
+                     L"Continue anyway?";
+        if (MessageBoxW(g_app.hwnd, msg.c_str(), L"Force remove",
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            return;
+        }
+        terminate = (killable > 0);
+    }
+
+    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const ForceRemoveResult r = ForceRemove(path, terminate);
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+
+    if (r.ok) {
+        // The tree on screen still contains what was just removed, and the
+        // cache describes the old state of exactly these files.
+        StartScan(g_app.selected, false);
+        return;
+    }
+
+    std::wstring failed =
+        L"Removed " + FormatCount(r.filesDeleted) +
+        L" items, then stopped.\n\n";
+    if (r.blocked) {
+        failed = L"Refused: that path is protected.\n\n";
+    } else if (!r.remaining.empty()) {
+        failed += L"Still held open by:\n";
+        for (size_t i = 0; i < r.remaining.size() && i < 8; ++i) {
+            failed += L"    " + SanitizeForDisplay(r.remaining[i].name) +
+                      L'\n';
+        }
+    } else if (r.lastError == ERROR_ACCESS_DENIED) {
+        failed += L"Access was denied. Running Spindle as administrator "
+                  L"would let it take ownership.";
+    } else if (r.lastError != 0) {
+        failed += L"Windows error " + std::to_wstring(r.lastError) + L".";
+    }
+    MessageBoxW(g_app.hwnd, failed.c_str(), L"Force remove",
+                MB_OK | MB_ICONWARNING);
+
+    if (r.filesDeleted > 0) StartScan(g_app.selected, false);
+}
+
 static void ShowCellMenu(int cellIndex, POINT screenPt) {
     if (cellIndex < 0 ||
         static_cast<size_t>(cellIndex) >= g_app.cells.size()) {
@@ -1564,6 +1666,9 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
     // pointing, not a stray keypress. The ellipsis is the Windows convention
     // for "asks before doing anything".
     AppendMenuW(menu, MF_STRING, 3, L"Move to Recycle Bin...");
+    // Force removal is permanent and can kill processes, so it sits below
+    // the reversible option and never becomes the default action.
+    AppendMenuW(menu, MF_STRING, 5, L"Force remove (permanent)...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 4, L"Export this folder to CSV\tCtrl+E");
 
@@ -1632,6 +1737,8 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
         }
     } else if (cmd == 4) {
         DoExport();
+    } else if (cmd == 5) {
+        DoForceRemove(path, node);
     }
 }
 

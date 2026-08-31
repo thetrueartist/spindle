@@ -1395,6 +1395,88 @@ static void TestScanCache() {
     CHECK(out.root.children.empty(), "bare root stays bare");
 }
 
+// ---------------------------------------------------------- force removal
+
+static void TestForceRemovalGuards() {
+    std::printf("Force removal guards\n");
+
+    // Volume roots and anything that is not a plain drive-letter path.
+    CHECK(IsProtectedSystemPath(L""), "empty refused");
+    CHECK(IsProtectedSystemPath(L"C:\\"), "drive root refused");
+    CHECK(IsProtectedSystemPath(L"C:"), "bare drive refused");
+    CHECK(IsProtectedSystemPath(L"D:\\"), "any drive root refused");
+    CHECK(IsProtectedSystemPath(L"\\\\?\\C:\\"), "extended root refused");
+    CHECK(IsProtectedSystemPath(L"\\\\server\\share\\x"), "UNC refused");
+    CHECK(IsProtectedSystemPath(L"\\\\?\\UNC\\server\\share"),
+          "extended UNC refused");
+
+    // The directories whose loss ends the machine.
+    CHECK(IsProtectedSystemPath(L"C:\\Windows"), "Windows refused");
+    CHECK(IsProtectedSystemPath(L"C:\\Windows\\System32"),
+          "inside Windows refused");
+    CHECK(IsProtectedSystemPath(L"c:\\wInDoWs\\system32\\drivers"),
+          "case-insensitive");
+    CHECK(IsProtectedSystemPath(L"C:\\Windows\\"), "trailing slash handled");
+    // Container roots: the directory itself is refused, because losing it
+    // whole is catastrophic.
+    CHECK(IsProtectedSystemPath(L"C:\\Program Files"),
+          "Program Files root refused");
+    CHECK(IsProtectedSystemPath(L"C:\\Program Files (x86)"),
+          "Program Files (x86) root refused");
+    CHECK(IsProtectedSystemPath(L"C:\\ProgramData"),
+          "ProgramData root refused");
+    CHECK(IsProtectedSystemPath(L"C:\\Users"), "Users root refused");
+    CHECK(IsProtectedSystemPath(L"c:\\users\\"),
+          "Users root refused with trailing slash");
+
+    // ...but their contents are the whole point of the feature: the
+    // abandoned application folder is what force removal is for.
+    CHECK(!IsProtectedSystemPath(L"C:\\Program Files\\DeadApp"),
+          "leftover app folder allowed");
+    CHECK(!IsProtectedSystemPath(L"C:\\Program Files (x86)\\DeadApp\\bin"),
+          "deep inside Program Files allowed");
+    CHECK(!IsProtectedSystemPath(L"C:\\ProgramData\\DeadApp"),
+          "leftover ProgramData allowed");
+    CHECK(!IsProtectedSystemPath(L"C:\\Users\\xander"),
+          "a whole profile is allowed (it is the user's own)");
+    CHECK(IsProtectedSystemPath(L"D:\\System Volume Information"),
+          "SVI refused on any volume");
+    CHECK(IsProtectedSystemPath(L"C:\\pagefile.sys"), "pagefile refused");
+    CHECK(IsProtectedSystemPath(L"C:\\hiberfil.sys"), "hiberfil refused");
+
+    // The whole point is that ordinary user data is still removable, and
+    // that a prefix match is not a path match.
+    CHECK(!IsProtectedSystemPath(L"C:\\Users\\xander\\Downloads\\big.iso"),
+          "a file in a profile is allowed");
+    CHECK(!IsProtectedSystemPath(L"D:\\Games\\Helldivers 2"),
+          "ordinary folder allowed");
+    CHECK(!IsProtectedSystemPath(L"C:\\WindowsApps"),
+          "WindowsApps is not Windows");
+    CHECK(!IsProtectedSystemPath(L"D:\\My Windows Backup"),
+          "substring is not a match");
+    CHECK(!IsProtectedSystemPath(L"C:\\Program Files Backup"),
+          "Program Files Backup allowed");
+    CHECK(!IsProtectedSystemPath(L"\\\\?\\D:\\Media\\video.mkv"),
+          "extended prefix stripped, then allowed");
+
+    // Processes that must never be killed to break a lock.
+    CHECK(IsCriticalProcess(L"anything.exe", 0), "pid 0 critical");
+    CHECK(IsCriticalProcess(L"anything.exe", 4), "pid 4 critical");
+    CHECK(IsCriticalProcess(L"csrss.exe", 900), "csrss critical");
+    CHECK(IsCriticalProcess(L"C:\\Windows\\System32\\lsass.exe", 901),
+          "full path stripped to leaf");
+    CHECK(IsCriticalProcess(L"WinLogon.EXE", 902), "case-insensitive");
+    CHECK(IsCriticalProcess(L"services.exe", 903), "services critical");
+    CHECK(IsCriticalProcess(L"spindle.exe", 904), "never kills itself");
+    CHECK(IsCriticalProcess(L"", 905), "unnamed treated as critical");
+
+    // ...and the ordinary programs that legitimately hold files open.
+    CHECK(!IsCriticalProcess(L"notepad.exe", 1200), "notepad killable");
+    CHECK(!IsCriticalProcess(L"steam.exe", 1201), "steam killable");
+    CHECK(!IsCriticalProcess(L"C:\\Games\\game.exe", 1202),
+          "game killable by full path");
+}
+
 // --------------------------------------------------------------- settings
 
 static void TestSettings() {
@@ -1466,6 +1548,7 @@ int main() {
     FuzzTreemap();
     TestScanCache();
     TestSettings();
+    TestForceRemovalGuards();
 
     std::printf("\n=== %d passed, %d failed ===\n\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

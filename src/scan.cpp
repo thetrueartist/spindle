@@ -18,7 +18,10 @@
 
 #include <windows.h>
 #include <process.h>
-#include <shlobj.h>   // SHGetFolderPathW, for the cache directory
+#include <shlobj.h>    // SHGetFolderPathW, for the cache directory
+#include <aclapi.h>    // SetNamedSecurityInfoW, for taking ownership
+#include <sddl.h>
+#include <restartmanager.h>   // RmStartSession: who has this file open
 
 #include <algorithm>
 #include <atomic>
@@ -610,6 +613,293 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
         return false;
     }
     return true;
+}
+
+// ------------------------------------------------------------ force removal
+//
+// The destructive path. Everything here is bounded by IsProtectedSystemPath,
+// checked first and re-checked per directory entry, because the recursion
+// below walks whatever the disk hands it.
+
+std::vector<Locker> FindLockers(const std::wstring& path) {
+    std::vector<Locker> out;
+    if (path.empty()) return out;
+
+    // Restart Manager is the documented way to ask "who has this open" -
+    // no driver, no handle-table walking, no injection.
+    DWORD  session = 0;
+    WCHAR  key[CCH_RM_SESSION_KEY + 1] = {};
+    if (RmStartSession(&session, 0, key) != ERROR_SUCCESS) return out;
+
+    LPCWSTR files[1] = {path.c_str()};
+    if (RmRegisterResources(session, 1, files, 0, nullptr, 0, nullptr) ==
+        ERROR_SUCCESS) {
+        UINT needed = 0, got = 0;
+        DWORD reason = 0;
+        // Ask for the count, then the list. A process can appear between
+        // the two calls, so this is a snapshot, not a guarantee.
+        UINT result = RmGetList(session, &needed, &got, nullptr, &reason);
+        if ((result == ERROR_MORE_DATA || result == ERROR_SUCCESS) &&
+            needed > 0 && needed < 1024) {
+            std::vector<RM_PROCESS_INFO> info(needed);
+            got = needed;
+            if (RmGetList(session, &needed, &got, info.data(), &reason) ==
+                ERROR_SUCCESS) {
+                for (UINT i = 0; i < got; ++i) {
+                    Locker l;
+                    l.pid  = info[i].Process.dwProcessId;
+                    l.name = info[i].strAppName;
+                    l.critical = IsCriticalProcess(l.name, l.pid);
+                    out.push_back(std::move(l));
+                }
+            }
+        }
+    }
+    RmEndSession(session);
+    return out;
+}
+
+namespace {
+
+// Strip the attributes that make DeleteFileW refuse before it starts.
+void ClearBlockingAttributes(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+    const DWORD blocking =
+        FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
+        FILE_ATTRIBUTE_SYSTEM;
+    if ((attrs & blocking) != 0) {
+        SetFileAttributesW(path.c_str(), attrs & ~blocking);
+    }
+}
+
+// Make the file deletable when the ACL says otherwise: become the owner,
+// then grant Administrators full control. Both steps need the process to be
+// elevated; unelevated they fail and the delete simply reports access
+// denied, which is the correct outcome.
+bool TakeOwnershipAndGrant(const std::wstring& path) {
+    // SE_TAKE_OWNERSHIP_NAME is not enabled by default even for an admin.
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(),
+                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        const wchar_t* privileges[] = {SE_TAKE_OWNERSHIP_NAME,
+                                       SE_RESTORE_NAME, SE_BACKUP_NAME};
+        for (const wchar_t* name : privileges) {
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (LookupPrivilegeValueW(nullptr, name,
+                                      &tp.Privileges[0].Luid)) {
+                AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr);
+            }
+        }
+        CloseHandle(token);
+    }
+
+    // The Administrators group, built from its well-known SID rather than a
+    // name lookup, which is localised.
+    BYTE sidBuf[SECURITY_MAX_SID_SIZE];
+    auto* admins = reinterpret_cast<PSID>(sidBuf);
+    DWORD sidSize = sizeof(sidBuf);
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, admins,
+                            &sidSize)) {
+        return false;
+    }
+
+    std::vector<wchar_t> mutablePath(path.begin(), path.end());
+    mutablePath.push_back(L'\0');
+
+    if (SetNamedSecurityInfoW(mutablePath.data(), SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION, admins, nullptr,
+                              nullptr, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    EXPLICIT_ACCESS_W ea{};
+    ea.grfAccessPermissions = GENERIC_ALL;
+    ea.grfAccessMode        = GRANT_ACCESS;
+    ea.grfInheritance       = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    ea.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType  = TRUSTEE_IS_GROUP;
+    ea.Trustee.ptstrName    = static_cast<LPWSTR>(admins);
+
+    PACL newAcl = nullptr;
+    if (SetEntriesInAclW(1, &ea, nullptr, &newAcl) != ERROR_SUCCESS) {
+        return false;
+    }
+    const DWORD rc =
+        SetNamedSecurityInfoW(mutablePath.data(), SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                              newAcl, nullptr);
+    if (newAcl) LocalFree(newAcl);
+    return rc == ERROR_SUCCESS;
+}
+
+// Delete one file, escalating only as far as it has to.
+bool DeleteOneFile(const std::wstring& path, DWORD& lastError) {
+    if (DeleteFileW(path.c_str())) return true;
+    lastError = GetLastError();
+
+    if (lastError == ERROR_ACCESS_DENIED) {
+        ClearBlockingAttributes(path);
+        if (DeleteFileW(path.c_str())) return true;
+        TakeOwnershipAndGrant(path);
+        if (DeleteFileW(path.c_str())) return true;
+        lastError = GetLastError();
+    }
+    return false;
+}
+
+bool RemoveOneDirectory(const std::wstring& path, DWORD& lastError) {
+    if (RemoveDirectoryW(path.c_str())) return true;
+    lastError = GetLastError();
+
+    if (lastError == ERROR_ACCESS_DENIED) {
+        ClearBlockingAttributes(path);
+        if (RemoveDirectoryW(path.c_str())) return true;
+        TakeOwnershipAndGrant(path);
+        if (RemoveDirectoryW(path.c_str())) return true;
+        lastError = GetLastError();
+    }
+    return false;
+}
+
+// Depth-first, iterative: nesting depth comes off the disk here exactly as
+// it does in the scanner, so this must not recurse. Directories are pushed
+// twice - once to enumerate, once to remove after their children are gone.
+bool DeleteTreeIterative(const std::wstring& root, uint64_t& deleted,
+                         DWORD& lastError) {
+    struct Frame {
+        std::wstring path;
+        bool         enumerated;
+    };
+    std::vector<Frame> stack;
+    stack.push_back({root, false});
+    bool allOk = true;
+
+    // The same bound the scanner uses; a structure deeper than this is not
+    // something to keep walking.
+    constexpr size_t kMaxPending = 1u << 20;
+
+    while (!stack.empty()) {
+        Frame frame = stack.back();
+        stack.pop_back();
+
+        const DWORD attrs = GetFileAttributesW(frame.path.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) continue;   // already gone
+
+        const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const bool isLink = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+        // A junction is removed as a link, never followed. Recursing
+        // through one would delete the target's contents - the same rule
+        // as the scanner, with far worse consequences for breaking it.
+        if (!isDir || isLink) {
+            DWORD err = 0;
+            const bool ok = isLink && isDir
+                                ? RemoveOneDirectory(frame.path, err)
+                                : DeleteOneFile(frame.path, err);
+            if (ok) {
+                ++deleted;
+            } else {
+                allOk = false;
+                if (err != 0) lastError = err;
+            }
+            continue;
+        }
+
+        if (!frame.enumerated) {
+            // Re-check per directory: the walk is following names off the
+            // disk, and a junction or a race could have led somewhere the
+            // caller never named.
+            if (IsProtectedSystemPath(frame.path)) {
+                allOk = false;
+                continue;
+            }
+            stack.push_back({frame.path, true});   // remove after children
+
+            WIN32_FIND_DATAW fd{};
+            const std::wstring pattern = frame.path + L"\\*";
+            const HANDLE h = FindFirstFileExW(pattern.c_str(),
+                                              FindExInfoBasic, &fd,
+                                              FindExSearchNameMatch, nullptr,
+                                              FIND_FIRST_EX_LARGE_FETCH);
+            if (h == INVALID_HANDLE_VALUE) {
+                lastError = GetLastError();
+                allOk = false;
+                continue;
+            }
+            do {
+                const wchar_t* n = fd.cFileName;
+                if (n[0] == L'.' &&
+                    (n[1] == 0 || (n[1] == L'.' && n[2] == 0))) {
+                    continue;
+                }
+                if (stack.size() >= kMaxPending) { allOk = false; break; }
+                stack.push_back({frame.path + L'\\' + n, false});
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+            continue;
+        }
+
+        DWORD err = 0;
+        if (RemoveOneDirectory(frame.path, err)) {
+            ++deleted;
+        } else {
+            allOk = false;
+            if (err != 0) lastError = err;
+        }
+    }
+    return allOk;
+}
+
+}  // namespace
+
+ForceRemoveResult ForceRemove(const std::wstring& path,
+                              bool terminateLockers) {
+    ForceRemoveResult res;
+
+    // The refusal lives here, not only in the dialog, so that no future
+    // caller can reach the destructive path without passing it.
+    if (path.empty() || IsProtectedSystemPath(path)) {
+        res.blocked = true;
+        return res;
+    }
+
+    if (terminateLockers) {
+        for (const Locker& l : FindLockers(path)) {
+            if (l.critical) {
+                res.remaining.push_back(l);
+                continue;   // never, whatever the user clicked
+            }
+            const HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, l.pid);
+            if (!h) {
+                res.remaining.push_back(l);
+                continue;
+            }
+            if (!TerminateProcess(h, 1)) {
+                res.remaining.push_back(l);
+            } else {
+                // Give the handles a moment to close before retrying the
+                // delete; a terminated process does not release instantly.
+                WaitForSingleObject(h, 3000);
+            }
+            CloseHandle(h);
+        }
+    }
+
+    DWORD lastError = 0;
+    res.ok = DeleteTreeIterative(path, res.filesDeleted, lastError);
+    res.lastError = lastError;
+
+    // Whatever still has it open, so the interface can say so by name
+    // rather than reporting a bare error code.
+    if (!res.ok) {
+        for (const Locker& l : FindLockers(path)) {
+            res.remaining.push_back(l);
+        }
+    }
+    return res;
 }
 
 std::wstring CacheDirPath() { return CacheDir(); }

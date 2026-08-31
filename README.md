@@ -23,7 +23,7 @@ profiles, which on a typical system is tens of gigabytes you cannot see.
 | Ctrl+E | export to CSV |
 | Backspace / mouse-back | go up |
 | Click a breadcrumb | jump to that level |
-| Right-click a block | show in Explorer, copy path, recycle |
+| Right-click a block | show in Explorer, copy path, recycle, force remove |
 | F5 | rescan |
 | Esc | cancel a running scan |
 
@@ -51,6 +51,24 @@ keyed to the volume serial and parsed with the same suspicion as everything
 else that comes off a disk.
 
 **Filenames are treated as hostile input.** See below.
+
+**Force removal, for the things that will not go.** The locked file, the
+folder whose ACL says no, the leftovers of an application whose uninstaller
+is long gone: right-click, *Force remove*. It deletes permanently, takes
+ownership when access is denied, and ends the processes holding the target
+open — found through the Restart Manager, the same way Windows finds them,
+with no injection and no handle-table games.
+
+Force applies to locks and permissions, never to the confirmations. It is a
+separate menu item below the reversible one, it is never the default, it has
+no keyboard shortcut, and it asks three times: once for the protected-path
+check, once with the size and file count for the permanent deletion, and
+once with the processes it would end, listed by name. No is the default
+answer every time. Drive roots, `\Windows`, `System Volume Information`, the
+boot files and the `Program Files` / `ProgramData` / `Users` roots are
+refused outright — not by the dialog, but in the removal code itself, so
+there is no path to them. It never terminates a system process, and never
+touches the registry.
 
 ## Building
 

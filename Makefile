@@ -38,6 +38,7 @@ CXXFLAGS := -std=c++17 -municode -O2 -DNDEBUG -DUNICODE -D_UNICODE \
 LDFLAGS  := -mwindows -static -static-libgcc -static-libstdc++ \
             -Wl,--gc-sections $(HARDEN_L)
 LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
+            -ladvapi32 -lrstrtmgr \
             -lcomdlg32 -luuid
 
 .PHONY: all test stress analyze clean dirs icon

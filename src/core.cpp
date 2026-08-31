@@ -954,6 +954,131 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
     return true;
 }
 
+// ----------------------------------------------------------- force removal
+
+namespace {
+
+std::wstring LowerAscii(const std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size());
+    for (wchar_t c : s) {
+        out.push_back((c >= L'A' && c <= L'Z')
+                          ? static_cast<wchar_t>(c - L'A' + L'a') : c);
+    }
+    return out;
+}
+
+// Does `path` name `leaf` directly under a drive root, or anything below it?
+// Compared component-wise so "C:\Windows" and "C:\Windows\System32" match
+// while "C:\WindowsApps" and "D:\My Windows Backup" do not.
+bool UnderDriveRelative(const std::wstring& lowerPath,
+                        const std::wstring& leaf) {
+    // "c:\" + leaf, and the path either ends there or continues with a
+    // separator. Anything else is a different directory that merely starts
+    // with the same letters.
+    if (lowerPath.size() < 3) return false;
+    if (lowerPath[1] != L':' || lowerPath[2] != L'\\') return false;
+    const std::wstring prefix = lowerPath.substr(0, 3) + leaf;
+    if (lowerPath.size() < prefix.size()) return false;
+    if (lowerPath.compare(0, prefix.size(), prefix) != 0) return false;
+    return lowerPath.size() == prefix.size() ||
+           lowerPath[prefix.size()] == L'\\';
+}
+
+// Is `path` exactly "<drive>:\<leaf>", the directory itself and nothing
+// inside it?
+bool IsDriveRelativeRoot(const std::wstring& lowerPath,
+                         const std::wstring& leaf) {
+    if (lowerPath.size() < 4) return false;
+    if (lowerPath[1] != L':' || lowerPath[2] != L'\\') return false;
+    return lowerPath.compare(3, std::wstring::npos, leaf) == 0;
+}
+
+}  // namespace
+
+bool IsProtectedSystemPath(const std::wstring& path) {
+    if (path.empty()) return true;   // nothing to delete: refuse
+
+    // Strip the extended-length prefix so the checks below see a plain path.
+    std::wstring p = path;
+    if (p.size() >= 8 && p.compare(0, 8, L"\\\\?\\UNC\\") == 0) {
+        return true;   // a network share has no local root to reason about
+    }
+    if (p.size() >= 4 && p.compare(0, 4, L"\\\\?\\") == 0) p = p.substr(4);
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') return true;  // UNC
+
+    // Trailing separators would make "C:\Windows\" miss the comparisons.
+    while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/')) {
+        p.pop_back();
+    }
+
+    const std::wstring lower = LowerAscii(p);
+
+    // A drive root: "C:", "C:\". Deleting one is deleting the volume.
+    if (lower.size() <= 3) {
+        return lower.size() < 2 || lower[1] == L':';
+    }
+    if (lower[1] != L':') return true;   // not a drive-letter path: refuse
+
+    // Tier one: the operating system itself. Nothing inside these is ever a
+    // legitimate target for a disk cleaner, so they are refused at and below
+    // the named directory.
+    static const wchar_t* const kRefusedTree[] = {
+        L"windows",      L"winnt",
+        L"system volume information",
+        L"$recycle.bin", L"recovery",
+        L"boot",
+        L"pagefile.sys", L"swapfile.sys", L"hiberfil.sys",
+        L"bootmgr",      L"ntldr",
+    };
+    for (const wchar_t* leaf : kRefusedTree) {
+        if (UnderDriveRelative(lower, leaf)) return true;
+    }
+
+    // Tier two: containers whose *contents* are exactly what force removal
+    // exists for - the abandoned application folder, the orphaned profile
+    // data. Losing one of these directories entirely is catastrophic;
+    // losing something inside it is Tuesday. So the root is refused and the
+    // contents are allowed.
+    static const wchar_t* const kRefusedRoot[] = {
+        L"program files", L"program files (x86)",
+        L"programdata",   L"users",
+        L"perflogs",
+    };
+    for (const wchar_t* leaf : kRefusedRoot) {
+        if (IsDriveRelativeRoot(lower, leaf)) return true;
+    }
+    return false;
+}
+
+bool IsCriticalProcess(const std::wstring& exeName, uint32_t pid) {
+    // The idle process and the kernel. Terminating either is not survivable.
+    if (pid <= 4) return true;
+
+    // Strip any directory part: the caller may pass a full image path.
+    std::wstring leaf = exeName;
+    const size_t slash = leaf.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) leaf = leaf.substr(slash + 1);
+    const std::wstring lower = LowerAscii(leaf);
+    if (lower.empty()) return true;   // unidentifiable: treat as critical
+
+    // Killing any of these bugchecks the machine or destroys the session.
+    // Spindle itself is on the list: terminating the process mid-delete
+    // leaves the operation half-finished with nothing to report it.
+    static const wchar_t* const kCritical[] = {
+        L"system",       L"smss.exe",     L"csrss.exe",
+        L"wininit.exe",  L"winlogon.exe", L"services.exe",
+        L"lsass.exe",    L"lsaiso.exe",   L"svchost.exe",
+        L"fontdrvhost.exe", L"dwm.exe",   L"memory compression",
+        L"registry",     L"secure system",
+        L"spindle.exe",
+    };
+    for (const wchar_t* name : kCritical) {
+        if (lower == name) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------- settings
 
 Settings ParseSettings(const uint8_t* data, size_t len) {
