@@ -641,10 +641,130 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
 
 // -------------------------------------------------------------- duplicates
 
+// How much of a file is enough to tell it apart from another of the same
+// length. 16 KB covers every practical header and costs one read.
+constexpr uint64_t kProbeBytes = 16u << 10;
+
+// Below this, tiering is pointless: the file is a single read anyway, and
+// probing head and tail would read most of it twice.
+constexpr uint64_t kSmallFile = 64u << 10;
+
+enum class OpenWhy { Ok, Cloud, Unreadable };
+
+// Open one candidate with every content-safety check applied to the handle
+// rather than to what the scan recorded.
+static HANDLE OpenCandidate(const std::wstring& rootPath,
+                            const std::wstring& rel, OpenWhy& why) {
+    // Names are validated where they enter (IsSafeNodeName), so `rel`
+    // cannot carry a separator, colon or NUL - and the join still goes
+    // through the extended-length form, which stops Win32 reinterpreting
+    // anything that did get through.
+    std::wstring full = rootPath;
+    if (!full.empty() && full.back() != L'\\') full += L'\\';
+    full += rel;
+    const std::wstring extended = ExtendedPath(full);
+
+    // FILE_FLAG_OPEN_NO_RECALL: if a file became a cloud placeholder since
+    // the scan, refuse it rather than silently costing a large download.
+    const HANDLE h = CreateFileW(
+        extended.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        why = (err == ERROR_CLOUD_FILE_ACCESS_DENIED || err == ERROR_NOT_READY)
+                  ? OpenWhy::Cloud : OpenWhy::Unreadable;
+        return h;
+    }
+
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    if (GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag,
+                                     sizeof(tag))) {
+        const DWORD deny = FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                           FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+                           FILE_ATTRIBUTE_OFFLINE;
+        if ((tag.FileAttributes & deny) != 0) {
+            CloseHandle(h);
+            why = OpenWhy::Cloud;
+            return INVALID_HANDLE_VALUE;
+        }
+        // A symlink would have us hash whatever it points at - an oracle
+        // for files only an elevated process can read.
+        if ((tag.FileAttributes &
+             (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+            CloseHandle(h);
+            why = OpenWhy::Unreadable;
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    why = OpenWhy::Ok;
+    return h;
+}
+
+// Digest `length` bytes starting at `offset`. `length` of UINT64_MAX means
+// "to the end". Returns false if any read failed.
+static bool HashRegion(HANDLE h, uint64_t offset, uint64_t length,
+                       std::vector<uint8_t>& buf, Digest& out,
+                       uint64_t& bytesRead, Progress* progress) {
+    LARGE_INTEGER li;
+    li.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) return false;
+
+    Hasher hasher;
+    uint64_t remaining = length;
+    while (remaining > 0) {
+        if (progress && progress->cancel.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        const DWORD want = static_cast<DWORD>(
+            std::min<uint64_t>(remaining, buf.size()));
+        DWORD got = 0;
+        if (!ReadFile(h, buf.data(), want, &got, nullptr)) return false;
+        if (got == 0) break;                  // end of file
+        hasher.Update(buf.data(), got);
+        bytesRead += got;
+        if (remaining != UINT64_MAX) remaining -= got;
+    }
+    out = hasher.Finish();
+    return true;
+}
+
+// Split a set of candidates by a digest just computed for each, dropping
+// anything that ended up alone - a file with no twin at this tier cannot
+// have one at any later tier either.
+static std::vector<std::vector<size_t>> Regroup(
+    const std::vector<size_t>& members,
+    const std::vector<std::pair<size_t, Digest>>& digests) {
+    std::vector<std::pair<size_t, Digest>> live;
+    live.reserve(members.size());
+    for (const auto& d : digests) live.push_back(d);
+
+    std::sort(live.begin(), live.end(),
+              [](const std::pair<size_t, Digest>& a,
+                 const std::pair<size_t, Digest>& b) {
+                  return a.second < b.second;
+              });
+
+    std::vector<std::vector<size_t>> out;
+    size_t i = 0;
+    while (i < live.size()) {
+        size_t j = i + 1;
+        while (j < live.size() && live[j].second == live[i].second) ++j;
+        if (j - i >= 2) {
+            std::vector<size_t> g;
+            g.reserve(j - i);
+            for (size_t k = i; k < j; ++k) g.push_back(live[k].first);
+            out.push_back(std::move(g));
+        }
+        i = j;
+    }
+    return out;
+}
+
 DupReport HashCandidates(std::vector<DupFile> candidates,
                          const std::wstring& rootPath, Progress* progress) {
     DupReport rep;
-
     std::vector<DupFile> hashed;
     hashed.reserve(candidates.size());
 
@@ -652,112 +772,131 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
     // without the allocation itself being a spike.
     std::vector<uint8_t> buf(1u << 20);
 
-    for (DupFile& f : candidates) {
-        if (progress && progress->cancel.load(std::memory_order_relaxed)) {
-            rep.cancelled = true;
-            break;
-        }
+    // Exact size is the only free grouping, so it goes first.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const DupFile& a, const DupFile& b) {
+                  return a.size < b.size;
+              });
 
-        // Names are validated where they enter (IsSafeNodeName), so f.path
-        // cannot carry a separator, colon or NUL - but the join is still
-        // done through the extended-length form, which stops Win32 from
-        // reinterpreting anything that did get through.
-        std::wstring full = rootPath;
-        if (!full.empty() && full.back() != L'\\') full += L'\\';
-        full += f.path;
-        const std::wstring extended = ExtendedPath(full);
-
-        // FILE_FLAG_OPEN_NO_RECALL is the belt to the placeholder check's
-        // braces: if a file became a cloud placeholder between the scan and
-        // now, this refuses to pull it down rather than silently costing
-        // the user a multi-gigabyte download.
-        const HANDLE h = CreateFileW(
-            extended.c_str(), GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-            OPEN_EXISTING,
-            FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
-            const DWORD err = GetLastError();
-            // A placeholder that would need fetching reports this rather
-            // than downloading itself, which is exactly what was wanted.
-            if (err == ERROR_CLOUD_FILE_ACCESS_DENIED ||
-                err == ERROR_NOT_READY) {
-                ++rep.skippedCloud;
-            } else {
-                ++rep.skippedUnread;
-            }
-            continue;
-        }
-
-        // Re-check on the handle, not on what the scan recorded. The scan
-        // may have been the MFT path, which cannot see cloud or reparse
-        // attributes at all, and in any case a file can become a
-        // placeholder or be swapped for a link between the scan and here.
-        // This is the only check that describes the object actually opened.
-        {
-            FILE_ATTRIBUTE_TAG_INFO tag{};
-            if (GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag,
-                                             sizeof(tag))) {
-                const DWORD deny =
-                    FILE_ATTRIBUTE_RECALL_ON_OPEN |
-                    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
-                    FILE_ATTRIBUTE_OFFLINE;
-                if ((tag.FileAttributes & deny) != 0) {
-                    ++rep.skippedCloud;   // reading it would fetch it
-                    CloseHandle(h);
-                    continue;
-                }
-                if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-                    // A symlink would have us hash whatever it points at -
-                    // an oracle for the contents of files only an elevated
-                    // process can read.
-                    ++rep.skippedUnread;
-                    CloseHandle(h);
-                    continue;
-                }
-                if ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-                    ++rep.skippedUnread;
-                    CloseHandle(h);
-                    continue;
-                }
-            }
-        }
-
-        Hasher hasher;
-        bool ok = true;
-        uint64_t read = 0;
-        for (;;) {
+    // Probe a tier across one group and split it by the result. Files that
+    // fail to open or read are dropped from consideration and counted.
+    const auto probeTier = [&](const std::vector<size_t>& members,
+                               uint64_t offset, uint64_t length)
+        -> std::vector<std::vector<size_t>> {
+        std::vector<std::pair<size_t, Digest>> digests;
+        digests.reserve(members.size());
+        for (size_t idx : members) {
             if (progress && progress->cancel.load(std::memory_order_relaxed)) {
-                ok = false;
                 rep.cancelled = true;
-                break;
+                return {};
             }
-            DWORD got = 0;
-            if (!ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got,
-                          nullptr)) {
-                ok = false;
-                break;
+            OpenWhy why = OpenWhy::Unreadable;
+            const HANDLE h = OpenCandidate(rootPath, candidates[idx].path, why);
+            if (h == INVALID_HANDLE_VALUE) {
+                if (why == OpenWhy::Cloud) ++rep.skippedCloud;
+                else ++rep.skippedUnread;
+                continue;
             }
-            if (got == 0) break;   // end of file
-            hasher.Update(buf.data(), got);
-            read += got;
+            Digest d;
+            const bool ok = HashRegion(h, offset, length, buf, d,
+                                       rep.bytesHashed, progress);
+            CloseHandle(h);
+            if (!ok) {
+                if (progress &&
+                    progress->cancel.load(std::memory_order_relaxed)) {
+                    rep.cancelled = true;
+                    return {};
+                }
+                ++rep.skippedUnread;
+                continue;
+            }
+            digests.push_back({idx, d});
+            if (progress) {
+                progress->bytes.store(rep.bytesHashed,
+                                      std::memory_order_relaxed);
+            }
         }
-        CloseHandle(h);
+        return Regroup(members, digests);
+    };
 
-        if (!ok) {
-            if (!rep.cancelled) ++rep.skippedUnread;
+    size_t i = 0;
+    while (i < candidates.size() && !rep.cancelled) {
+        size_t j = i + 1;
+        while (j < candidates.size() &&
+               candidates[j].size == candidates[i].size) {
+            ++j;
+        }
+        const uint64_t size = candidates[i].size;
+
+        std::vector<size_t> group;
+        group.reserve(j - i);
+        for (size_t k = i; k < j; ++k) group.push_back(k);
+        i = j;
+        if (group.size() < 2) continue;   // a unique size cannot duplicate
+
+        std::vector<std::vector<size_t>> live{std::move(group)};
+
+        // Tier 1 and 2: head, then tail. Most files that merely share a
+        // size differ within the first few kilobytes, and the ones that do
+        // not are usually a format with a fixed header - disk images,
+        // media containers - which the tail then separates. A file only
+        // reaches the full read if it survives both.
+        if (size > kSmallFile) {
+            for (int tier = 0; tier < 2 && !rep.cancelled; ++tier) {
+                const uint64_t off = (tier == 0) ? 0 : size - kProbeBytes;
+                std::vector<std::vector<size_t>> next;
+                for (const auto& g : live) {
+                    auto split = probeTier(g, off, kProbeBytes);
+                    for (auto& sub : split) next.push_back(std::move(sub));
+                    if (rep.cancelled) break;
+                }
+                live = std::move(next);
+                if (live.empty()) break;
+            }
+        }
+
+        // Whatever still shares a size, a head and a tail is now read in
+        // full: only a complete digest is allowed to call two files equal.
+        for (const auto& g : live) {
             if (rep.cancelled) break;
-            continue;
-        }
-
-        f.digest = hasher.Finish();
-        rep.bytesHashed = SatAdd(rep.bytesHashed, read);
-        ++rep.filesHashed;
-        hashed.push_back(f);
-
-        if (progress) {
-            progress->files.store(rep.filesHashed, std::memory_order_relaxed);
-            progress->bytes.store(rep.bytesHashed, std::memory_order_relaxed);
+            std::vector<std::pair<size_t, Digest>> digests;
+            for (size_t idx : g) {
+                if (progress &&
+                    progress->cancel.load(std::memory_order_relaxed)) {
+                    rep.cancelled = true;
+                    break;
+                }
+                OpenWhy why = OpenWhy::Unreadable;
+                const HANDLE h =
+                    OpenCandidate(rootPath, candidates[idx].path, why);
+                if (h == INVALID_HANDLE_VALUE) {
+                    if (why == OpenWhy::Cloud) ++rep.skippedCloud;
+                    else ++rep.skippedUnread;
+                    continue;
+                }
+                Digest d;
+                const bool ok = HashRegion(h, 0, UINT64_MAX, buf, d,
+                                           rep.bytesHashed, progress);
+                CloseHandle(h);
+                if (!ok) {
+                    if (progress &&
+                        progress->cancel.load(std::memory_order_relaxed)) {
+                        rep.cancelled = true;
+                        break;
+                    }
+                    ++rep.skippedUnread;
+                    continue;
+                }
+                candidates[idx].digest = d;
+                hashed.push_back(candidates[idx]);
+                ++rep.filesHashed;
+                if (progress) {
+                    progress->files.store(rep.filesHashed,
+                                          std::memory_order_relaxed);
+                    progress->bytes.store(rep.bytesHashed,
+                                          std::memory_order_relaxed);
+                }
+            }
         }
     }
 

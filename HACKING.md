@@ -90,6 +90,17 @@ bounded twice over.
 **Reparse points are never traversed.** Junctions and symlinks would loop or
 double-count.
 
+**A file is never read in full to prove it is different.** Sharing a size
+makes two files *possible* duplicates, not actual ones, and the original
+finder spent a whole file discovering otherwise - two 40 GB images differing
+in their first block cost 80 GB of reading. Comparison is tiered: exact size
+(free), then a 16 KB head, then a 16 KB tail, and only what survives all
+three is read in full. The tail tier exists because disk images and media
+containers share fixed headers, so a head probe alone does not separate them.
+Only a complete digest is ever allowed to call two files equal. Measured on
+20 same-size files differing at byte 0: 3.24s to 0.28s cold, 7.09s to 0.14s
+warm.
+
 **Anything that reads the disk runs off the UI thread.** The scan always
 did; the duplicate hunt did not, and a window that never pumps its message
 loop is a window Windows paints a spinning cursor over and marks Not
