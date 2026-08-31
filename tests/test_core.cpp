@@ -1395,6 +1395,44 @@ static void TestScanCache() {
     CHECK(out.root.children.empty(), "bare root stays bare");
 }
 
+// --------------------------------------------------------------- settings
+
+static void TestSettings() {
+    std::printf("Settings\n");
+
+    const Settings d;
+    CHECK(d.keepCaches && d.resumeOnLaunch, "defaults are on");
+    CHECK(ParseSettings(nullptr, 0).keepCaches, "null input keeps defaults");
+
+    const char* junk = "\xFF\xFE not a settings file == = \n\n=";
+    const Settings j =
+        ParseSettings(reinterpret_cast<const uint8_t*>(junk), strlen(junk));
+    CHECK(j.keepCaches && j.resumeOnLaunch, "garbage keeps defaults");
+
+    Settings s;
+    std::vector<uint8_t> buf;
+    s.keepCaches = false;
+    s.resumeOnLaunch = true;
+    SerializeSettings(s, buf);
+    Settings r = ParseSettings(buf.data(), buf.size());
+    CHECK(!r.keepCaches && r.resumeOnLaunch, "round-trips");
+
+    s.keepCaches = true;
+    s.resumeOnLaunch = false;
+    SerializeSettings(s, buf);
+    r = ParseSettings(buf.data(), buf.size());
+    CHECK(r.keepCaches && !r.resumeOnLaunch, "round-trips the other way");
+
+    const char* mixed = "unknown_key=7\r\nkeep_caches=0\r\nfuture=stuff\n";
+    r = ParseSettings(reinterpret_cast<const uint8_t*>(mixed), strlen(mixed));
+    CHECK(!r.keepCaches && r.resumeOnLaunch,
+          "unknown keys ignored, CRLF handled");
+
+    const std::vector<uint8_t> big(kMaxSettingsBytes + 1, 'x');
+    r = ParseSettings(big.data(), big.size());
+    CHECK(r.keepCaches, "oversize input keeps defaults");
+}
+
 int main() {
     std::printf("\n=== Spindle core tests ===\n\n");
 
@@ -1427,6 +1465,7 @@ int main() {
     FuzzSanitize();
     FuzzTreemap();
     TestScanCache();
+    TestSettings();
 
     std::printf("\n=== %d passed, %d failed ===\n\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

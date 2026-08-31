@@ -108,6 +108,28 @@ std::wstring CachePathForVolume(const std::wstring& volumePath);
 bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
                    CacheMeta& meta);
 bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res);
+std::wstring CacheDirPath();
+void ClearScanCaches();
+
+// ------------------------------------------------------------------ settings
+//
+// Two booleans. Persisted as key=value lines beside the caches - the
+// registry stays untouched, per the security posture - and parsed with the
+// usual suspicion even though the file is normally our own.
+
+struct Settings {
+    bool keepCaches     = true;   // write and load .spincache files
+    bool resumeOnLaunch = true;   // open the freshest cached drive at start
+};
+
+inline constexpr size_t kMaxSettingsBytes = 4096;
+
+Settings ParseSettings(const uint8_t* data, size_t len);
+void SerializeSettings(const Settings& s, std::vector<uint8_t>& out);
+
+// Windows-only, implemented in scan.cpp.
+Settings LoadSettings();
+bool SaveSettings(const Settings& s);
 
 // Progress is polled by the UI thread while a scan runs. Relaxed ordering is
 // fine: these are display counters, nothing branches on them.

@@ -612,4 +612,78 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
     return true;
 }
 
+std::wstring CacheDirPath() { return CacheDir(); }
+
+void ClearScanCaches() {
+    const std::wstring dir = CacheDir();
+    if (dir.empty()) return;
+
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = dir + L"\\*.spincache";
+    const HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// ---------------------------------------------------------------- settings
+
+static std::wstring SettingsPath() {
+    const std::wstring dir = CacheDir();
+    if (dir.empty()) return {};
+    return dir + L"\\settings.txt";
+}
+
+Settings LoadSettings() {
+    Settings s;
+    const std::wstring path = SettingsPath();
+    if (path.empty()) return s;
+
+    const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                 nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return s;
+
+    uint8_t buf[kMaxSettingsBytes];
+    DWORD got = 0;
+    const bool ok = ReadFile(h, buf, sizeof(buf), &got, nullptr) != 0;
+    CloseHandle(h);
+    if (!ok) return s;
+    return ParseSettings(buf, got);
+}
+
+bool SaveSettings(const Settings& s) {
+    const std::wstring path = SettingsPath();
+    if (path.empty()) return false;
+
+    std::vector<uint8_t> bytes;
+    SerializeSettings(s, bytes);
+
+    // Same temp-and-swap as the caches: never a torn file.
+    const std::wstring tmp = path + L".tmp";
+    const HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                 nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    DWORD written = 0;
+    const bool ok =
+        WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()),
+                  &written, nullptr) != 0 &&
+        written == bytes.size();
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
 }  // namespace spindle

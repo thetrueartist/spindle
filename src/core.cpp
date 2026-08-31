@@ -954,6 +954,44 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
     return true;
 }
 
+// ---------------------------------------------------------------- settings
+
+Settings ParseSettings(const uint8_t* data, size_t len) {
+    Settings s;
+    if (data == nullptr || len == 0 || len > kMaxSettingsBytes) return s;
+
+    // key=value per line. Unknown keys are ignored, so an older build reads
+    // a newer file without drama; anything malformed just keeps a default.
+    std::string line;
+    for (size_t i = 0; i <= len; ++i) {
+        const char c = (i < len) ? static_cast<char>(data[i]) : '\n';
+        if (c != '\n' && c != '\r') {
+            if (line.size() < 128) line.push_back(c);
+            continue;
+        }
+        const size_t eq = line.find('=');
+        if (eq != std::string::npos) {
+            const std::string key = line.substr(0, eq);
+            const bool value = (line.substr(eq + 1) == "1");
+            if (key == "keep_caches") {
+                s.keepCaches = value;
+            } else if (key == "resume_on_launch") {
+                s.resumeOnLaunch = value;
+            }
+        }
+        line.clear();
+    }
+    return s;
+}
+
+void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
+    out.clear();
+    const std::string text =
+        std::string("keep_caches=") + (s.keepCaches ? "1" : "0") +
+        "\nresume_on_launch=" + (s.resumeOnLaunch ? "1" : "0") + "\n";
+    out.assign(text.begin(), text.end());
+}
+
 
 // ------------------------------------------------------------------ search
 
