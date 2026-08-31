@@ -1,241 +1,84 @@
-// Spindle - shared types and the public interface of every module.
-//
-// This header is included by the portable core, the Windows-only modules and
-// the host-side tests alike, so it must not pull in windows.h. Anything that
-// needs a Win32 type belongs in scan.cpp, mft.cpp or ui.cpp.
+// Spindle - disk space analyser
+// Core types shared between the scanner, treemap layout and UI.
+#pragma once
 
-#ifndef SPINDLE_H_
-#define SPINDLE_H_
-
-#include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <atomic>
 
 namespace spindle {
 
 // ---------------------------------------------------------------- categories
 
-// What a file *is*, decided once at scan time from its extension. The map is
-// coloured by this, which is the one thing a size-only treemap cannot tell
-// you. Directory is first so index 0 stays the neutral folder shade, and the
-// order must match theme::kCat in ui.cpp.
+// Files are coloured by what they are, not at random. The category is decided
+// once at scan time from the extension and never recomputed during rendering.
 enum class Cat : uint8_t {
     Directory = 0,
-    Media,
-    Game,
-    Archive,
-    Code,
-    Document,
-    Binary,
-    VirtualDisk,
-    Database,
-    System,
+    Media,        // video, audio, images
+    Game,         // game package/asset formats
+    Archive,      // zip, 7z, tar, installers
+    Code,         // source, headers, scripts
+    Document,     // text, pdf, office
+    Binary,       // exe, dll, sys, obj
+    VirtualDisk,  // vmdk, vhdx, iso, dumps
+    Database,     // sqlite, db, mdb, log-structured stores
+    System,       // anything under a known OS-owned path
     Other,
-    COUNT,
+    COUNT
 };
 
 const wchar_t* CatName(Cat c);
+
+// Decide a category from a filename. Extension match is case-insensitive.
 Cat CategoryForFile(const std::wstring& name);
 
-// -------------------------------------------------------------------- sizes
+// ---------------------------------------------------------------------- tree
 
-// Every size accumulation goes through this. A volume reporting absurd sizes
-// must clamp at the top of the range, not wrap around to something small and
-// quietly vanish from the map.
-inline uint64_t SatAdd(uint64_t a, uint64_t b) {
-    return (b > UINT64_MAX - a) ? UINT64_MAX : a + b;
-}
-
-// --------------------------------------------------------------------- tree
-
-// One scanned file or directory. Sized with intent: the whole tree is held in
-// memory so navigation is instant, and at two million nodes every byte here
-// is two megabytes there.
 struct Node {
-    std::wstring      name;
-    std::vector<Node> children;
-    uint64_t          size  = 0;   // files: logical length; dirs: rolled up
-    uint64_t          files = 0;   // files: 1; dirs: files anywhere below
-    Cat               cat   = Cat::Other;
-    bool              dir   = false;
-};
-
-// Fills in directory sizes and file counts from the leaves. Iterative: the
-// nesting depth of a scanned tree comes off the disk and is not ours to
-// trust, so no walk in this codebase may recurse on it.
-inline void RollUp(Node& root) {
-    struct Frame {
-        Node*  node;
-        size_t next;
-    };
-    std::vector<Frame> stack;
-    stack.push_back(Frame{&root, 0});
-
-    while (!stack.empty()) {
-        Frame& f = stack.back();
-        if (f.next < f.node->children.size()) {
-            Node* child = &f.node->children[f.next];
-            ++f.next;
-            if (child->dir && !child->children.empty()) {
-                stack.push_back(Frame{child, 0});
-            }
-            continue;
-        }
-        if (f.node->dir) {
-            uint64_t bytes = 0;
-            uint64_t count = 0;
-            for (const Node& c : f.node->children) {
-                bytes = SatAdd(bytes, c.size);
-                count = SatAdd(count, c.files);
-            }
-            f.node->size  = bytes;
-            f.node->files = count;
-        }
-        stack.pop_back();
-    }
-}
-
-// Largest-first within every directory, so identical trees always lay out
-// identically. Iterative for the same reason as RollUp.
-inline void SortTree(Node& root) {
-    std::vector<Node*> stack;
-    stack.push_back(&root);
-    while (!stack.empty()) {
-        Node* n = stack.back();
-        stack.pop_back();
-        std::sort(n->children.begin(), n->children.end(),
-                  [](const Node& a, const Node& b) { return a.size > b.size; });
-        for (Node& c : n->children) {
-            if (!c.children.empty()) stack.push_back(&c);
-        }
-    }
-}
-
-// ------------------------------------------------------------------ geometry
-
-struct Rect {
-    float x = 0.0f;
-    float y = 0.0f;
-    float w = 0.0f;
-    float h = 0.0f;
-
-    float right() const { return x + w; }
-    float bottom() const { return y + h; }
-    bool contains(float px, float py) const {
-        return px >= x && px < x + w && py >= y && py < y + h;
-    }
-};
-
-// ------------------------------------------------------------------- treemap
-
-// One drawn block. `parent` indexes the cell this one nests inside (-1 at the
-// top level): cells sit up to five levels below the viewed directory, so the
-// on-screen breadcrumb plus a cell's own name is *not* its path, and the full
-// chain has to be rebuilt through these links. `header` and `expanded` mark a
-// directory that reserved a label strip and drew its children below it.
-struct Cell {
-    const Node* node     = nullptr;
-    Rect        rect;
-    int         depth    = 0;
-    float       header   = 0.0f;
-    bool        expanded = false;
-    int         parent   = -1;
-};
-
-// Squarified layout (Bruls, Huizing & van Wijk, 2000) of `node`'s subtree
-// into `bounds`, emitted parent-before-child. minArea is the smallest cell
-// worth drawing, in square DIPs.
-void BuildTreemap(const Node& node, Rect bounds, int maxDepth, float minArea,
-                  std::vector<Cell>& out);
-
-// Deepest cell under the point, or -1 / nullptr.
-int HitTestIndex(const std::vector<Cell>& cells, float x, float y);
-const Cell* HitTest(const std::vector<Cell>& cells, float x, float y);
-
-// The node chain from the viewed directory down to `index`, outermost first,
-// rebuilt through the parent links. Bounded internally, so a corrupted link
-// terminates instead of spinning.
-std::vector<const Node*> CellChain(const std::vector<Cell>& cells, int index);
-
-// ------------------------------------------------------------------- display
-
-std::wstring FormatSize(uint64_t bytes);
-std::wstring FormatCount(uint64_t n);
-
-// Strips C0/C1 controls, bidi overrides and zero-width characters, replacing
-// each with a visible open-box mark. Filenames are attacker-controlled input
-// and a bidi override in one reorders everything drawn after it.
-std::wstring SanitizeForDisplay(const std::wstring& in,
-                                bool* modified = nullptr);
-
-// ----------------------------------------------------------------- reporting
-
-struct ExtStat {
-    std::wstring ext;
-    uint64_t     bytes = 0;
-    uint64_t     count = 0;
+    std::wstring name;
+    uint64_t     size  = 0;   // bytes, inclusive of children for directories
+    uint32_t     files = 0;   // file count in subtree
+    bool         dir   = false;
     Cat          cat   = Cat::Other;
+    std::vector<Node> children;
+
+    Node() = default;
+    Node(std::wstring n, bool d) : name(std::move(n)), dir(d) {}
 };
 
-struct FileHit {
-    const Node*  node = nullptr;
-    std::wstring path;   // relative to the subtree the report ran over
-    uint64_t     size = 0;
+// Saturating add. File sizes come from the filesystem and a corrupt or hostile
+// volume can report values that would otherwise wrap a 64-bit accumulator.
+inline uint64_t SatAdd(uint64_t a, uint64_t b) {
+    return (a > UINT64_MAX - b) ? UINT64_MAX : a + b;
+}
+
+// --------------------------------------------------------------- scan result
+
+struct ScanStats {
+    uint64_t bytes       = 0;
+    uint64_t fileCount   = 0;
+    uint64_t dirCount    = 0;
+    uint64_t deniedCount = 0;
+    double   seconds     = 0.0;
+    // A worker aborted on an exception. The tree is usable but incomplete,
+    // and the interface says so rather than presenting partial totals as
+    // though they were the whole volume.
+    bool     faulted     = false;
+    // The scan read the Master File Table rather than walking directories.
+    bool     usedMft     = false;
 };
 
-std::vector<ExtStat> ExtensionBreakdown(const Node& root, size_t limit);
-std::vector<FileHit> LargestFiles(const Node& root, size_t limit);
-std::vector<FileHit> FindByName(const Node& root, const std::wstring& needle,
-                                size_t limit);
-
-bool ExportCsv(const Node& root, const std::wstring& rootPath,
-               const std::wstring& outPath);
-
-// Implemented in scan.cpp on Windows; the host test harness supplies its own,
-// which is what lets ExportCsv run under the sanitizers.
-bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text);
-
-// -------------------------------------------------------------------- search
-
-// A parsed Find query. Every populated term must match, so a query reads as a
-// sentence: "kind:media >500mb -temp".
-struct Query {
-    enum class Only { Any, Files, Folders };
-
-    std::vector<std::wstring> include;   // lower-cased name substrings
-    std::vector<std::wstring> exclude;
-    std::vector<Cat>          kinds;
-    std::vector<std::wstring> exts;      // lower-cased, no leading dot
-    uint64_t                  minSize = 0;
-    uint64_t                  maxSize = UINT64_MAX;
-    Only                      only    = Only::Any;
-
-    bool Empty() const {
-        return include.empty() && exclude.empty() && kinds.empty() &&
-               exts.empty() && minSize == 0 && maxSize == UINT64_MAX &&
-               only == Only::Any;
-    }
+struct ScanResult {
+    Node      root;
+    ScanStats stats;
+    std::vector<std::wstring> denied;   // capped; see kMaxDeniedRecorded
 };
 
-bool CatFromToken(const std::wstring& token, Cat& out);
-Query ParseQuery(const std::wstring& text);
-bool QueryMatches(const Query& q, const Node& n);
-std::vector<FileHit> FindMatching(const Node& root, const Query& q,
-                                  size_t limit);
+inline constexpr size_t kMaxDeniedRecorded = 512;
 
-// ------------------------------------------------------------------ scanning
-
-struct Volume {
-    std::wstring path;       // "C:\"
-    std::wstring label;
-    uint64_t     capacity = 0;
-    uint64_t     free     = 0;
-};
-
-// Shared between the scan thread and the UI. Counters are relaxed atomics:
-// they feed a progress line, not a decision.
+// Progress is polled by the UI thread while a scan runs. Relaxed ordering is
+// fine: these are display counters, nothing branches on them.
 struct Progress {
     std::atomic<uint64_t> files{0};
     std::atomic<uint64_t> dirs{0};
@@ -244,44 +87,209 @@ struct Progress {
     std::atomic<bool>     done{false};
 };
 
-struct ScanStats {
-    uint64_t fileCount   = 0;
-    uint64_t dirCount    = 0;
-    uint64_t bytes       = 0;
-    uint64_t deniedCount = 0;   // directories the scan could not open
-    double   seconds     = 0.0;
-    bool     usedMft     = false;
-    bool     faulted     = false;   // a worker died; the tree is incomplete
-};
+// Walk `root` and return the aggregated tree. Reparse points are never
+// followed, so junctions and symlinks cannot loop or double-count.
+//
+// Prefers the NTFS Master File Table when it is available -- local NTFS
+// volume, elevated process -- and falls back to a parallel directory walk
+// otherwise. Both paths produce the same tree; the MFT path is far faster.
+ScanResult Scan(const std::wstring& root, unsigned threads, Progress* progress);
 
-struct ScanResult {
-    Node      root;
-    ScanStats stats;
+// Reads the tree from the volume's Master File Table. Returns false, having
+// changed nothing observable, whenever the fast path is unavailable.
+bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out);
+
+// True when the last completed scan used the MFT rather than the walker.
+// Purely informational; both paths agree on the result.
+
+// ------------------------------------------------------------------- volumes
+
+struct Volume {
+    std::wstring path;       // "C:\"
+    std::wstring label;      // volume name, may be empty
+    std::wstring fs;         // "NTFS"
+    uint64_t     capacity = 0;
+    uint64_t     free     = 0;
+    bool         ready    = false;
 };
 
 std::vector<Volume> EnumerateVolumes();
 
-// Scans `root` and returns the finished tree, rolled up and sorted. Tries the
-// MFT fast path first where it applies, then falls back to the parallel
-// directory walk. Cancellation is polled from `progress`.
-ScanResult Scan(const std::wstring& root, uint32_t threads,
-                Progress* progress);
+// ------------------------------------------------------------------ treemap
 
-// The MFT fast path (mft.cpp). Returns false - leaving `outRoot` untouched -
-// on anything unexpected at all, from a non-NTFS volume to a record that
-// fails validation; the caller falls back to the directory walk.
-bool ScanWithMft(const std::wstring& root, Progress* progress, Node& outRoot,
-                 ScanStats& outStats);
+struct Rect {
+    float x = 0, y = 0, w = 0, h = 0;
+    float right()  const { return x + w; }
+    float bottom() const { return y + h; }
+    bool  contains(float px, float py) const {
+        return px >= x && px < x + w && py >= y && py < y + h;
+    }
+};
 
-// -------------------------------------------------------------------- easing
+struct Cell {
+    const Node* node   = nullptr;
+    Rect        rect;
+    int         depth  = 0;
 
+    // Height of the label strip reserved at the top of this cell. Children are
+    // laid out below it, so the parent's own label never collides with theirs.
+    // Zero means no strip was reserved.
+    float       header = 0.0f;
+
+    // True when child cells were laid out inside this one. An expanded cell
+    // with no header must not draw a label: its children cover the area.
+    bool        expanded = false;
+
+    // Index of the enclosing cell in the same vector, or -1 at the top level.
+    // Cells nest several levels below the directory being viewed, so the
+    // breadcrumb alone does not identify a cell: without this chain a nested
+    // cell's path is missing every intermediate directory.
+    int         parent = -1;
+};
+
+// ------------------------------------------------------------------ easing
+
+// Easing curves. All take and return a normalised 0..1.
+//
+// The default choice everywhere is OutQuint: it covers most of the distance in
+// the first third of the duration, which is what makes a transition read as
+// instant while still showing what moved. A symmetric curve at the same
+// duration feels sluggish even though it takes exactly as long.
 namespace ease {
-float OutQuint(float t);
-float OutCubic(float t);
-float OutBack(float t);
-float InOutCubic(float t);
+
+float OutQuint(float t);   // very fast start, long gentle settle
+float OutCubic(float t);   // gentler; for things that should not snap
+float OutBack(float t);    // slight overshoot, for arrival emphasis
+float InOutCubic(float t); // symmetric, for reversible movement
+
 }  // namespace ease
 
-}  // namespace spindle
+// Squarified treemap (Bruls, Huizing & van Wijk 2000).
+//
+// Lays out `node`'s subtree into `bounds`, descending only while a cell is
+// large enough to be worth drawing. `minArea` is in square pixels and bounds
+// the output size: without it a 1.6M-file volume would emit 1.6M cells.
+void BuildTreemap(const Node& node, Rect bounds, int maxDepth, float minArea,
+                  std::vector<Cell>& out);
 
-#endif  // SPINDLE_H_
+// Index of the topmost (deepest) cell containing the point, or -1.
+int HitTestIndex(const std::vector<Cell>& cells, float x, float y);
+
+// As above, returning the cell itself. Prefer HitTestIndex where the full
+// path is needed: the index is what lets the parent chain be walked.
+const Cell* HitTest(const std::vector<Cell>& cells, float x, float y);
+
+// Names from the outermost cell down to `index`, inclusive. Empty if the
+// index is out of range. Does not include the directory being viewed.
+std::vector<const Node*> CellChain(const std::vector<Cell>& cells, int index);
+
+// ------------------------------------------------------------------ display
+
+// --------------------------------------------------------------- reporting
+
+// Aggregate for one file extension, the breakdown every comparable tool
+// shows: which kinds of file are actually consuming the volume.
+struct ExtStat {
+    std::wstring ext;      // lower case, without the dot; empty = no extension
+    uint64_t     bytes = 0;
+    uint32_t     count = 0;
+    Cat          cat   = Cat::Other;
+};
+
+// Extension totals across a subtree, largest first. `limit` caps the result;
+// the remainder is folded into a trailing "other" row so the totals still add
+// up to the subtree.
+std::vector<ExtStat> ExtensionBreakdown(const Node& root, size_t limit);
+
+// Largest files in a subtree, largest first. Directories are excluded: this
+// answers "what single files should I look at", which a treemap makes you
+// hunt for.
+struct FileHit {
+    const Node*  node = nullptr;
+    std::wstring path;   // relative to the subtree root
+    uint64_t     size = 0;
+};
+std::vector<FileHit> LargestFiles(const Node& root, size_t limit);
+
+// ------------------------------------------------------------------ search
+
+// A parsed search query.
+//
+// Bare words match the name. Prefixed terms filter by kind, extension, size
+// or type, and every term must match -- so `kind:media >500mb` is "media
+// files over 500 MB", which is the question people actually have when a drive
+// fills up. The alternative, a row of dropdowns, takes longer to operate than
+// typing it.
+//
+//   pak                 name contains "pak"
+//   "two words"         name contains the quoted phrase
+//   kind:media          one of the categories in the Kinds panel
+//   ext:vmdk            exact extension
+//   >500mb  <2gb        size bounds; b/kb/mb/gb/tb, or bare bytes
+//   size:>1gb           same, spelled out
+//   is:file is:folder   restrict to one or the other
+//   -temp               name must NOT contain "temp"
+struct Query {
+    std::vector<std::wstring> include;   // name substrings, all must match
+    std::vector<std::wstring> exclude;   // name substrings, none may match
+    std::vector<Cat>          kinds;     // any match; empty means any kind
+    std::vector<std::wstring> exts;      // any match; empty means any
+    uint64_t minSize = 0;
+    uint64_t maxSize = UINT64_MAX;
+
+    enum class Only { Any, Files, Folders };
+    Only only = Only::Any;
+
+    // True when nothing was specified, so the caller can show everything or
+    // nothing rather than treating an empty query as "match all".
+    bool Empty() const {
+        return include.empty() && exclude.empty() && kinds.empty() &&
+               exts.empty() && minSize == 0 && maxSize == UINT64_MAX &&
+               only == Only::Any;
+    }
+};
+
+// Parses query text. Never fails: anything unrecognised is treated as a name
+// term, because a search box that rejects input is worse than one that
+// guesses.
+Query ParseQuery(const std::wstring& text);
+
+// Maps a kind: token to a category. Returns false if it names nothing.
+bool CatFromToken(const std::wstring& token, Cat& out);
+
+bool QueryMatches(const Query& q, const Node& n);
+
+// Nodes matching `q`, largest first.
+std::vector<FileHit> FindMatching(const Node& root, const Query& q,
+                                  size_t limit);
+
+// Convenience wrapper: a plain name substring search.
+std::vector<FileHit> FindByName(const Node& root, const std::wstring& needle,
+                                size_t limit);
+
+// Writes the subtree as CSV: path, size in bytes, kind. Returns false if the
+// file could not be opened.
+bool ExportCsv(const Node& root, const std::wstring& rootPath,
+               const std::wstring& outPath);
+
+// Writes UTF-16 text to a file as UTF-8 with a BOM. Platform-specific; the
+// host test build supplies its own so the CSV writer stays testable.
+bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text);
+
+// Human-readable byte count, e.g. "1.44 GB".
+std::wstring FormatSize(uint64_t bytes);
+
+// Thousands-separated integer.
+std::wstring FormatCount(uint64_t n);
+
+// Strip characters that must never reach the renderer: C0/C1 controls, and the
+// Unicode bidi overrides (U+202A..U+202E, U+2066..U+2069).
+//
+// This matters because filenames are attacker-controlled input. A sample named
+// "invoice\u202Egpj.exe" renders as "invoicexe.jpg" in any bidi-aware text
+// stack, which is a live technique for disguising executables. Spindle is
+// meant to be pointed at directories full of hostile files, so it shows the
+// real name and marks the substitution rather than rendering the spoof.
+std::wstring SanitizeForDisplay(const std::wstring& in, bool* modified = nullptr);
+
+}  // namespace spindle

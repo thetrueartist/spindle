@@ -1,15 +1,13 @@
-// Spindle resources. Compiled by windres; -I res and -I build let the icon
-// and manifest be referenced by bare name (the icon is generated into build).
+// Spindle - Windows resources.
+// The icon must be the lowest-numbered ICON resource in the binary: Explorer
+// and the shell pick an executable's display icon by lowest ordinal, not by
+// which one the window class loads.
 
-#include <winver.h>
+#include <windows.h>
 
-// Must match IDI_APPICON in ui.cpp.
-1 ICON "spindle.ico"
+#define IDI_APPICON 1
 
-// CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24). Spelled as
-// numbers because the named constants live in winuser.h, which windres does
-// not need for anything else.
-1 24 "spindle.manifest"
+IDI_APPICON ICON "spindle.ico"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     1,0,0,0
@@ -22,18 +20,23 @@ FILESUBTYPE     VFT2_UNKNOWN
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
-        BLOCK "040904B0"
+        BLOCK "080904B0"   // UK English, Unicode
         BEGIN
-            VALUE "FileDescription",  "Spindle - disk space analyser"
-            VALUE "FileVersion",      "1.0.0.0"
-            VALUE "InternalName",     "spindle"
-            VALUE "OriginalFilename", "spindle.exe"
-            VALUE "ProductName",      "Spindle"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "FileDescription", "Spindle - disk space, mapped"
+            VALUE "FileVersion",     "1.0.0.0"
+            VALUE "InternalName",    "spindle"
+            VALUE "OriginalFilename","spindle.exe"
+            VALUE "ProductName",     "Spindle"
+            VALUE "ProductVersion",  "1.0.0.0"
         END
     END
     BLOCK "VarFileInfo"
     BEGIN
-        VALUE "Translation", 0x409, 1200
+        VALUE "Translation", 0x809, 1200
     END
 END
+
+// Common Controls v6 for the modern context menu and dialog styling, plus an
+// explicit per-monitor DPI declaration. The runtime SetProcessDpiAwarenessContext
+// call still runs first; this covers the case where that API is unavailable.
+1 RT_MANIFEST "spindle.manifest"

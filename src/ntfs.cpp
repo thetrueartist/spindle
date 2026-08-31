@@ -1,433 +1,361 @@
 // Spindle - NTFS on-disk structure parsing.
-//
-// Pure bytes in, validated values out. Nothing in this file touches the
-// operating system, and every offset, length and count read from the input
-// is checked before use, because the input is a disk and disks lie: the
-// volume may be corrupt, or crafted by someone who knows this code runs
-// elevated.
+// See ntfs.h for the security posture. Short version: none of this input is
+// trusted, and every read is bounds-checked against the supplied buffer.
 
 #include "ntfs.h"
 
-namespace spindle {
-namespace ntfs {
+#include <climits>
+#include <cstring>
 
+namespace spindle::ntfs {
 namespace {
 
-inline bool IsPow2(uint64_t v) { return v != 0 && (v & (v - 1)) == 0; }
+// A cursor that cannot read past its buffer. Every field access in this file
+// goes through it, so an out-of-range offset yields zero rather than a read
+// of whatever happens to follow in memory.
+class Reader {
+public:
+    Reader(const uint8_t* data, size_t len) : d_(data), n_(len) {}
 
-// Little-endian read of 1..8 bytes, used by the run-list decoder where the
-// field width itself comes off the disk.
-inline uint64_t ReadLe(const uint8_t* p, uint32_t n) {
-    uint64_t v = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        v |= static_cast<uint64_t>(p[i]) << (8 * i);
-    }
-    return v;
-}
-
-}  // namespace
-
-// -------------------------------------------------------------- boot sector
-
-bool ParseBootSector(const uint8_t* data, size_t len, BootSector& out) {
-    if (data == nullptr || len < 512) return false;
-    ByteCursor c(data, len);
-
-    c.Seek(3);
-    const uint8_t* oem = c.Peek(8);
-    if (oem == nullptr) return false;
-    static const uint8_t kOem[8] = {'N', 'T', 'F', 'S', ' ', ' ', ' ', ' '};
-    for (size_t i = 0; i < 8; ++i) {
-        if (oem[i] != kOem[i]) return false;
+    bool Has(size_t off, size_t bytes) const {
+        return d_ != nullptr && off <= n_ && bytes <= n_ - off;
     }
 
-    c.Seek(0x0B);
-    const uint32_t bps = c.U16();
-    // 512 through 4096 covers every sector size NTFS has ever shipped on.
-    if (!IsPow2(bps) || bps < 512 || bps > 4096) return false;
-
-    const uint32_t rawSpc = c.U8();
-    // Values above 0x80 are two's-complement exponents: 0xF8 means 2^8
-    // sectors per cluster. Introduced alongside the >64K cluster sizes.
-    uint64_t spc = 0;
-    if (rawSpc > 0x80) {
-        const uint32_t shift = 256u - rawSpc;
-        if (shift > 25) return false;
-        spc = 1ull << shift;
-    } else {
-        spc = rawSpc;
-    }
-    const uint64_t clusterBytes = spc * bps;
-    // 2 MB is the largest cluster NTFS supports (Windows 10 1709 onwards).
-    if (!IsPow2(spc) || clusterBytes == 0 || clusterBytes > (2ull << 20)) {
-        return false;
+    uint8_t U8(size_t off) const {
+        return Has(off, 1) ? d_[off] : uint8_t{0};
     }
 
-    c.Seek(0x28);
-    const uint64_t totalSectors = c.U64();
-    const uint64_t mftLcn = c.U64();
-    if (totalSectors == 0) return false;
-    const uint64_t totalClusters = totalSectors / spc;
-    if (totalClusters == 0 || mftLcn >= totalClusters) return false;
-
-    c.Seek(0x40);
-    const uint8_t rawRec = c.U8();
-    if (!c.ok()) return false;
-    // Positive: clusters per record. Negative (two's complement): the record
-    // is 2^|value| bytes, which is how every volume with clusters larger
-    // than the record size expresses it.
-    uint64_t recordBytes = 0;
-    if (rawRec > 0x80) {
-        const uint32_t shift = 256u - rawRec;
-        if (shift > 12) return false;
-        recordBytes = 1ull << shift;
-    } else {
-        recordBytes = static_cast<uint64_t>(rawRec) * clusterBytes;
-    }
-    // The reader slices the MFT into fixed records; anything outside the
-    // sizes Windows actually formats is treated as corruption.
-    if (!IsPow2(recordBytes) || recordBytes < 512 || recordBytes > 4096) {
-        return false;
+    uint16_t U16(size_t off) const {
+        if (!Has(off, 2)) return 0;
+        return static_cast<uint16_t>(d_[off] |
+                                     (static_cast<uint16_t>(d_[off + 1]) << 8));
     }
 
-    out.bytesPerSector = bps;
-    out.sectorsPerCluster = static_cast<uint32_t>(spc);
-    out.clusterBytes = clusterBytes;
-    out.totalSectors = totalSectors;
-    out.totalClusters = totalClusters;
-    out.mftLcn = mftLcn;
-    out.recordBytes = static_cast<uint32_t>(recordBytes);
-    return true;
-}
-
-// ------------------------------------------------------------------- fixups
-
-bool ApplyFixups(uint8_t* record, size_t len, uint32_t bytesPerSector) {
-    if (record == nullptr || bytesPerSector == 0) return false;
-    if (len < bytesPerSector || len % bytesPerSector != 0) return false;
-
-    ByteCursor c(record, len);
-    c.Seek(4);
-    const uint16_t usaOffset = c.U16();
-    const uint16_t usaCount = c.U16();
-    if (!c.ok()) return false;
-
-    // One sequence number plus one saved word per sector. A count that does
-    // not match the record's own size means the header is lying about one of
-    // them, and neither can then be trusted.
-    const size_t sectors = len / bytesPerSector;
-    if (usaCount != sectors + 1) return false;
-    if (usaOffset < 6 ||
-        static_cast<size_t>(usaOffset) + 2 * usaCount > len) {
-        return false;
+    uint32_t U32(size_t off) const {
+        if (!Has(off, 4)) return 0;
+        return static_cast<uint32_t>(d_[off]) |
+               (static_cast<uint32_t>(d_[off + 1]) << 8) |
+               (static_cast<uint32_t>(d_[off + 2]) << 16) |
+               (static_cast<uint32_t>(d_[off + 3]) << 24);
     }
 
-    const uint8_t usn0 = record[usaOffset];
-    const uint8_t usn1 = record[usaOffset + 1];
-
-    for (size_t s = 0; s < sectors; ++s) {
-        uint8_t* tail = record + (s + 1) * bytesPerSector - 2;
-        // A tail that no longer carries the sequence number is a torn
-        // multi-sector write; the record content is not usable.
-        if (tail[0] != usn0 || tail[1] != usn1) return false;
-        const size_t saved = static_cast<size_t>(usaOffset) + 2 * (s + 1);
-        tail[0] = record[saved];
-        tail[1] = record[saved + 1];
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------- run lists
-
-bool DecodeRunList(const uint8_t* data, size_t len, uint64_t maxClusters,
-                   std::vector<Run>& out) {
-    out.clear();
-    if (data == nullptr || maxClusters == 0) return false;
-
-    ByteCursor c(data, len);
-    uint64_t lcn = 0;
-    uint64_t total = 0;
-
-    for (;;) {
-        const uint8_t header = c.U8();
-        if (!c.ok()) return false;    // ran off the end before the terminator
-        if (header == 0) break;
-
-        const uint32_t lenBytes = header & 0x0F;
-        const uint32_t offBytes = header >> 4;
-        if (lenBytes == 0 || lenBytes > 8 || offBytes > 8) return false;
-
-        const uint8_t* lp = c.Peek(lenBytes);
-        if (lp == nullptr) return false;
-        c.Skip(lenBytes);
-        const uint64_t clusters = ReadLe(lp, lenBytes);
-        if (clusters == 0) return false;
-
-        // A hostile list may claim any length at all; refusing anything the
-        // volume could not physically hold keeps allocation and read sizes
-        // derived from this list bounded.
-        if (clusters > maxClusters - total) return false;
-        total += clusters;
-
-        if (offBytes == 0) {
-            // Sparse run: no clusters on disk.
-            Run r;
-            r.clusters = clusters;
-            r.sparse = true;
-            out.push_back(r);
-        } else {
-            const uint8_t* op = c.Peek(offBytes);
-            if (op == nullptr) return false;
-            c.Skip(offBytes);
-            uint64_t delta = ReadLe(op, offBytes);
-
-            // Sign-extend the delta - but only when the field is narrower
-            // than 64 bits. An eight-byte field is already complete, and the
-            // original "value << (64 - 8*offBytes)" style extension shifted
-            // by 64 exactly there: undefined behaviour, found by the fuzzer.
-            if (offBytes < 8) {
-                const uint64_t signBit = 1ull << (8 * offBytes - 1);
-                if (delta & signBit) {
-                    delta |= ~((signBit << 1) - 1);
-                }
-            }
-
-            // Accumulate in unsigned arithmetic, where wraparound is defined,
-            // then range-check the result. This replaces a signed
-            // accumulation that a crafted delta could overflow - the second
-            // fuzzer finding in this file.
-            lcn += delta;
-            if (lcn >= maxClusters) return false;
-
-            Run r;
-            r.lcn = lcn;
-            r.clusters = clusters;
-            out.push_back(r);
+    uint64_t U64(size_t off) const {
+        if (!Has(off, 8)) return 0;
+        uint64_t v = 0;
+        for (int i = 7; i >= 0; --i) {
+            v = (v << 8) | static_cast<uint64_t>(d_[off + static_cast<size_t>(i)]);
         }
-
-        // A run describes at least one cluster, so a legitimate list can
-        // never have more runs than the volume has clusters; combined with
-        // the total check this is only reachable by redundant hostile input.
-        if (out.size() > (1u << 20)) return false;
+        return v;
     }
-    return true;
-}
 
-// ------------------------------------------------------------- file records
+    const uint8_t* Ptr(size_t off) const { return d_ + off; }
+    size_t Size() const { return n_; }
 
-namespace {
-
-// The fixed part of one attribute header, validated against the record.
-struct AttrHeader {
-    uint32_t type = 0;
-    uint32_t length = 0;
-    bool nonResident = false;
-    uint8_t nameLen = 0;
-    uint32_t valueLen = 0;     // resident only
-    uint16_t valueOffset = 0;  // resident only
-    uint16_t runOffset = 0;    // non-resident only
-    uint64_t startVcn = 0;     // non-resident only
-    uint64_t realSize = 0;     // non-resident only
+private:
+    const uint8_t* d_ = nullptr;
+    size_t         n_ = 0;
 };
 
-// Reads the attribute at `off`, checking every offset and length against the
-// record bounds. Returns false on structural corruption; sets `end` when the
-// terminator is reached.
-bool ReadAttrHeader(ByteCursor& c, size_t off, size_t limit, AttrHeader& a,
-                    bool& end) {
-    end = false;
-    if (!c.Seek(off)) return false;
-
-    a.type = c.U32();
-    if (!c.ok()) return false;
-    if (a.type == kAttrEnd) {
-        end = true;
-        return true;
-    }
-
-    a.length = c.U32();
-    // Minimum resident header is 24 bytes; attributes are 8-aligned. An
-    // unaligned or overlong length would make the iteration walk off the
-    // record or loop in place.
-    if (a.length < 24 || a.length % 8 != 0 || a.length > limit - off) {
-        return false;
-    }
-
-    a.nonResident = c.U8() != 0;
-    a.nameLen = c.U8();
-    c.U16();  // name offset
-    c.U16();  // flags
-    c.U16();  // attribute id
-
-    if (!a.nonResident) {
-        a.valueLen = c.U32();
-        a.valueOffset = c.U16();
-        if (!c.ok()) return false;
-        if (a.valueOffset > a.length ||
-            static_cast<uint64_t>(a.valueLen) >
-                static_cast<uint64_t>(a.length) - a.valueOffset) {
-            return false;
-        }
-    } else {
-        a.startVcn = c.U64();
-        c.U64();  // end VCN
-        a.runOffset = c.U16();
-        c.U16();  // compression unit
-        c.U32();  // padding
-        c.U64();  // allocated size
-        a.realSize = c.U64();
-        if (!c.ok()) return false;
-        if (a.runOffset < 64 || a.runOffset > a.length) return false;
-    }
-    return c.ok();
-}
+bool IsPowerOfTwo(uint32_t v) { return v != 0 && (v & (v - 1)) == 0; }
 
 }  // namespace
 
-bool ParseFileRecord(const uint8_t* data, size_t len, FileRecord& out) {
-    out = FileRecord{};
-    if (data == nullptr || len < 48) return false;
+// ------------------------------------------------------------- boot sector
 
-    ByteCursor c(data, len);
-    if (c.U8() != 'F' || c.U8() != 'I' || c.U8() != 'L' || c.U8() != 'E') {
-        return false;
+BootInfo ParseBootSector(const uint8_t* data, size_t len) {
+    BootInfo bi;
+    const Reader r(data, len);
+    if (!r.Has(0, 512)) return bi;
+
+    // OEM identifier. Not a security control -- anyone can write these eight
+    // bytes -- but it rejects the common case of pointing at a non-NTFS
+    // volume before any of the numeric fields are interpreted.
+    if (std::memcmp(r.Ptr(3), "NTFS    ", 8) != 0) return bi;
+
+    const uint32_t bps = r.U16(0x0B);
+    if (!IsPowerOfTwo(bps) || bps < 256 || bps > kMaxBytesPerSector) return bi;
+
+    const uint8_t spc = r.U8(0x0D);
+    uint32_t clusterSize = 0;
+    if (spc == 0) {
+        return bi;
+    } else if (spc <= 0x80) {
+        if (!IsPowerOfTwo(spc)) return bi;
+        clusterSize = bps * spc;
+    } else {
+        // Values above 0x80 encode 2^(256-spc) sectors per cluster. Bound the
+        // shift: an unchecked value here shifts by more than the width of the
+        // type, which is undefined behaviour.
+        const uint32_t shift = 256u - spc;
+        if (shift > 24) return bi;
+        clusterSize = bps << shift;
     }
+    if (clusterSize == 0 || clusterSize > kMaxClusterSize) return bi;
 
-    c.Seek(0x14);
-    const uint16_t firstAttr = c.U16();
-    const uint16_t flags = c.U16();
-    const uint32_t bytesInUse = c.U32();
-    c.U32();  // bytes allocated
-    const uint64_t baseRef = c.U64();
-    if (!c.ok()) return false;
-
-    out.inUse = (flags & 0x1) != 0;
-    out.isDir = (flags & 0x2) != 0;
-    // The upper sixteen bits of a file reference are the sequence number;
-    // only the low 48 identify the record.
-    out.baseFrs = baseRef & 0x0000FFFFFFFFFFFFull;
-
-    // A record that is unused or belongs to another record carries nothing
-    // this caller uses; both are valid parses.
-    if (!out.inUse || out.baseFrs != 0) return true;
-
-    const size_t limit = (bytesInUse < len) ? bytesInUse : len;
-    if (firstAttr < 0x18 || firstAttr % 8 != 0 || firstAttr >= limit) {
-        return false;
+    // Record size uses the same dual encoding: a positive value is clusters
+    // per record, a value above 0x80 is 2^(256-v) bytes.
+    const uint8_t cpr = r.U8(0x40);
+    uint32_t recordSize = 0;
+    if (cpr == 0) {
+        return bi;
+    } else if (cpr <= 0x80) {
+        recordSize = clusterSize * cpr;
+    } else {
+        const uint32_t shift = 256u - cpr;
+        if (shift > 20) return bi;
+        recordSize = 1u << shift;
     }
+    if (recordSize < kMinRecordSize || recordSize > kMaxRecordSize) return bi;
+    if (!IsPowerOfTwo(recordSize)) return bi;
 
-    bool sawData = false;
-    uint64_t fileNameSize = 0;
-    bool nameIsDos = false;
+    // A record must be a whole number of sectors or the fixup arithmetic in
+    // ApplyFixups cannot describe it.
+    if (recordSize % bps != 0) return bi;
 
-    size_t off = firstAttr;
-    for (;;) {
-        AttrHeader a;
-        bool end = false;
-        if (!ReadAttrHeader(c, off, limit, a, end)) return false;
-        if (end) break;
+    const uint64_t mftLcn = r.U64(0x30);
+    const uint64_t total  = r.U64(0x28);
+    if (mftLcn == 0) return bi;
 
-        if (a.type == kAttrFileName && !a.nonResident && a.nameLen == 0) {
-            ByteCursor v(data + off + a.valueOffset, a.valueLen);
-            const uint64_t parentRef = v.U64();
-            v.Seek(0x30);
-            const uint64_t fnReal = v.U64();
-            const uint32_t fnFlags = v.U32();
-            v.Seek(0x40);
-            const uint8_t nameChars = v.U8();
-            const uint8_t nameSpace = v.U8();
-            const uint8_t* nameBytes =
-                v.Peek(static_cast<size_t>(nameChars) * 2);
-            if (v.ok() && nameBytes != nullptr) {
-                // Keep the first name seen, upgrading once if that was the
-                // DOS 8.3 alias: files carry Win32+DOS pairs and the alias
-                // is never the name anyone recognises.
-                if (!out.hasName || (nameIsDos && nameSpace != kNameSpaceDos)) {
-                    std::wstring name;
-                    name.reserve(nameChars);
-                    for (size_t i = 0; i < nameChars; ++i) {
-                        const uint16_t u = static_cast<uint16_t>(
-                            static_cast<uint16_t>(nameBytes[2 * i]) |
-                            static_cast<uint16_t>(nameBytes[2 * i + 1]) << 8);
-                        // Path separators and NUL cannot appear in a name the
-                        // Win32 layer produced, so from a raw record they are
-                        // an attack on path assembly. Neutralised here, and
-                        // visibly: U+FFFD survives every later sanitiser.
-                        const bool hostile = (u == 0) || (u == L'\\') ||
-                                             (u == L'/');
-                        name.push_back(hostile ? L'\xFFFD'
-                                               : static_cast<wchar_t>(u));
-                    }
-                    out.name = std::move(name);
-                    out.hasName = true;
-                    out.parentFrs = parentRef & 0x0000FFFFFFFFFFFFull;
-                    nameIsDos = (nameSpace == kNameSpaceDos);
-                    if ((fnFlags & 0x0400u) != 0) out.isReparse = true;
-                    fileNameSize = fnReal;
+    // The MFT cannot start beyond the end of the volume. Checked because the
+    // caller turns this into a byte offset for a seek.
+    if (total != 0) {
+        const uint64_t clustersTotal = total / (clusterSize / bps);
+        if (mftLcn >= clustersTotal) return bi;
+    }
+    // Guard the multiplication the caller will perform.
+    if (mftLcn > (UINT64_MAX / clusterSize)) return bi;
+
+    bi.bytesPerSector  = bps;
+    bi.bytesPerCluster = clusterSize;
+    bi.bytesPerRecord  = recordSize;
+    bi.mftStartCluster = mftLcn;
+    bi.totalSectors    = total;
+    bi.valid           = true;
+    return bi;
+}
+
+// --------------------------------------------------------------- run lists
+
+bool ParseRunList(const uint8_t* data, size_t len, std::vector<DataRun>& out) {
+    out.clear();
+    const Reader r(data, len);
+    if (data == nullptr) return false;
+
+    size_t pos = 0;
+    int64_t lcn = 0;   // run offsets are deltas against the previous run
+
+    while (pos < len) {
+        const uint8_t header = r.U8(pos);
+        if (header == 0) break;   // end of list
+
+        const size_t lenBytes = header & 0x0Fu;
+        const size_t offBytes = (header >> 4) & 0x0Fu;
+
+        // A zero length field describes a run of unknown size: malformed.
+        if (lenBytes == 0 || lenBytes > 8 || offBytes > 8) return false;
+        if (!r.Has(pos + 1, lenBytes + offBytes)) return false;
+
+        uint64_t runLen = 0;
+        for (size_t i = 0; i < lenBytes; ++i) {
+            runLen |= static_cast<uint64_t>(r.U8(pos + 1 + i)) << (i * 8);
+        }
+        if (runLen == 0) return false;
+
+        DataRun run;
+        run.clusters = runLen;
+
+        if (offBytes == 0) {
+            // Sparse run: no cluster is allocated.
+            run.sparse = true;
+            run.lcn = 0;
+        } else {
+            // Assemble unsigned, then sign-extend from the encoded width.
+            // Doing this in a signed type shifts a 1 into, and past, the sign
+            // bit -- undefined behaviour that a crafted run list reaches with
+            // an 8-byte offset field.
+            uint64_t raw = 0;
+            for (size_t i = 0; i < offBytes; ++i) {
+                raw |= static_cast<uint64_t>(r.U8(pos + 1 + lenBytes + i))
+                       << (i * 8);
+            }
+
+            if (offBytes < 8) {
+                const unsigned bits = static_cast<unsigned>(offBytes) * 8u;
+                const uint64_t signBit = uint64_t{1} << (bits - 1);
+                if (raw & signBit) {
+                    // Set every bit above the encoded width.
+                    raw |= ~((uint64_t{1} << bits) - 1);
                 }
             }
-        } else if (a.type == kAttrData && a.nameLen == 0 && !sawData) {
-            // The unnamed stream is the file's content. Alternate (named)
-            // streams are not what the map shows, matching what the
-            // directory-walk scanner reports.
-            out.size = a.nonResident ? a.realSize : a.valueLen;
-            sawData = true;
-        } else if (a.type == kAttrReparsePoint) {
-            out.isReparse = true;
+            // Width 8 needs no extension: the value already fills the type.
+            const int64_t delta = static_cast<int64_t>(raw);
+
+            // Checked addition. The running LCN is signed and a hostile run
+            // list can drive it past either bound, which is undefined
+            // behaviour before it is ever a bad seek.
+            if (delta > 0 && lcn > INT64_MAX - delta) return false;
+            if (delta < 0 && lcn < INT64_MIN - delta) return false;
+            lcn += delta;
+
+            if (lcn < 0) return false;   // would seek before the volume start
+            run.lcn = lcn;
         }
 
-        off += a.length;
-    }
+        out.push_back(run);
+        if (out.size() > kMaxRuns) return false;
 
-    // No $DATA in the base record (a directory, or content pushed to an
-    // extension record by attribute-list growth): fall back to the size the
-    // $FILE_NAME carries.
-    if (!sawData && !out.isDir) out.size = fileNameSize;
-    if (out.isDir) out.size = 0;
+        pos += 1 + lenBytes + offBytes;
+    }
     return true;
 }
 
-bool ExtractDataRuns(const uint8_t* data, size_t len, uint64_t maxClusters,
-                     std::vector<Run>& runs, uint64_t& dataSize) {
-    runs.clear();
-    dataSize = 0;
-    if (data == nullptr || len < 48) return false;
+// ------------------------------------------------------------------ fixups
 
-    ByteCursor c(data, len);
-    if (c.U8() != 'F' || c.U8() != 'I' || c.U8() != 'L' || c.U8() != 'E') {
-        return false;
+bool ApplyFixups(uint8_t* record, size_t len, uint32_t bytesPerSector) {
+    if (record == nullptr || bytesPerSector < 256) return false;
+    if (len < 48 || len % bytesPerSector != 0) return false;
+
+    const Reader r(record, len);
+    const uint16_t usaOffset = r.U16(0x04);
+    const uint16_t usaCount  = r.U16(0x06);
+
+    // usaCount counts the check value plus one entry per sector.
+    if (usaCount < 2) return false;
+    const size_t sectors = static_cast<size_t>(usaCount) - 1;
+    if (sectors != len / bytesPerSector) return false;
+
+    // The array must lie inside the record and must not overlap the header.
+    if (usaOffset < 0x30) return false;
+    const size_t usaBytes = static_cast<size_t>(usaCount) * 2;
+    if (!r.Has(usaOffset, usaBytes)) return false;
+
+    const uint16_t check = r.U16(usaOffset);
+
+    for (size_t i = 0; i < sectors; ++i) {
+        const size_t tail = (i + 1) * bytesPerSector - 2;
+        if (!r.Has(tail, 2)) return false;
+
+        const uint16_t present = r.U16(tail);
+        // A mismatch means the sector was not written as part of this record:
+        // a torn write, or a record that is not what the header claims.
+        if (present != check) return false;
+
+        const size_t src = static_cast<size_t>(usaOffset) + 2 + i * 2;
+        record[tail]     = record[src];
+        record[tail + 1] = record[src + 1];
     }
-    c.Seek(0x14);
-    const uint16_t firstAttr = c.U16();
-    c.U16();
-    const uint32_t bytesInUse = c.U32();
-    if (!c.ok()) return false;
-
-    const size_t limit = (bytesInUse < len) ? bytesInUse : len;
-    if (firstAttr < 0x18 || firstAttr % 8 != 0 || firstAttr >= limit) {
-        return false;
-    }
-
-    size_t off = firstAttr;
-    for (;;) {
-        AttrHeader a;
-        bool end = false;
-        if (!ReadAttrHeader(c, off, limit, a, end)) return false;
-        if (end) break;
-
-        if (a.type == kAttrData && a.nameLen == 0 && a.nonResident &&
-            a.startVcn == 0) {
-            if (!DecodeRunList(data + off + a.runOffset,
-                               a.length - a.runOffset, maxClusters, runs)) {
-                return false;
-            }
-            dataSize = a.realSize;
-            return !runs.empty();
-        }
-        off += a.length;
-    }
-    return false;
+    return true;
 }
 
-}  // namespace ntfs
-}  // namespace spindle
+// ------------------------------------------------------------ file records
+
+RecordInfo ParseRecord(const uint8_t* record, size_t len) {
+    RecordInfo info;
+    const Reader r(record, len);
+    if (!r.Has(0, 48)) return info;
+
+    if (std::memcmp(r.Ptr(0), "FILE", 4) != 0) return info;
+
+    const uint16_t flags = r.U16(0x16);
+    info.inUse = (flags & 0x0001) != 0;
+    info.isDir = (flags & 0x0002) != 0;
+
+    // A non-zero base reference means this record continues another one. Its
+    // attributes belong to the base record, not to a file of its own.
+    info.isExtension = (r.U64(0x20) & 0x0000FFFFFFFFFFFFull) != 0;
+
+    const uint32_t usedSize = r.U32(0x18);
+    // The header's own idea of how much of the record is live must fit inside
+    // the record. Attribute walking is bounded by the smaller of the two.
+    const size_t limit =
+        (usedSize >= 48 && usedSize <= len) ? usedSize : len;
+
+    size_t off = r.U16(0x14);
+    if (off < 48 || off >= limit) return info;
+
+    // Best name found so far. NTFS may store several: a Win32 name, a DOS 8.3
+    // alias, or both. The 8.3 alias is preferred by nothing and shown by
+    // nobody, so it only wins if there is no alternative.
+    int bestNamespace = -1;
+    bool sawData = false;
+
+    for (size_t guard = 0; guard < kMaxAttrsPerRec; ++guard) {
+        if (!r.Has(off, 4)) break;
+        const uint32_t type = r.U32(off);
+        if (type == kAttrEnd) break;
+        if (!r.Has(off, 16)) break;
+
+        const uint32_t attrLen = r.U32(off + 4);
+        // Zero or unaligned lengths would loop forever or step into the
+        // middle of a structure; an over-long one walks off the record.
+        if (attrLen < 16 || (attrLen % 8) != 0) break;
+        if (attrLen > limit - off) break;
+
+        const uint8_t nonResident = r.U8(off + 8);
+
+        if (type == kAttrFileName && nonResident == 0) {
+            const uint32_t valueLen = r.U32(off + 0x10);
+            const uint16_t valueOff = r.U16(off + 0x14);
+            const size_t base = off + valueOff;
+
+            // 0x42 is the fixed part of $FILE_NAME before the name itself.
+            if (valueLen >= 0x42 && valueOff < attrLen &&
+                valueLen <= attrLen - valueOff && r.Has(base, 0x42)) {
+                const uint32_t nameChars = r.U8(base + 0x40);
+                const uint8_t  nameSpace = r.U8(base + 0x41);
+                const size_t   nameBytes = static_cast<size_t>(nameChars) * 2;
+
+                if (nameChars > 0 && nameChars <= kMaxNameChars &&
+                    r.Has(base + 0x42, nameBytes) &&
+                    nameBytes <= valueLen - 0x42) {
+                    // Namespace: 0 POSIX, 1 Win32, 2 DOS, 3 Win32+DOS.
+                    // Rank so that anything beats a bare DOS alias.
+                    const int rank = (nameSpace == 2) ? 0
+                                   : (nameSpace == 0) ? 1
+                                   : 2;
+                    if (rank > bestNamespace) {
+                        bestNamespace = rank;
+                        info.parent = static_cast<uint32_t>(
+                            r.U64(base) & 0x0000FFFFFFFFFFFFull);
+
+                        info.name.clear();
+                        info.name.reserve(nameChars);
+                        for (size_t i = 0; i < nameChars; ++i) {
+                            // Index arithmetic done in size_t. Computing
+                            // i * 2 in uint32_t and widening afterwards is
+                            // how an offset overflows before it is checked;
+                            // nameChars is bounded above, but the parser
+                            // should not depend on a bound to be safe.
+                            info.name.push_back(static_cast<wchar_t>(
+                                r.U16(base + size_t{0x42} + i * 2)));
+                        }
+                        info.hasName = true;
+                    }
+                }
+            }
+        } else if (type == kAttrData && !sawData) {
+            // Only the unnamed $DATA stream counts as the file's size. Named
+            // streams are separate content that Explorer does not show as
+            // part of the file.
+            const uint8_t nameLen = r.U8(off + 9);
+            if (nameLen == 0) {
+                if (nonResident == 0) {
+                    info.size = r.U32(off + 0x10);
+                } else if (r.Has(off + 0x30, 8)) {
+                    // Real (logical) size, matching what the directory-walk
+                    // scanner reports, so the two paths agree.
+                    info.size = r.U64(off + 0x30);
+                }
+                sawData = true;
+            }
+        }
+
+        off += attrLen;
+        if (off >= limit) break;
+    }
+
+    info.valid = true;
+    return info;
+}
+
+}  // namespace spindle::ntfs

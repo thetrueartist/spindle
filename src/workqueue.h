@@ -1,107 +1,109 @@
-// Spindle - the scanner's work queue.
+// Spindle - work queue shared by the scanner's threads.
 //
-// This is where the original crash lived, so it no longer lives inside
-// scan.cpp as untestable Windows-only code: the queue is header-only over the
-// primitives in sync.h, the Windows build compiles it against SRWLOCK, and
-// the tests compile the identical code against pthreads and run it under
-// ThreadSanitizer and AddressSanitizer.
-//
-// The shape it serves: workers pop a directory, enumerate it, push the
-// subdirectories they find, and only then mark the popped unit finished. So
-// "queue empty" does not mean "work finished" - a worker holding the last
-// item may be about to push twenty more. The queue therefore counts units
-// from Push until Done, and a Pop only reports completion when the queue is
-// empty AND nothing popped is still being processed.
+// Extracted into a header so the state machine can be exercised on a host
+// machine under ThreadSanitizer. This is the code the scanner was crashing
+// in, so it is the code that most needs to be testable.
 
-#ifndef SPINDLE_WORKQUEUE_H_
-#define SPINDLE_WORKQUEUE_H_
-
-#include <cstddef>
-#include <deque>
-#include <utility>
+#pragma once
 
 #include "sync.h"
 
+#include <utility>
+#include <vector>
+
 namespace spindle {
 
+// A queue that also tracks how many items are being worked on, so it can tell
+// the difference between "empty for now, work still in flight" and "finished".
+//
+// Termination: Pop blocks while the queue is empty and any worker is still
+// busy, because a busy worker may yet push more. Once the queue is empty and
+// nothing is in flight, Pop returns false and every worker exits.
 template <typename T>
 class WorkQueue {
 public:
-    WorkQueue() = default;
-    WorkQueue(const WorkQueue&) = delete;
-    WorkQueue& operator=(const WorkQueue&) = delete;
-
-    // Enqueues one unit of work. Callable from inside a worker (that is the
-    // whole point) or from outside before the workers start.
     void Push(T item) {
         {
-            LockGuard g(lock_);
+            Held h(lock_);
             items_.push_back(std::move(item));
-            ++pending_;
         }
-        cv_.NotifyOne();
+        cv_.WakeOne();
     }
 
-    // Blocks until an item is available, all work has finished, or the queue
-    // is cancelled. Returns false only for the latter two, and every worker
-    // sees the same false: there is no state in which one thread is handed an
-    // item after another has been told the queue is finished, other than the
-    // hand-off Done() below makes explicit.
+    // Pushes under a single lock acquisition. A scanned directory typically
+    // yields several subdirectories at once, and taking the lock once per
+    // batch rather than once per item measurably reduces contention with
+    // sixteen threads running.
+    void PushBatch(std::vector<T>& batch) {
+        if (batch.empty()) return;
+        {
+            Held h(lock_);
+            for (T& item : batch) items_.push_back(std::move(item));
+        }
+        cv_.WakeAll();
+        batch.clear();
+    }
+
+    // Returns false when the queue is drained and nothing is in flight, or
+    // once Stop has been called.
     bool Pop(T& out) {
-        LockGuard g(lock_);
+        Held h(lock_);
         for (;;) {
-            if (cancelled_) return false;
+            // Checked before the queue: after Stop, pending items are not
+            // handed out. Anything already in flight still completes.
+            if (stop_) return false;
+
             if (!items_.empty()) {
-                out = std::move(items_.front());
-                items_.pop_front();
+                out = std::move(items_.back());
+                items_.pop_back();
+                ++busy_;
                 return true;
             }
-            if (pending_ == 0) return false;
+            if (busy_ == 0) return false;
+
+            // Spurious wakeups are permitted, hence the surrounding loop.
             cv_.Wait(lock_);
         }
     }
 
-    // The unit obtained from Pop is fully processed, including any Pushes it
-    // performed. When the last unit finishes, every sleeping worker is woken
-    // so it can observe completion and leave. pending_ counting queued items
-    // too means pending_ == 0 already implies an empty queue.
+    // Exactly one call per successful Pop.
     void Done() {
-        bool finished = false;
+        bool wake = false;
         {
-            LockGuard g(lock_);
-            if (pending_ > 0) --pending_;
-            finished = (pending_ == 0);
+            Held h(lock_);
+            if (busy_ > 0) --busy_;
+            wake = (busy_ == 0 && items_.empty());
         }
-        if (finished) cv_.NotifyAll();
+        // Waking outside the lock: waiters would otherwise wake straight into
+        // contention for a lock this thread still holds.
+        if (wake) cv_.WakeAll();
     }
 
-    // Abandons everything: current items are discarded and every Pop, present
-    // and future, returns false. Safe to call from any thread at any time,
-    // including before the first Push.
-    void Cancel() {
+    void Stop() {
         {
-            LockGuard g(lock_);
-            cancelled_ = true;
+            Held h(lock_);
+            stop_ = true;
             items_.clear();
         }
-        cv_.NotifyAll();
+        cv_.WakeAll();
     }
 
-    bool Cancelled() {
-        LockGuard g(lock_);
-        return cancelled_;
+    size_t SizeForTest() {
+        Held h(lock_);
+        return items_.size();
+    }
+
+    int BusyForTest() {
+        Held h(lock_);
+        return busy_;
     }
 
 private:
-    Mutex         lock_;
-    CondVar       cv_;
-    std::deque<T> items_;
-    // Units pushed but not yet Done()'d. This is what distinguishes "nothing
-    // queued right now" from "nothing left to do".
-    size_t        pending_   = 0;
-    bool          cancelled_ = false;
+    Lock           lock_;
+    CondVar        cv_;
+    std::vector<T> items_;
+    int            busy_ = 0;
+    bool           stop_ = false;
 };
 
 }  // namespace spindle
-
-#endif  // SPINDLE_WORKQUEUE_H_

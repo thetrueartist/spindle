@@ -1,359 +1,475 @@
-// Spindle - the parallel directory scanner, volume enumeration and file
-// writing. Everything in this file needs windows.h; the queue it runs on and
-// the tree it produces do not, which is what makes those testable.
+// Spindle - Windows filesystem scanner.
+//
+// Walks a volume with FindFirstFileExW directly rather than via any shell or
+// .NET layer. Sizes come out of WIN32_FIND_DATA, so no handle is ever opened
+// on a scanned file: nothing is read, nothing is locked, and files held under
+// an exclusive kernel lock (pagefile.sys, hiberfil.sys) still report a size.
 
 #include "spindle.h"
+#include "sync.h"
+#include "workqueue.h"
 
-#include "workqueue.h"  // pulls in sync.h and, on Windows, windows.h
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
+#include <windows.h>
 #include <process.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <exception>
-#include <utility>
+#include <vector>
 
 namespace spindle {
+namespace {
 
-// ------------------------------------------------------------- file writing
+// Guard against a pathological or hostile directory structure driving the
+// worker queue without bound. 512 is far past anything a real volume reaches.
+constexpr int kMaxDepth = 512;
 
-// UTF-8 with a BOM: Excel is the main consumer of these exports and without
-// the BOM it guesses the codepage, mangling every non-ASCII filename.
-bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text) {
-    const HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                                 nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
+// Prefix a path so the Win32 API skips MAX_PATH normalisation entirely.
+// Paths handed here are always canonical: they are either a caller-supplied
+// root or built from FindFirstFile output, never user-typed relative fragments.
+std::wstring ExtendedPath(const std::wstring& path) {
+    if (path.size() >= 4 && path.compare(0, 4, L"\\\\?\\") == 0) {
+        return path;
+    }
+    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+        return L"\\\\?\\UNC\\" + path.substr(2);
+    }
+    return L"\\\\?\\" + path;
+}
 
-    bool ok = true;
-    const auto write = [&](const void* p, DWORD n) {
-        DWORD written = 0;
-        if (!WriteFile(f, p, n, &written, nullptr) || written != n) {
-            ok = false;
+std::wstring JoinPath(const std::wstring& dir, const std::wstring& leaf) {
+    if (dir.empty()) return leaf;
+    if (dir.back() == L'\\' || dir.back() == L'/') return dir + leaf;
+    return dir + L'\\' + leaf;
+}
+
+struct Task {
+    Node*        node = nullptr;   // stable: parent reserved its children first
+    std::wstring path;
+    int          depth = 0;
+};
+
+using Queue = WorkQueue<Task>;
+
+struct Shared {
+    Queue                     queue;
+    Progress*                 progress = nullptr;
+    Lock                      deniedLock;
+    std::vector<std::wstring> denied;
+    std::atomic<uint64_t>     deniedCount{0};
+    std::atomic<uint64_t>     dirCount{0};
+    std::atomic<uint64_t>     fileCount{0};
+    std::atomic<uint64_t>     byteCount{0};
+    // Set if a worker aborted on an exception, so the caller can say so
+    // rather than silently returning a truncated tree.
+    std::atomic<bool>         faulted{false};
+};
+
+void RecordDenied(Shared& sh, const std::wstring& path) {
+    sh.deniedCount.fetch_add(1, std::memory_order_relaxed);
+    Held h(sh.deniedLock);
+    if (sh.denied.size() < kMaxDeniedRecorded) sh.denied.push_back(path);
+}
+
+// Closes the search handle on every path out of ScanOne, including the one
+// where a container allocation throws part-way through the enumeration.
+// Sixteen threads leaking a find handle per failure exhausts them quickly.
+class FindHandle {
+public:
+    explicit FindHandle(HANDLE h) : h_(h) {}
+    ~FindHandle() { if (h_ != INVALID_HANDLE_VALUE) FindClose(h_); }
+    FindHandle(const FindHandle&) = delete;
+    FindHandle& operator=(const FindHandle&) = delete;
+    HANDLE get() const { return h_; }
+
+private:
+    HANDLE h_;
+};
+
+// Scan one directory. Children are sized and reserved before any pointer into
+// the vector escapes, so the tasks queued below hold pointers that stay valid
+// for the rest of the scan.
+void ScanOne(const Task& task, Shared& sh) {
+    const std::wstring pattern = JoinPath(ExtendedPath(task.path), L"*");
+
+    WIN32_FIND_DATAW fd{};
+    const FindHandle find(FindFirstFileExW(pattern.c_str(), FindExInfoBasic,
+                                           &fd, FindExSearchNameMatch, nullptr,
+                                           FIND_FIRST_EX_LARGE_FETCH));
+    const HANDLE h = find.get();
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION) {
+            RecordDenied(sh, task.path);
         }
-    };
-
-    static const uint8_t kBom[3] = {0xEF, 0xBB, 0xBF};
-    write(kBom, 3);
-
-    // Converted in bounded chunks: WideCharToMultiByte takes an int, and a
-    // full-volume export can be large enough to care. A chunk may not end
-    // between a surrogate pair or the pair converts as two broken
-    // replacement characters.
-    constexpr size_t kChunk = 1u << 20;
-    std::string bytes;
-    size_t off = 0;
-    while (ok && off < text.size()) {
-        size_t n = (text.size() - off < kChunk) ? text.size() - off : kChunk;
-        const wchar_t last = text[off + n - 1];
-        if (n < text.size() - off && last >= 0xD800 && last <= 0xDBFF) --n;
-        if (n == 0) break;
-
-        const int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str() + off,
-                                             static_cast<int>(n), nullptr, 0,
-                                             nullptr, nullptr);
-        if (need <= 0) {
-            ok = false;
-            break;
-        }
-        bytes.resize(static_cast<size_t>(need));
-        WideCharToMultiByte(CP_UTF8, 0, text.c_str() + off,
-                            static_cast<int>(n), bytes.data(), need, nullptr,
-                            nullptr);
-        write(bytes.data(), static_cast<DWORD>(need));
-        off += n;
+        return;
     }
 
-    CloseHandle(f);
-    return ok;
+    struct Entry {
+        std::wstring name;
+        uint64_t     size = 0;
+        bool         dir  = false;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(64);
+
+    uint64_t localFiles = 0;
+    uint64_t localBytes = 0;
+
+    do {
+        const wchar_t* n = fd.cFileName;
+        if (n[0] == L'.' && (n[1] == 0 || (n[1] == L'.' && n[2] == 0))) {
+            continue;
+        }
+
+        const bool isDir =
+            (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const bool isLink =
+            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+        // Never traverse a reparse point. Junctions and symlinks would
+        // otherwise let the walk loop indefinitely or count a subtree twice,
+        // and a crafted junction is a trivial way to make a scanner hang.
+        if (isDir && isLink) continue;
+
+        Entry e;
+        e.name = n;
+        e.dir  = isDir;
+        if (!isDir) {
+            e.size = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) |
+                     static_cast<uint64_t>(fd.nFileSizeLow);
+            localBytes = SatAdd(localBytes, e.size);
+            ++localFiles;
+        }
+        entries.push_back(std::move(e));
+    } while (FindNextFileW(h, &fd));
+
+    if (entries.empty()) return;
+
+    // Single allocation, then no further reallocation: the addresses handed to
+    // the queue below remain valid because nothing else ever touches this
+    // vector's capacity.
+    Node& parent = *task.node;
+    parent.children.reserve(entries.size());
+
+    std::vector<Task> subdirs;
+    subdirs.reserve(8);
+
+    for (Entry& e : entries) {
+        Node child(std::move(e.name), e.dir);
+        if (e.dir) {
+            child.cat = Cat::Directory;
+        } else {
+            child.size  = e.size;
+            child.files = 1;
+            child.cat   = CategoryForFile(child.name);
+        }
+        parent.children.push_back(std::move(child));
+    }
+
+    if (task.depth < kMaxDepth) {
+        for (Node& c : parent.children) {
+            if (!c.dir) continue;
+            subdirs.push_back(
+                Task{&c, JoinPath(task.path, c.name), task.depth + 1});
+        }
+    }
+
+    sh.fileCount.fetch_add(localFiles, std::memory_order_relaxed);
+    sh.byteCount.fetch_add(localBytes, std::memory_order_relaxed);
+    sh.dirCount.fetch_add(1, std::memory_order_relaxed);
+
+    if (sh.progress) {
+        sh.progress->files.store(sh.fileCount.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        sh.progress->dirs.store(sh.dirCount.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        sh.progress->bytes.store(sh.byteCount.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+    }
+
+    sh.queue.PushBatch(subdirs);
+}
+
+void WorkerLoop(Shared* sh) {
+    Task t;
+    while (sh->queue.Pop(t)) {
+        if (sh->progress &&
+            sh->progress->cancel.load(std::memory_order_relaxed)) {
+            sh->queue.Done();
+            sh->queue.Stop();
+            return;
+        }
+        ScanOne(t, *sh);
+        sh->queue.Done();
+    }
+}
+
+// Thread entry point. The catch-all is not defensive padding: an exception
+// escaping a thread function calls std::terminate, which kills the process
+// outright with no dialog and no chance to save anything. A scan of a large
+// volume performs millions of allocations, so a bad_alloc here has to unwind
+// into a reported failure rather than take the application down.
+unsigned __stdcall WorkerThunk(void* param) {
+    Shared* sh = static_cast<Shared*>(param);
+    try {
+        WorkerLoop(sh);
+    } catch (...) {
+        sh->faulted.store(true, std::memory_order_relaxed);
+        // Wake anyone waiting: this worker will not be calling Done() again,
+        // and without a nudge the remaining threads block until the busy count
+        // happens to reach zero on its own.
+        sh->queue.Done();
+        sh->queue.Stop();
+    }
+    return 0;
+}
+
+// Post-order size rollup, done iteratively. A recursive version would risk the
+// stack on a deeply nested tree, and extended-length paths permit far more
+// nesting than MAX_PATH ever did.
+void RollUp(Node& root) {
+    struct Frame { Node* node; size_t next; };
+
+    std::vector<Frame> stack;
+    stack.push_back(Frame{&root, 0});
+
+    while (!stack.empty()) {
+        Frame& f = stack.back();
+        if (f.next < f.node->children.size()) {
+            Node* child = &f.node->children[f.next];
+            ++f.next;
+            if (child->dir) stack.push_back(Frame{child, 0});
+            continue;
+        }
+
+        Node* n = f.node;
+        if (n->dir) {
+            uint64_t total = 0;
+            uint32_t files = 0;
+            for (const Node& c : n->children) {
+                total = SatAdd(total, c.size);
+                files += c.files;
+            }
+            n->size  = total;
+            n->files = files;
+        }
+        stack.pop_back();
+    }
+}
+
+void SortTree(Node& root) {
+    struct Frame { Node* node; size_t next; };
+
+    std::vector<Frame> stack;
+    stack.push_back(Frame{&root, 0});
+
+    while (!stack.empty()) {
+        Frame& f = stack.back();
+        if (f.next == 0) {
+            std::sort(f.node->children.begin(), f.node->children.end(),
+                      [](const Node& a, const Node& b) {
+                          return a.size > b.size;
+                      });
+        }
+        if (f.next < f.node->children.size()) {
+            Node* child = &f.node->children[f.next];
+            ++f.next;
+            if (child->dir && !child->children.empty()) {
+                stack.push_back(Frame{child, 0});
+            }
+            continue;
+        }
+        stack.pop_back();
+    }
+}
+
+}  // namespace
+
+ScanResult Scan(const std::wstring& root, unsigned threads,
+                Progress* progress) {
+    const auto t0 = std::chrono::steady_clock::now();
+
+    ScanResult result;
+    result.root.name = root;
+    result.root.dir  = true;
+    result.root.cat  = Cat::Directory;
+
+    if (root.empty()) return result;
+
+    if (threads == 0) {
+        SYSTEM_INFO si{};
+        GetNativeSystemInfo(&si);
+        threads = si.dwNumberOfProcessors;
+    }
+    if (threads == 0) threads = 4;
+    threads = std::min(threads, 64u);
+
+    // Fast path first. It needs a local NTFS volume and elevation; when any
+    // of that is missing it returns false having done nothing, and the
+    // directory walk below runs instead. The user is not told which ran,
+    // because the answer is the same either way.
+    if (ScanMft(root, progress, result)) {
+        RollUp(result.root);
+        SortTree(result.root);
+        result.stats.bytes   = result.root.size;
+        result.stats.usedMft = true;
+
+        const auto tMft = std::chrono::steady_clock::now();
+        result.stats.seconds =
+            std::chrono::duration<double>(tMft - t0).count();
+        if (progress) progress->done.store(true, std::memory_order_release);
+        return result;
+    }
+
+    // A failed MFT attempt may have left a partial tree behind.
+    result.root.children.clear();
+    result.root.size = 0;
+    result.root.files = 0;
+
+    Shared sh;
+    sh.progress = progress;
+    sh.queue.Push(Task{&result.root, root, 0});
+
+    // _beginthreadex rather than CreateThread: the CRT needs its per-thread
+    // state set up, and rather than std::thread because the win32 MinGW
+    // threading model is the thing this scanner was tripping over.
+    std::vector<HANDLE> pool;
+    pool.reserve(threads);
+
+    for (unsigned i = 0; i < threads; ++i) {
+        const uintptr_t h =
+            _beginthreadex(nullptr, 0, WorkerThunk, &sh, 0, nullptr);
+        if (h == 0) break;   // out of threads; those already started continue
+        pool.push_back(reinterpret_cast<HANDLE>(h));
+    }
+
+    if (pool.empty()) {
+        // No worker could start, so run the walk inline rather than returning
+        // an empty tree and reporting a successful scan of nothing.
+        WorkerThunk(&sh);
+    }
+
+    // WaitForMultipleObjects caps at MAXIMUM_WAIT_OBJECTS (64) and the thread
+    // count is clamped to that, but waiting one at a time is just as correct
+    // and does not depend on the cap.
+    for (HANDLE h : pool) {
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+    }
+
+    RollUp(result.root);
+    SortTree(result.root);
+
+    result.stats.bytes       = result.root.size;
+    result.stats.fileCount   = sh.fileCount.load();
+    result.stats.dirCount    = sh.dirCount.load();
+    result.stats.deniedCount = sh.deniedCount.load();
+    result.stats.faulted     = sh.faulted.load();
+
+    {
+        Held h(sh.deniedLock);
+        result.denied = std::move(sh.denied);
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    result.stats.seconds = std::chrono::duration<double>(t1 - t0).count();
+
+    if (progress) progress->done.store(true, std::memory_order_release);
+    return result;
 }
 
 // ------------------------------------------------------------------ volumes
 
 std::vector<Volume> EnumerateVolumes() {
     std::vector<Volume> out;
+
     const DWORD mask = GetLogicalDrives();
+    if (mask == 0) return out;
+
+    // Suppress the "no disk in drive" dialog for empty removable bays.
+    const UINT oldMode = SetErrorMode(SEM_FAILCRITICALERRORS);
 
     for (int i = 0; i < 26; ++i) {
         if ((mask & (1u << i)) == 0) continue;
 
-        const wchar_t root[4] = {static_cast<wchar_t>(L'A' + i), L':', L'\\',
-                                 L'\0'};
-        const UINT type = GetDriveTypeW(root);
-        // Optical drives and RAM disks are excluded; a mapped network drive
-        // is not, because the directory walker handles it fine - it just
-        // never gets the MFT fast path.
+        wchar_t rootPath[4] = {static_cast<wchar_t>(L'A' + i), L':', L'\\', 0};
+
+        const UINT type = GetDriveTypeW(rootPath);
         if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE &&
             type != DRIVE_REMOTE) {
             continue;
         }
 
         Volume v;
-        v.path = root;
+        v.path = rootPath;
 
         wchar_t label[MAX_PATH + 1] = {};
-        if (GetVolumeInformationW(root, label, MAX_PATH, nullptr, nullptr,
-                                  nullptr, nullptr, 0)) {
+        wchar_t fsName[64] = {};
+        if (GetVolumeInformationW(rootPath, label, MAX_PATH, nullptr, nullptr,
+                                  nullptr, fsName, 63)) {
             v.label = label;
+            v.fs    = fsName;
+            v.ready = true;
         }
 
-        ULARGE_INTEGER freeBytes{};
-        ULARGE_INTEGER totalBytes{};
-        if (GetDiskFreeSpaceExW(root, nullptr, &totalBytes, &freeBytes)) {
-            v.capacity = totalBytes.QuadPart;
-            v.free = freeBytes.QuadPart;
+        ULARGE_INTEGER avail{}, total{}, freeBytes{};
+        if (GetDiskFreeSpaceExW(rootPath, &avail, &total, &freeBytes)) {
+            v.capacity = total.QuadPart;
+            v.free     = avail.QuadPart;
+            v.ready    = true;
         }
-        out.push_back(std::move(v));
+
+        if (v.ready) out.push_back(std::move(v));
     }
+
+    SetErrorMode(oldMode);
     return out;
 }
 
-// ------------------------------------------------------------------- walker
+}  // namespace spindle
 
-namespace {
+namespace spindle {
 
-struct WorkItem {
-    Node* node = nullptr;
-    std::wstring path;   // display form, e.g. "C:\Users" - no \\?\ prefix
-};
+bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text) {
+    if (path.empty()) return false;
 
-struct WalkContext {
-    WorkQueue<WorkItem>* queue = nullptr;
-    Progress* progress = nullptr;
-    std::atomic<uint64_t>* denied = nullptr;
-    std::atomic<bool>* faulted = nullptr;
-};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                           static_cast<int>(text.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    if (needed < 0) return false;
 
-// FindClose on every exit path. The enumeration loop below allocates, and an
-// exception part-way through would otherwise leak the handle - sixteen
-// workers leaking one per failure exhausts them quickly.
-class FindGuard {
-public:
-    explicit FindGuard(HANDLE h) : h_(h) {}
-    ~FindGuard() {
-        if (h_ != INVALID_HANDLE_VALUE) FindClose(h_);
-    }
-    FindGuard(const FindGuard&) = delete;
-    FindGuard& operator=(const FindGuard&) = delete;
-
-private:
-    HANDLE h_;
-};
-
-inline bool IsDotEntry(const wchar_t* n) {
-    return n[0] == L'.' &&
-           (n[1] == L'\0' || (n[1] == L'.' && n[2] == L'\0'));
-}
-
-void EnumerateDirectory(const WorkItem& item, const WalkContext& ctx) {
-    // Extended-length prefix on every query: nesting on a real volume runs
-    // far past MAX_PATH, and the prefix costs nothing on short paths.
-    std::wstring pattern;
-    pattern.reserve(item.path.size() + 8);
-    pattern += L"\\\\?\\";
-    pattern += item.path;
-    pattern += L"\\*";
-
-    WIN32_FIND_DATAW fd;
-    // FindExInfoBasic skips the short-name lookup, and the large fetch flag
-    // batches the directory read; together they are most of the reason this
-    // outruns a naive FindFirstFile walk.
-    const HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
-                                      FindExSearchNameMatch, nullptr,
-                                      FIND_FIRST_EX_LARGE_FETCH);
-    if (h == INVALID_HANDLE_VALUE) {
-        ctx.denied->fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    FindGuard guard(h);
-
-    struct Entry {
-        std::wstring name;
-        uint64_t size = 0;
-        bool dir = false;
-        bool traverse = false;
-    };
-    std::vector<Entry> entries;
-
-    do {
-        if (IsDotEntry(fd.cFileName)) continue;
-
-        const bool isDir =
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        // Junctions and symlinks are recorded but never walked into: they
-        // would loop, or count a target twice. Their target's size is not
-        // this directory's size either, so they carry none.
-        const bool reparse =
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-
-        Entry e;
-        e.name = fd.cFileName;
-        e.dir = isDir;
-        e.traverse = isDir && !reparse;
-        if (!isDir && !reparse) {
-            e.size = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) |
-                     fd.nFileSizeLow;
-        }
-        entries.push_back(std::move(e));
-    } while (FindNextFileW(h, &fd) != 0);
-
-    // The children vector is reserved to its exact final count before any
-    // pointer into it leaves this function. That is the whole locking
-    // strategy: a queued child pointer stays valid because the vector can
-    // never reallocate afterwards.
-    Node* node = item.node;
-    node->children.reserve(entries.size());
-
-    uint64_t files = 0;
-    uint64_t dirs = 0;
-    uint64_t bytes = 0;
-    for (Entry& e : entries) {
-        Node child;
-        child.dir = e.dir;
-        child.size = e.size;
-        child.files = e.dir ? 0 : 1;
-        child.cat = e.dir ? Cat::Directory : CategoryForFile(e.name);
-        child.name = std::move(e.name);
-        node->children.push_back(std::move(child));
-        if (e.dir) {
-            ++dirs;
-        } else {
-            ++files;
-            bytes = SatAdd(bytes, e.size);
-        }
+    std::vector<char> utf8(static_cast<size_t>(needed));
+    if (needed > 0) {
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                            static_cast<int>(text.size()), utf8.data(), needed,
+                            nullptr, nullptr);
     }
 
-    ctx.progress->files.fetch_add(files, std::memory_order_relaxed);
-    ctx.progress->dirs.fetch_add(dirs, std::memory_order_relaxed);
-    ctx.progress->bytes.fetch_add(bytes, std::memory_order_relaxed);
+    const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
 
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (!entries[i].traverse) continue;
-        WorkItem w;
-        w.node = &node->children[i];
-        w.path.reserve(item.path.size() + 1 + node->children[i].name.size());
-        w.path += item.path;
-        w.path += L'\\';
-        w.path += node->children[i].name;
-        ctx.queue->Push(std::move(w));
+    bool ok = true;
+    DWORD written = 0;
+    // BOM, so Excel opens UTF-8 as UTF-8 rather than guessing the code page.
+    const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
+    if (!WriteFile(h, bom, 3, &written, nullptr)) ok = false;
+    if (ok && needed > 0 &&
+        !WriteFile(h, utf8.data(), static_cast<DWORD>(needed), &written,
+                   nullptr)) {
+        ok = false;
     }
-}
-
-// Thread entry. Wrapped end to end: an exception escaping a thread function
-// calls std::terminate, and a scan this size performs millions of
-// allocations - one bad_alloc must degrade to an incomplete tree, not kill
-// the process.
-unsigned __stdcall WalkWorker(void* param) {
-    auto* ctx = static_cast<WalkContext*>(param);
-    try {
-        WorkItem item;
-        while (ctx->queue->Pop(item)) {
-            if (ctx->progress->cancel.load(std::memory_order_relaxed)) {
-                ctx->queue->Cancel();
-                ctx->queue->Done();
-                continue;   // the next Pop observes the cancel and exits
-            }
-            EnumerateDirectory(item, *ctx);
-            ctx->queue->Done();
-        }
-    } catch (...) {
-        ctx->faulted->store(true, std::memory_order_relaxed);
-        ctx->queue->Cancel();
-    }
-    return 0;
-}
-
-void WalkTree(const std::wstring& rootPath, uint32_t threads, Node& root,
-              ScanStats& stats, Progress* progress) {
-    WorkQueue<WorkItem> queue;
-    std::atomic<uint64_t> denied{0};
-    std::atomic<bool> faulted{false};
-
-    WalkContext ctx;
-    ctx.queue = &queue;
-    ctx.progress = progress;
-    ctx.denied = &denied;
-    ctx.faulted = &faulted;
-
-    WorkItem seed;
-    seed.node = &root;
-    seed.path = root.name;
-    queue.Push(std::move(seed));
-
-    // Sixteen is where the returns flatten on real volumes: past it the
-    // walk is bound by the filesystem, not the CPU.
-    uint32_t want = threads;
-    if (want < 1) want = 1;
-    if (want > 16) want = 16;
-
-    // The pool runs with however many threads it can get. Every worker holds
-    // a pointer to `ctx`, which outlives them because this function joins
-    // them all before returning; if none start at all, the scan runs inline
-    // on this thread instead of failing.
-    HANDLE pool[16] = {};
-    uint32_t started = 0;
-    for (uint32_t i = 0; i < want; ++i) {
-        const uintptr_t h =
-            _beginthreadex(nullptr, 0, WalkWorker, &ctx, 0, nullptr);
-        if (h != 0) pool[started++] = reinterpret_cast<HANDLE>(h);
-    }
-
-    if (started == 0) {
-        WalkWorker(&ctx);
-    } else {
-        WaitForMultipleObjects(started, pool, TRUE, INFINITE);
-        for (uint32_t i = 0; i < started; ++i) CloseHandle(pool[i]);
-    }
-
-    stats.deniedCount = denied.load(std::memory_order_relaxed);
-    stats.faulted = faulted.load(std::memory_order_relaxed);
-}
-
-}  // namespace
-
-// --------------------------------------------------------------------- scan
-
-ScanResult Scan(const std::wstring& root, uint32_t threads,
-                Progress* progress) {
-    LARGE_INTEGER freq{};
-    LARGE_INTEGER t0{};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-
-    ScanResult result;
-    result.root.dir = true;
-    result.root.cat = Cat::Directory;
-    result.root.name = root;
-    while (!result.root.name.empty() && result.root.name.back() == L'\\') {
-        result.root.name.pop_back();
-    }
-
-    // The MFT fast path applies to a local NTFS volume in an elevated
-    // process; ScanWithMft checks its own preconditions and reports false on
-    // any of them, or on anything unexpected in the volume itself. The
-    // answer is the same either way, so the fallback is silent.
-    if (ScanWithMft(root, progress, result.root, result.stats)) {
-        result.stats.usedMft = true;
-    } else if (!progress->cancel.load(std::memory_order_relaxed)) {
-        result.root.children.clear();
-        WalkTree(root, threads, result.root, result.stats, progress);
-        result.stats.fileCount =
-            progress->files.load(std::memory_order_relaxed);
-        result.stats.dirCount = progress->dirs.load(std::memory_order_relaxed);
-        result.stats.bytes = progress->bytes.load(std::memory_order_relaxed);
-    }
-
-    RollUp(result.root);
-    SortTree(result.root);
-
-    LARGE_INTEGER t1{};
-    QueryPerformanceCounter(&t1);
-    if (freq.QuadPart > 0) {
-        result.stats.seconds =
-            static_cast<double>(t1.QuadPart - t0.QuadPart) /
-            static_cast<double>(freq.QuadPart);
-    }
-
-    progress->done.store(true, std::memory_order_relaxed);
-    return result;
+    CloseHandle(h);
+    return ok;
 }
 
 }  // namespace spindle

@@ -1,209 +1,104 @@
-// Spindle - NTFS on-disk structures.
+// Spindle - NTFS on-disk structure parsing.
 //
-// Everything in this header and its .cpp handles nothing but bytes: no
-// windows.h, no file handles, no assumption that the input came from a real
-// volume. That is a security decision, not a style one. Reading the Master
-// File Table means interpreting raw disk structures while running elevated,
-// and a crafted VHD, a corrupt volume or a hand-edited USB stick all reach
-// this code. Keeping it pure lets the whole parser run under ASan and UBSan
-// on any host, and be fuzzed - which is how two real bugs were found in it.
+// Reading the Master File Table directly is what makes a scan take seconds
+// instead of minutes: one large sequential read of the volume's own index,
+// rather than a syscall round trip per directory.
 //
-// Layout references: the NTFS documentation in the Linux-NTFS project and
-// Microsoft's published $Boot/$MFT descriptions. Offsets below are the
-// on-disk little-endian layout, stable since NTFS 3.1 (Windows XP).
+// Everything here operates on plain byte buffers and knows nothing about
+// Windows, for two reasons. It can be compiled and fuzzed on any host, and
+// the separation keeps the parsing -- which is the dangerous part -- away
+// from the I/O.
+//
+// SECURITY POSTURE: every byte handled here is attacker-controlled. A crafted
+// or corrupt filesystem, a malicious VHD, or a USB stick with a hand-edited
+// boot sector all reach this code, and it runs elevated because raw volume
+// access requires it. Every field read is bounds-checked against the buffer
+// actually supplied; no structure is trusted to describe itself honestly, and
+// no length, offset or count from the disk is used without validation.
 
-#ifndef SPINDLE_NTFS_H_
-#define SPINDLE_NTFS_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace spindle {
-namespace ntfs {
+namespace spindle::ntfs {
 
-// The file record number of the volume root directory, fixed by the format.
-inline constexpr uint64_t kRootFrs = 5;
+// ------------------------------------------------------------- boot sector
 
-// Attribute type codes.
+struct BootInfo {
+    uint32_t bytesPerSector   = 0;
+    uint32_t bytesPerCluster  = 0;
+    uint32_t bytesPerRecord   = 0;   // MFT file record size, normally 1024
+    uint64_t mftStartCluster  = 0;
+    uint64_t totalSectors     = 0;
+    bool     valid            = false;
+};
+
+// Parses the volume boot record. Returns valid=false for anything that is not
+// a plausible NTFS boot sector, including sane-looking values that are
+// self-inconsistent.
+BootInfo ParseBootSector(const uint8_t* data, size_t len);
+
+// --------------------------------------------------------------- run lists
+
+struct DataRun {
+    int64_t  lcn      = 0;       // starting cluster; meaningless when sparse
+    uint64_t clusters = 0;
+    bool     sparse   = false;
+};
+
+// Decodes a non-resident attribute's run list. Run lists are a compact
+// variable-length encoding, so a corrupt length nibble is the obvious way to
+// walk a parser off the end of its buffer; every step is bounds-checked and
+// the run count is capped.
+bool ParseRunList(const uint8_t* data, size_t len, std::vector<DataRun>& out);
+
+// ------------------------------------------------------------ file records
+
 inline constexpr uint32_t kAttrStandardInfo = 0x10;
 inline constexpr uint32_t kAttrAttributeList = 0x20;
-inline constexpr uint32_t kAttrFileName = 0x30;
-inline constexpr uint32_t kAttrData = 0x80;
-inline constexpr uint32_t kAttrReparsePoint = 0xC0;
-inline constexpr uint32_t kAttrEnd = 0xFFFFFFFF;
+inline constexpr uint32_t kAttrFileName     = 0x30;
+inline constexpr uint32_t kAttrData         = 0x80;
+inline constexpr uint32_t kAttrEnd          = 0xFFFFFFFF;
 
-// $FILE_NAME namespaces. DOS is the 8.3 alias and never the display name.
-inline constexpr uint8_t kNameSpaceDos = 2;
+// The NTFS root directory is always MFT record 5.
+inline constexpr uint32_t kRootRecord = 5;
 
-// ------------------------------------------------------------------- cursor
-
-// Every field read out of a disk buffer goes through one of these. A read
-// past the end does not return garbage or fault: it marks the cursor failed
-// and yields zero, and the caller checks ok() before trusting anything
-// derived from the values. This is the property the fuzzer leans on.
-class ByteCursor {
-public:
-    ByteCursor(const uint8_t* data, size_t len) : p_(data), len_(len) {}
-
-    bool ok() const { return !fail_; }
-    size_t offset() const { return off_; }
-    size_t remaining() const { return fail_ ? 0 : len_ - off_; }
-
-    bool Seek(size_t off) {
-        if (off > len_) {
-            fail_ = true;
-            return false;
-        }
-        off_ = off;
-        return true;
-    }
-
-    bool Skip(size_t n) {
-        if (n > len_ - off_ || off_ > len_) {
-            fail_ = true;
-            return false;
-        }
-        off_ += n;
-        return true;
-    }
-
-    uint8_t U8() {
-        if (fail_ || len_ - off_ < 1) {
-            fail_ = true;
-            return 0;
-        }
-        return p_[off_++];
-    }
-
-    uint16_t U16() {
-        if (fail_ || len_ - off_ < 2) {
-            fail_ = true;
-            return 0;
-        }
-        const uint16_t v = static_cast<uint16_t>(
-            static_cast<uint16_t>(p_[off_]) |
-            static_cast<uint16_t>(p_[off_ + 1]) << 8);
-        off_ += 2;
-        return v;
-    }
-
-    uint32_t U32() {
-        if (fail_ || len_ - off_ < 4) {
-            fail_ = true;
-            return 0;
-        }
-        uint32_t v = 0;
-        for (size_t i = 0; i < 4; ++i) {
-            v |= static_cast<uint32_t>(p_[off_ + i]) << (8 * i);
-        }
-        off_ += 4;
-        return v;
-    }
-
-    uint64_t U64() {
-        if (fail_ || len_ - off_ < 8) {
-            fail_ = true;
-            return 0;
-        }
-        uint64_t v = 0;
-        for (size_t i = 0; i < 8; ++i) {
-            v |= static_cast<uint64_t>(p_[off_ + i]) << (8 * i);
-        }
-        off_ += 8;
-        return v;
-    }
-
-    // A window of `n` bytes at the current offset, or nullptr. The cursor
-    // does not advance; pair with Skip.
-    const uint8_t* Peek(size_t n) {
-        if (fail_ || len_ - off_ < n || off_ > len_) {
-            fail_ = true;
-            return nullptr;
-        }
-        return p_ + off_;
-    }
-
-private:
-    const uint8_t* p_;
-    size_t len_;
-    size_t off_ = 0;
-    bool fail_ = false;
+struct RecordInfo {
+    bool     valid     = false;  // parsed successfully
+    bool     inUse     = false;  // record flag 0x01
+    bool     isDir     = false;  // record flag 0x02
+    bool     hasName   = false;
+    bool     isExtension = false;  // continuation of another record
+    uint64_t size      = 0;      // unnamed $DATA logical size
+    uint32_t parent    = 0;      // parent directory's MFT index
+    std::wstring name;
 };
 
-// -------------------------------------------------------------- boot sector
-
-struct BootSector {
-    uint32_t bytesPerSector = 0;
-    uint32_t sectorsPerCluster = 0;
-    uint64_t clusterBytes = 0;
-    uint64_t totalSectors = 0;
-    uint64_t totalClusters = 0;
-    uint64_t mftLcn = 0;         // first cluster of the $MFT
-    uint32_t recordBytes = 0;    // size of one FILE record
-};
-
-// Parses and validates the first sector of an NTFS volume. Rejects anything
-// that is not self-consistent: wrong OEM id, sector or cluster sizes that are
-// not sane powers of two, an MFT start beyond the volume, a record size the
-// reader could not handle.
-bool ParseBootSector(const uint8_t* data, size_t len, BootSector& out);
-
-// ------------------------------------------------------------------- fixups
-
-// Multi-sector records end every sector with a two-byte update sequence
-// number, with the displaced real bytes kept in the update sequence array.
-// Verifies each sector's tail matches and restores the original bytes, in
-// place. A mismatch means a torn write and the record cannot be trusted.
+// Applies the update sequence array ("fixups") to a file record in place.
+//
+// NTFS stores a check value in the last two bytes of every sector of a
+// record and keeps the real bytes in an array in the header. Skipping this
+// leaves the record subtly corrupt at each sector boundary. Returns false if
+// the array does not describe the buffer it was handed, or if a check value
+// does not match -- which means a torn write.
 bool ApplyFixups(uint8_t* record, size_t len, uint32_t bytesPerSector);
 
-// ---------------------------------------------------------------- run lists
+// Parses one MFT file record. `record` must already have had fixups applied.
+RecordInfo ParseRecord(const uint8_t* record, size_t len);
 
-// One extent of a non-resident attribute. `sparse` runs occupy no clusters
-// on disk and carry no meaningful lcn.
-struct Run {
-    uint64_t lcn = 0;
-    uint64_t clusters = 0;
-    bool sparse = false;
-};
+// ------------------------------------------------------------------ limits
 
-// Decodes a mapping-pairs array. Offsets are signed deltas from the previous
-// run's LCN with a field width of 0 to 8 bytes; both fuzz-found bugs in this
-// file lived here (see ntfs.cpp). Rejects a list whose total length exceeds
-// `maxClusters` or whose LCN leaves [0, maxClusters), so a hostile list
-// cannot direct reads at arbitrary disk offsets or claim absurd sizes.
-bool DecodeRunList(const uint8_t* data, size_t len, uint64_t maxClusters,
-                   std::vector<Run>& out);
+// Caps that bound the work a hostile filesystem can induce. Each is far above
+// anything a real volume produces.
+inline constexpr size_t   kMaxRuns          = 1u << 20;
+inline constexpr size_t   kMaxAttrsPerRec   = 256;
+inline constexpr uint32_t kMaxNameChars     = 255;   // NTFS limit
+inline constexpr uint32_t kMinRecordSize    = 256;
+inline constexpr uint32_t kMaxRecordSize    = 4096;
+inline constexpr uint32_t kMaxBytesPerSector = 4096;
+inline constexpr uint32_t kMaxClusterSize   = 1u << 26;   // 64 MB
 
-// ------------------------------------------------------------- file records
-
-struct FileRecord {
-    bool inUse = false;
-    bool isDir = false;
-    bool isReparse = false;
-    bool hasName = false;
-    uint64_t baseFrs = 0;     // nonzero: extension record, not a file
-    uint64_t parentFrs = 0;
-    uint64_t size = 0;        // unnamed $DATA stream, resident or not
-    std::wstring name;        // best $FILE_NAME (never the DOS alias)
-};
-
-// Parses one FILE record that has already had its fixups applied. Returns
-// false when the record is malformed; a false return leaves no partial state
-// worth reading. A record with no unnamed $DATA (a directory, or a file
-// whose data lives in an extension record) reports the $FILE_NAME size
-// instead, which Windows keeps only lazily up to date - documented in the
-// known limits.
-bool ParseFileRecord(const uint8_t* data, size_t len, FileRecord& out);
-
-// Extracts the unnamed $DATA attribute's run list from a FILE record, for
-// reading the $MFT itself. Returns false if the record has no non-resident
-// unnamed $DATA. `dataSize` reports the attribute's real (byte) size.
-bool ExtractDataRuns(const uint8_t* data, size_t len, uint64_t maxClusters,
-                     std::vector<Run>& runs, uint64_t& dataSize);
-
-}  // namespace ntfs
-}  // namespace spindle
-
-#endif  // SPINDLE_NTFS_H_
+}  // namespace spindle::ntfs

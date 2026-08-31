@@ -1,14 +1,28 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="Spindle"
+      version="1.0.0.0"
+      processorArchitecture="amd64"/>
 
-  <assemblyIdentity version="1.0.0.0" processorArchitecture="amd64"
-                    name="Spindle" type="win32"/>
-  <description>Disk space analyser</description>
+  <description>Spindle - disk space, mapped</description>
 
-  <!-- asInvoker, deliberately: Spindle never requests elevation itself.
-       Prompting on every launch to read protected paths the user may not
-       care about is the wrong default; run it elevated when the whole
-       picture (and the MFT fast path) is wanted. -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="amd64"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- Runs as the invoking user. Spindle needs no elevation of its own; the
+       user elevates the whole process when they want protected paths, and
+       requesting it here would prompt on every launch for no reason. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -17,21 +31,17 @@
     </security>
   </trustInfo>
 
-  <dependency>
-    <dependentAssembly>
-      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
-                        version="6.0.0.0" processorArchitecture="*"
-                        publicKeyToken="6595b64144ccf1df" language="*"/>
-    </dependentAssembly>
-  </dependency>
-
-  <!-- PerMonitorV2 here is the fallback for Windows builds that predate
-       SetProcessDpiAwarenessContext; ui.cpp also sets it at runtime. The
-       2005 element is what pre-1703 builds read. -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/PM</dpiAware>
+      <!-- Modern form; honoured by Windows 10 1703 and later. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings"
+        >PerMonitorV2, PerMonitor</dpiAwareness>
+      <!-- Legacy fallback for 8.1 and early 10 builds. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings"
+        >true/pm</dpiAware>
+      <!-- UTF-8 for narrow CRT APIs; harmless here, correct if any are added. -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings"
+        >UTF-8</activeCodePage>
     </windowsSettings>
   </application>
 
@@ -43,5 +53,4 @@
       <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
     </application>
   </compatibility>
-
 </assembly>
