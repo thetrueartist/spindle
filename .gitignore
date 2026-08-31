@@ -1,0 +1,19 @@
+# Build output
+build/
+*.o
+*.exe
+*.res.o
+
+# Generated
+spindle.ico
+icon_preview.png
+
+# Crash reports and exports produced at runtime
+spindle-crash.txt
+*.csv
+
+# Editors
+.vscode/
+.idea/
+*.swp
+compile_commands.json

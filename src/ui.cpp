@@ -1,0 +1,1963 @@
+// Spindle - Win32 + Direct2D interface.
+//
+// Palette is drawn from disk media rather than generic tool chrome: a cool
+// blue-graphite base so category colours stay readable against it, and an
+// amber accent taken from a drive activity LED.
+
+#include "spindle.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <dwmapi.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <windowsx.h>
+#include <commdlg.h>
+
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <string>
+#include <atomic>
+#include <exception>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <vector>
+#include <process.h>
+
+using namespace spindle;
+
+// Interface IDs defined locally. MinGW's import libraries carry some of these
+// symbols and not others (ID2D1Factory yes, IDWriteFactory no), and __uuidof
+// cannot be used where the out-pointer is void**. Spelling them out removes
+// the link-time dependency entirely.
+static const GUID kIidD2D1Factory = {
+    0x06152247, 0x6f50, 0x465a,
+    {0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07}};
+static const GUID kIidDWriteFactory = {
+    0xb859ee5a, 0xd838, 0x4b5b,
+    {0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48}};
+
+// --------------------------------------------------------------- small ComPtr
+
+template <typename T>
+class Com {
+public:
+    Com() = default;
+    ~Com() { reset(); }
+    Com(const Com&) = delete;
+    Com& operator=(const Com&) = delete;
+
+    T*  get() const { return p_; }
+    T** put() { reset(); return &p_; }
+    T*  operator->() const { return p_; }
+    explicit operator bool() const { return p_ != nullptr; }
+
+    void** putVoid() { reset(); return reinterpret_cast<void**>(&p_); }
+
+    void reset() {
+        if (p_) { p_->Release(); p_ = nullptr; }
+    }
+
+private:
+    T* p_ = nullptr;
+};
+
+// ------------------------------------------------------------------- palette
+
+namespace theme {
+
+constexpr D2D1_COLOR_F Hex(uint32_t rgb, float a = 1.0f) {
+    return D2D1_COLOR_F{
+        static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
+        static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
+        static_cast<float>(rgb & 0xFF) / 255.0f, a};
+}
+
+constexpr uint32_t kInk    = 0x12161C;  // base, blue-graphite
+constexpr uint32_t kSlab   = 0x191F27;  // panel
+constexpr uint32_t kSlabHi = 0x1F2732;  // raised panel
+constexpr uint32_t kRule   = 0x2A3440;  // hairline
+constexpr uint32_t kType   = 0xC9D4E1;  // primary text
+constexpr uint32_t kMute   = 0x6E7E92;  // secondary text
+constexpr uint32_t kSignal = 0xE8A33D;  // amber, drive-activity accent
+
+// Category colours. Chosen to stay distinguishable at small cell sizes on the
+// graphite base, and to avoid two adjacent hues reading as the same block.
+constexpr uint32_t kCat[static_cast<int>(Cat::COUNT)] = {
+    0x3D4B5C,  // Directory
+    0x4F9DD9,  // Media        blue
+    0x7B6CD9,  // Game         violet
+    0xD9714F,  // Archive      clay
+    0x52B788,  // Code         green
+    0xD9C24F,  // Document     yellow
+    0xC264A8,  // Binary       magenta
+    0xE8A33D,  // VirtualDisk  amber
+    0x4FC4C4,  // Database     teal
+    0x5A6B7D,  // System       slate
+    0x47566B,  // Other        dim slate
+};
+
+}  // namespace theme
+
+// --------------------------------------------------------------------- layout
+
+namespace layout {
+// Line boxes are pinned explicitly rather than left to the font's own
+// metrics. Every text rect is then sized from these, so a rect can never be
+// shorter than the line it has to hold -- which is what was clipping
+// descenders and cropping the larger labels.
+constexpr float kLineSmall = 17.0f;   // 12 px
+constexpr float kLineBody  = 20.0f;   // 14 px
+constexpr float kLineHead  = 26.0f;   // 19 px
+
+constexpr float kSidebar    = 268.0f;
+constexpr float kPad        = 16.0f;
+constexpr float kCrumbH     = 40.0f;
+constexpr float kStatusH    = 34.0f;
+constexpr float kDriveCardH = 66.0f;
+constexpr float kLegendRowH = 22.0f;
+}  // namespace layout
+
+// Must match res/spindle.rc.
+constexpr WORD IDI_APPICON = 1;
+
+constexpr UINT WM_SCAN_DONE = WM_APP + 1;
+constexpr UINT_PTR kTimerId = 1;
+
+// Durations. Deliberately short: the job of these is to show what moved, not
+// to be watched. Anything past about 200 ms starts to feel like waiting.
+constexpr DWORD kZoomMs   = 145;   // drilling in or out
+constexpr DWORD kRevealMs = 230;   // first paint after a scan, staggered
+constexpr DWORD kHoverMs  = 80;    // hover outline
+constexpr DWORD kTabMs    = 130;   // panel underline slide
+constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
+
+// A running animation. Holding the start time rather than a progress value
+// means a dropped frame is skipped over instead of stretching the duration.
+struct Anim {
+    DWORD start = 0;
+    DWORD ms    = 0;
+    bool  live  = false;
+
+    void Begin(DWORD durationMs) {
+        start = GetTickCount();
+        ms    = durationMs;
+        live  = durationMs > 0;
+    }
+
+    // Raw 0..1 progress. Marks itself finished on reaching the end, so the
+    // repaint timer can stop.
+    float Raw() {
+        if (!live || ms == 0) return 1.0f;
+        const DWORD elapsed = GetTickCount() - start;
+        if (elapsed >= ms) { live = false; return 1.0f; }
+        return static_cast<float>(elapsed) / static_cast<float>(ms);
+    }
+
+    bool Running() const { return live; }
+};
+
+// ----------------------------------------------------------------- app state
+
+struct DriveHit {
+    Rect rect;
+    int  index = -1;
+};
+
+struct App {
+    HWND hwnd = nullptr;
+
+    Com<ID2D1Factory>          d2d;
+    Com<ID2D1HwndRenderTarget> rt;
+    Com<IDWriteFactory>        dwrite;
+    Com<IDWriteTextFormat>     fmtBody;
+    Com<IDWriteTextFormat>     fmtSmall;
+    Com<IDWriteTextFormat>     fmtHead;
+    Com<IDWriteTextFormat>     fmtNum;
+    Com<IDWriteTypography>     typoTabular;
+
+    Com<ID2D1SolidColorBrush>     brush;      // recoloured per draw
+    Com<ID2D1LinearGradientBrush> sheen;      // one reused cell highlight
+
+    std::vector<Volume> volumes;
+    int                 selected = -1;
+
+    std::unique_ptr<ScanResult> result;
+    std::vector<const Node*>    trail;   // root .. current directory
+    std::vector<Cell>           cells;
+    const Node*                 hoverNode = nullptr;
+    int                         hoverIndex = -1;
+    Rect                        hoverRect;
+
+    std::vector<DriveHit> driveHits;
+    std::vector<Rect>     crumbHits;
+    size_t                crumbFirst = 0;   // trail index of crumbHits[0]
+
+    // Side panel. Every comparable tool carries these two views next to the
+    // map: which kinds of file are consuming the volume, and which individual
+    // files are the biggest. The treemap answers "where", these answer "what".
+    enum class Panel { Kinds, Largest, Search };
+    Panel                 panel = Panel::Kinds;
+    std::vector<ExtStat>  extStats;
+    std::vector<FileHit>  fileList;
+    std::vector<Rect>     panelTabs;
+    std::vector<Rect>     rowHits;
+    bool                  panelDirty = true;
+
+    std::wstring          query;
+    bool                  searchFocus = false;
+    Rect                  searchBox;
+
+    Progress              progress;
+    // Native thread handle rather than std::thread: MinGW's win32 threading
+    // model backs the standard library types, and this is the one place the
+    // application creates a long-lived thread.
+    HANDLE                worker = nullptr;
+    bool                  scanning = false;
+    // Bumped per scan. A result carrying a stale generation is discarded, so
+    // a superseded scan can never overwrite the one the user is waiting on.
+    std::atomic<uint64_t> scanGen{0};
+
+    Anim  zoom;
+    Rect  zoomFrom;
+    Anim  reveal;      // staggered entrance after a scan
+    Anim  hoverFade;
+    Anim  tabSlide;
+    Rect  tabFrom;     // underline position the slide started from
+    Rect  tabTo;
+    const Node* hoverPrev = nullptr;
+
+    // Windows exposes a system-wide preference for reduced motion. Honouring
+    // it is not decoration: for some people these transitions are the
+    // difference between usable and not.
+    bool  motion = true;
+
+    // True while the user is dragging a window edge. A full relayout costs
+    // 10-15 ms on a large volume, which is visible as stutter at every frame
+    // of a drag, so the existing cells are scaled instead and the real
+    // rebuild happens once the drag ends.
+    bool  resizing = false;
+
+    Rect  mapBounds;
+    float dpiScale = 1.0f;
+};
+
+static App g_app;
+
+// ------------------------------------------------------------------- helpers
+
+static D2D1_RECT_F ToD2D(const Rect& r) {
+    return D2D1_RECT_F{r.x, r.y, r.x + r.w, r.y + r.h};
+}
+
+static Rect Lerp(const Rect& a, const Rect& b, float t) {
+    return Rect{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+                a.w + (b.w - a.w) * t, a.h + (b.h - a.h) * t};
+}
+
+static void AppendComponent(std::wstring& p, const std::wstring& name) {
+    if (p.empty()) { p = name; return; }
+    if (p.back() != L'\\') p += L'\\';
+    p += name;
+}
+
+// Full path of the currently viewed directory, e.g. "C:\Users\thetr".
+static std::wstring TrailPath(const std::vector<const Node*>& trail) {
+    std::wstring p;
+    for (const Node* n : trail) AppendComponent(p, n->name);
+    return p;
+}
+
+// Full path of a cell. Cells nest up to five levels inside the viewed
+// directory, so the breadcrumb has to be extended by the cell's own parent
+// chain -- appending just the cell's name yields a path with every
+// intermediate directory missing, which would point Explorer (and delete)
+// somewhere else entirely.
+static std::wstring CellPath(int cellIndex) {
+    std::wstring p = TrailPath(g_app.trail);
+    for (const Node* n : CellChain(g_app.cells, cellIndex)) {
+        AppendComponent(p, n->name);
+    }
+    return p;
+}
+
+static void SetBrush(uint32_t rgb, float alpha = 1.0f) {
+    if (g_app.brush) g_app.brush->SetColor(theme::Hex(rgb, alpha));
+}
+
+// Draw text through a layout so tabular figures can be applied. Numeric
+// columns need equal-width digits to be comparable down a column; that is a
+// property of the figures, not a reason to switch to a monospace family.
+static void DrawText(const std::wstring& text, IDWriteTextFormat* fmt,
+                     const Rect& r, uint32_t rgb, float alpha = 1.0f,
+                     bool tabular = false,
+                     DWRITE_TEXT_ALIGNMENT align =
+                         DWRITE_TEXT_ALIGNMENT_LEADING) {
+    if (text.empty() || !fmt || !g_app.rt || !g_app.brush) return;
+    if (r.w <= 0.0f || r.h <= 0.0f) return;
+
+    SetBrush(rgb, alpha);
+
+    // Alignment is a property of the shared format object, so it has to be
+    // put back afterwards or it leaks into whatever draws next.
+    if (!tabular || !g_app.typoTabular) {
+        if (align != DWRITE_TEXT_ALIGNMENT_LEADING) fmt->SetTextAlignment(align);
+        g_app.rt->DrawText(text.c_str(), static_cast<UINT32>(text.size()), fmt,
+                           ToD2D(r), g_app.brush.get(),
+                           D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        if (align != DWRITE_TEXT_ALIGNMENT_LEADING) {
+            fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        return;
+    }
+
+    Com<IDWriteTextLayout> layout;
+    if (FAILED(g_app.dwrite->CreateTextLayout(
+            text.c_str(), static_cast<UINT32>(text.size()), fmt, r.w, r.h,
+            layout.put()))) {
+        return;
+    }
+    const DWRITE_TEXT_RANGE all{0, static_cast<UINT32>(text.size())};
+    layout->SetTypography(g_app.typoTabular.get(), all);
+    layout->SetTextAlignment(align);
+    g_app.rt->DrawTextLayout(D2D1_POINT_2F{r.x, r.y}, layout.get(),
+                             g_app.brush.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
+static void FillRect(const Rect& r, uint32_t rgb, float alpha = 1.0f) {
+    if (!g_app.rt || !g_app.brush) return;
+    SetBrush(rgb, alpha);
+    g_app.rt->FillRectangle(ToD2D(r), g_app.brush.get());
+}
+
+static void StrokeRect(const Rect& r, uint32_t rgb, float alpha = 1.0f,
+                       float width = 1.0f) {
+    if (!g_app.rt || !g_app.brush) return;
+    SetBrush(rgb, alpha);
+    const D2D1_RECT_F d{r.x + width * 0.5f, r.y + width * 0.5f,
+                        r.x + r.w - width * 0.5f, r.y + r.h - width * 0.5f};
+    g_app.rt->DrawRectangle(d, g_app.brush.get(), width);
+}
+
+static void FillRound(const Rect& r, float radius, uint32_t rgb,
+                      float alpha = 1.0f) {
+    if (!g_app.rt || !g_app.brush) return;
+    SetBrush(rgb, alpha);
+    const D2D1_ROUNDED_RECT rr{ToD2D(r), radius, radius};
+    g_app.rt->FillRoundedRectangle(rr, g_app.brush.get());
+}
+
+// ---------------------------------------------------------------- treemap fx
+
+// Composite a cell's fill against the background so label contrast is judged
+// against what is actually on screen, not the nominal colour. A directory
+// drawn at 0.32 alpha is far darker than its palette entry suggests.
+static uint32_t BlendOverInk(uint32_t rgb, float alpha) {
+    const auto ch = [&](int shift) {
+        const float top =
+            static_cast<float>((rgb >> shift) & 0xFF) / 255.0f;
+        const float bot =
+            static_cast<float>((theme::kInk >> shift) & 0xFF) / 255.0f;
+        const float v = top * alpha + bot * (1.0f - alpha);
+        return static_cast<uint32_t>(std::lround(v * 255.0f)) & 0xFFu;
+    };
+    return (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
+// Relative luminance, WCAG definition.
+static float Luminance(uint32_t rgb) {
+    const auto lin = [](float c) {
+        return (c <= 0.04045f) ? (c / 12.92f)
+                               : std::pow((c + 0.055f) / 1.055f, 2.4f);
+    };
+    const float r = lin(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f);
+    const float g = lin(static_cast<float>((rgb >> 8) & 0xFF) / 255.0f);
+    const float b = lin(static_cast<float>(rgb & 0xFF) / 255.0f);
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+// White on amber or yellow is close to unreadable; dark text on those is not.
+static uint32_t LabelInkFor(uint32_t fill, float alpha) {
+    return (Luminance(BlendOverInk(fill, alpha)) > 0.40f) ? 0x0E1218u
+                                                          : 0xFFFFFFu;
+}
+
+// Nested directories get progressively lighter so hierarchy is visible without
+// drawing a border around every single cell.
+static uint32_t ShadeForDepth(uint32_t base, int depth) {
+    const float lift = std::min(0.10f * static_cast<float>(depth), 0.34f);
+    auto ch = [&](int shift) {
+        const float v = static_cast<float>((base >> shift) & 0xFF) / 255.0f;
+        const float out = v + (1.0f - v) * lift;
+        return static_cast<uint32_t>(std::lround(out * 255.0f)) & 0xFFu;
+    };
+    return (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
+// ------------------------------------------------------------------ scanning
+
+static void JoinWorker() {
+    if (g_app.worker) {
+        g_app.progress.cancel.store(true, std::memory_order_relaxed);
+        WaitForSingleObject(g_app.worker, INFINITE);
+        CloseHandle(g_app.worker);
+        g_app.worker = nullptr;
+    }
+    g_app.scanning = false;
+}
+
+struct ScanRequest {
+    std::wstring root;
+    HWND         hwnd = nullptr;
+    uint64_t     gen  = 0;
+};
+
+// Scan thread entry. Wrapped end to end: an exception escaping here would
+// call std::terminate and take the process down mid-scan with nothing shown
+// to the user.
+unsigned __stdcall ScanThread(void* param) {
+    std::unique_ptr<ScanRequest> req(static_cast<ScanRequest*>(param));
+    try {
+        SYSTEM_INFO si{};
+        GetNativeSystemInfo(&si);
+
+        auto res = std::make_unique<ScanResult>(
+            Scan(req->root, si.dwNumberOfProcessors, &g_app.progress));
+
+        // Ownership passes to the UI thread only if the post succeeds. If the
+        // window has already gone, the unique_ptr frees it on the way out.
+        if (PostMessageW(req->hwnd, WM_SCAN_DONE,
+                         static_cast<WPARAM>(req->gen),
+                         reinterpret_cast<LPARAM>(res.get()))) {
+            // Deliberate: WM_SCAN_DONE re-adopts the pointer into a
+            // unique_ptr on the UI thread. Static analysis cannot follow
+            // ownership across a message post and reports a leak here.
+            static_cast<void>(res.release());  // NOLINT(bugprone-unused-return-value)
+        }
+    } catch (...) {
+        // Report failure rather than dying: a null result tells the handler
+        // the scan did not complete.
+        PostMessageW(req->hwnd, WM_SCAN_DONE, static_cast<WPARAM>(req->gen), 0);
+    }
+    return 0;
+}
+
+static void StartScan(int volumeIndex) {
+    if (volumeIndex < 0 ||
+        volumeIndex >= static_cast<int>(g_app.volumes.size())) {
+        return;
+    }
+    JoinWorker();
+
+    // Order matters: everything that points into the old tree is dropped
+    // before the tree itself is freed.
+    g_app.selected  = volumeIndex;
+    g_app.trail.clear();
+    g_app.cells.clear();
+    g_app.hoverNode  = nullptr;
+    g_app.hoverIndex = -1;
+    g_app.result.reset();
+
+    g_app.progress.files.store(0);
+    g_app.progress.dirs.store(0);
+    g_app.progress.bytes.store(0);
+    g_app.progress.cancel.store(false);
+    g_app.progress.done.store(false);
+    g_app.scanning = true;
+
+    auto req = std::make_unique<ScanRequest>();
+    req->root = g_app.volumes[static_cast<size_t>(volumeIndex)].path;
+    req->hwnd = g_app.hwnd;
+    req->gen  = g_app.scanGen.fetch_add(1) + 1;
+
+    const uintptr_t h =
+        _beginthreadex(nullptr, 0, ScanThread, req.get(), 0, nullptr);
+    if (h == 0) {
+        g_app.scanning = false;
+        MessageBoxW(g_app.hwnd, L"Could not start the scan: the system "
+                                L"refused a new thread.",
+                    L"Spindle", MB_OK | MB_ICONERROR);
+        return;
+    }
+    // The thread owns it now and frees it on the way out.
+    static_cast<void>(req.release());  // NOLINT(bugprone-unused-return-value)
+    g_app.worker = reinterpret_cast<HANDLE>(h);
+
+    SetTimer(g_app.hwnd, kTimerId, 33, nullptr);
+}
+
+// The layout is area-proportional, so scaling every cell by the same factor
+// is visually near-identical to relaying out -- close enough to hold during a
+// drag, and it costs microseconds rather than milliseconds.
+static void ScaleCells(const Rect& from, const Rect& to) {
+    if (from.w <= 0.01f || from.h <= 0.01f) return;
+    const float sx = to.w / from.w;
+    const float sy = to.h / from.h;
+    for (Cell& c : g_app.cells) {
+        c.rect.x = to.x + (c.rect.x - from.x) * sx;
+        c.rect.y = to.y + (c.rect.y - from.y) * sy;
+        c.rect.w *= sx;
+        c.rect.h *= sy;
+        c.header *= sy;
+    }
+}
+
+static void RebuildTreemap() {
+    g_app.cells.clear();
+    if (g_app.trail.empty()) return;
+
+    const Node* cur = g_app.trail.back();
+    if (!cur) return;
+
+    // minArea scales with the viewport so a large window shows more detail
+    // without a small one emitting tens of thousands of invisible cells.
+    const float area = g_app.mapBounds.w * g_app.mapBounds.h;
+    const float minArea = std::max(6.0f, area / 42000.0f);
+
+    BuildTreemap(*cur, g_app.mapBounds, 5, minArea, g_app.cells);
+}
+
+// Rebuilds whichever side panel is showing, for the directory currently in
+// view. Deferred behind a dirty flag: these walk the whole subtree, and doing
+// that inside a paint would stall the window.
+static void RefreshPanel() {
+    g_app.panelDirty = false;
+    g_app.extStats.clear();
+    g_app.fileList.clear();
+    if (g_app.trail.empty()) return;
+
+    const Node& cur = *g_app.trail.back();
+    switch (g_app.panel) {
+        case App::Panel::Kinds:
+            g_app.extStats = ExtensionBreakdown(cur, 12);
+            break;
+        case App::Panel::Largest:
+            g_app.fileList = LargestFiles(cur, 40);
+            break;
+        case App::Panel::Search:
+            g_app.fileList =
+                FindMatching(cur, ParseQuery(g_app.query), 200);
+            break;
+    }
+}
+
+static void NavigateTo(const Node* node, const Rect& from) {
+    if (!node) return;
+    g_app.zoomFrom  = from;
+    g_app.zoom.Begin(g_app.motion ? kZoomMs : 0);
+    g_app.panelDirty = true;
+    RebuildTreemap();
+    SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+static void GoUp() {
+    if (g_app.trail.size() <= 1) return;
+    g_app.trail.pop_back();
+    g_app.hoverNode  = nullptr;
+    g_app.hoverIndex = -1;
+    NavigateTo(g_app.trail.back(), g_app.mapBounds);
+}
+
+// ------------------------------------------------------------------- drawing
+
+static void DrawDriveCard(const Volume& v, const Rect& r, bool active,
+                          int index) {
+    g_app.driveHits.push_back(DriveHit{r, index});
+
+    FillRound(r, 6.0f, active ? theme::kSlabHi : theme::kSlab);
+    if (active) {
+        SetBrush(theme::kSignal, 0.85f);
+        const D2D1_ROUNDED_RECT rr{ToD2D(r), 6.0f, 6.0f};
+        g_app.rt->DrawRoundedRectangle(rr, g_app.brush.get(), 1.0f);
+    }
+
+    const float pad = 11.0f;
+
+    std::wstring letter = v.path.substr(0, 2);
+    DrawText(letter, g_app.fmtHead.get(),
+             Rect{r.x + pad, r.y + 6.0f, 40.0f, layout::kLineHead},
+             active ? theme::kSignal : theme::kType);
+
+    if (!v.label.empty()) {
+        DrawText(SanitizeForDisplay(v.label), g_app.fmtSmall.get(),
+                 Rect{r.x + pad + 34.0f, r.y + 6.0f,
+                      r.w - pad * 2 - 34.0f, layout::kLineHead},
+                 theme::kMute);
+    }
+
+    // Capacity bar. Fill is used space, so a nearly-full drive reads as a
+    // nearly-full bar without needing to be labelled as such.
+    const Rect bar{r.x + pad, r.y + 36.0f, r.w - pad * 2.0f, 5.0f};
+    FillRound(bar, 2.5f, theme::kRule);
+
+    if (v.capacity > 0) {
+        const double used = static_cast<double>(v.capacity - v.free) /
+                            static_cast<double>(v.capacity);
+        const float w = static_cast<float>(used) * bar.w;
+        if (w > 1.0f) {
+            const bool tight = used > 0.90;
+            const bool warn  = used > 0.78;
+            FillRound(Rect{bar.x, bar.y, w, bar.h}, 2.5f,
+                      tight ? 0xD9714F : (warn ? theme::kSignal : 0x4F9DD9));
+        }
+    }
+
+    const std::wstring freeText = FormatSize(v.free) + L" free";
+    DrawText(freeText, g_app.fmtSmall.get(),
+             Rect{r.x + pad, r.y + 44.0f, r.w - pad * 2.0f,
+                  layout::kLineSmall},
+             theme::kMute, 1.0f, true);
+}
+
+static void DrawSidebar(const Rect& area) {
+    FillRect(area, theme::kSlab, 0.55f);
+    FillRect(Rect{area.right() - 1.0f, area.y, 1.0f, area.h}, theme::kRule);
+
+    float y = area.y + layout::kPad;
+
+    DrawText(L"Spindle", g_app.fmtHead.get(),
+             Rect{area.x + layout::kPad, y, area.w - layout::kPad * 2,
+                  layout::kLineHead},
+             theme::kType);
+    y += 30.0f;
+    DrawText(L"Disk space, mapped", g_app.fmtSmall.get(),
+             Rect{area.x + layout::kPad, y, area.w - layout::kPad * 2,
+                  layout::kLineSmall},
+             theme::kMute);
+    y += 34.0f;
+
+    DrawText(L"Drives", g_app.fmtSmall.get(),
+             Rect{area.x + layout::kPad, y, area.w - layout::kPad * 2,
+                  layout::kLineSmall},
+             theme::kMute);
+    y += 22.0f;
+
+    g_app.driveHits.clear();
+    for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+        const Rect card{area.x + layout::kPad, y,
+                        area.w - layout::kPad * 2.0f, layout::kDriveCardH};
+        if (card.bottom() > area.bottom() - 200.0f) break;
+        DrawDriveCard(g_app.volumes[i], card,
+                      static_cast<int>(i) == g_app.selected,
+                      static_cast<int>(i));
+        y += layout::kDriveCardH + 8.0f;
+    }
+
+    if (g_app.cells.empty() && g_app.fileList.empty()) { return; }
+
+    if (g_app.panelDirty) RefreshPanel();
+
+    y += 10.0f;
+
+    // --- tabs
+    const wchar_t* labels[3] = {L"Kinds", L"Largest", L"Find"};
+    const float tabW = (area.w - layout::kPad * 2.0f) / 3.0f;
+    g_app.panelTabs.clear();
+
+    for (int i = 0; i < 3; ++i) {
+        const Rect tab{area.x + layout::kPad + tabW * static_cast<float>(i), y,
+                       tabW, 24.0f};
+        g_app.panelTabs.push_back(tab);
+
+        const bool active = (static_cast<int>(g_app.panel) == i);
+        DrawText(labels[i], g_app.fmtSmall.get(),
+                 Rect{tab.x, tab.y + 3.0f, tab.w, layout::kLineSmall},
+                 active ? theme::kType : theme::kMute, 1.0f, false,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    // The underline slides between tabs rather than jumping. It is the only
+    // thing on screen that moves when the panel changes, so it carries the
+    // whole transition.
+    {
+        const int idx = static_cast<int>(g_app.panel);
+        const Rect target{area.x + layout::kPad + tabW * static_cast<float>(idx),
+                          y + 22.0f, tabW, 2.0f};
+        Rect bar = target;
+        if (g_app.tabSlide.Running()) {
+            const float t = ease::OutQuint(g_app.tabSlide.Raw());
+            bar = Lerp(g_app.tabFrom, target, t);
+        }
+        g_app.tabTo = target;
+        FillRound(bar, 1.0f, theme::kSignal);
+    }
+    y += 30.0f;
+
+    const float rowW = area.w - layout::kPad * 2.0f;
+    g_app.rowHits.clear();
+
+    // --- search box
+    if (g_app.panel == App::Panel::Search) {
+        g_app.searchBox = Rect{area.x + layout::kPad, y, rowW, 26.0f};
+        FillRound(g_app.searchBox, 4.0f, theme::kInk);
+        if (g_app.searchFocus) {
+            SetBrush(theme::kSignal, 0.8f);
+            const D2D1_ROUNDED_RECT rr{ToD2D(g_app.searchBox), 4.0f, 4.0f};
+            g_app.rt->DrawRoundedRectangle(rr, g_app.brush.get(), 1.0f);
+        }
+        const std::wstring shown =
+            g_app.query.empty()
+                ? std::wstring(L"name, kind:media, ext:pak, >500mb, -temp")
+                : g_app.query + (g_app.searchFocus ? L"|" : L"");
+        DrawText(shown, g_app.fmtSmall.get(),
+                 Rect{g_app.searchBox.x + 8.0f, g_app.searchBox.y + 4.0f,
+                      rowW - 16.0f, layout::kLineSmall},
+                 g_app.query.empty() ? theme::kMute : theme::kType);
+        y += 32.0f;
+    }
+
+    // --- rows
+    if (g_app.panel == App::Panel::Kinds) {
+        for (const ExtStat& e : g_app.extStats) {
+            if (y + 22.0f > area.bottom() - layout::kPad) break;
+
+            const int ci = static_cast<int>(e.cat);
+            const uint32_t colour =
+                theme::kCat[(ci > 0 && ci < static_cast<int>(Cat::COUNT))
+                                ? ci : static_cast<int>(Cat::Other)];
+            FillRound(Rect{area.x + layout::kPad, y + 6.0f, 9.0f, 9.0f}, 2.0f,
+                      colour);
+
+            const Rect row{area.x + layout::kPad - 4.0f, y, rowW + 8.0f,
+                           21.0f};
+            g_app.rowHits.push_back(row);
+
+            const std::wstring label =
+                e.ext.empty() ? std::wstring(L"(none)") : L"." + e.ext;
+            DrawText(label, g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad + 16.0f, y + 2.0f, 96.0f,
+                          layout::kLineSmall},
+                     theme::kType);
+            DrawText(FormatSize(e.bytes), g_app.fmtSmall.get(),
+                     Rect{area.right() - layout::kPad - 82.0f, y + 2.0f,
+                          82.0f, layout::kLineSmall},
+                     theme::kMute, 1.0f, true, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            y += 22.0f;
+        }
+        return;
+    }
+
+    // Largest / Find both render a file list.
+    if (g_app.fileList.empty()) {
+        const wchar_t* empty =
+            (g_app.panel == App::Panel::Search)
+                ? (g_app.query.empty() ? L"" : L"Nothing matches")
+                : L"No files here";
+        DrawText(empty, g_app.fmtSmall.get(),
+                 Rect{area.x + layout::kPad, y, rowW, layout::kLineSmall},
+                 theme::kMute);
+        return;
+    }
+
+    for (const FileHit& hit : g_app.fileList) {
+        if (y + 34.0f > area.bottom() - layout::kPad) break;
+
+        const Rect row{area.x + layout::kPad - 4.0f, y, rowW + 8.0f, 32.0f};
+        const bool hot = (hit.node == g_app.hoverNode);
+        if (hot) FillRound(row, 3.0f, theme::kSlabHi);
+        g_app.rowHits.push_back(row);
+
+        const int ci = static_cast<int>(hit.node->cat);
+        const uint32_t colour =
+            theme::kCat[(ci > 0 && ci < static_cast<int>(Cat::COUNT))
+                            ? ci : static_cast<int>(Cat::Other)];
+        FillRound(Rect{area.x + layout::kPad, y + 6.0f, 3.0f, 20.0f}, 1.5f,
+                  colour);
+
+        DrawText(SanitizeForDisplay(hit.node->name), g_app.fmtSmall.get(),
+                 Rect{area.x + layout::kPad + 11.0f, y + 1.0f,
+                      rowW - 11.0f, layout::kLineSmall},
+                 theme::kType);
+        DrawText(FormatSize(hit.size), g_app.fmtSmall.get(),
+                 Rect{area.x + layout::kPad + 11.0f, y + 15.0f,
+                      rowW - 11.0f, layout::kLineSmall},
+                 theme::kMute, 0.9f, true);
+        y += 34.0f;
+    }
+}
+
+static void DrawBreadcrumb(const Rect& area) {
+    g_app.crumbHits.clear();
+    if (g_app.trail.empty()) return;
+
+    const float avail = area.w - layout::kPad * 2.0f;
+
+    // Measure every crumb first, then keep the deepest ones that fit. Laying
+    // out head-first pushes the folder you are actually looking at off the
+    // right edge once you are a few levels down.
+    struct Crumb { std::wstring text; float w; };
+    std::vector<Crumb> crumbs;
+    crumbs.reserve(g_app.trail.size());
+
+    for (const Node* n : g_app.trail) {
+        Crumb c;
+        c.text = SanitizeForDisplay(n->name);
+        c.w = 90.0f;
+        Com<IDWriteTextLayout> probe;
+        if (SUCCEEDED(g_app.dwrite->CreateTextLayout(
+                c.text.c_str(), static_cast<UINT32>(c.text.size()),
+                g_app.fmtBody.get(), 420.0f, 20.0f, probe.put()))) {
+            DWRITE_TEXT_METRICS tm{};
+            probe->GetMetrics(&tm);
+            c.w = std::min(tm.width + 2.0f, 250.0f);
+        }
+        crumbs.push_back(std::move(c));
+    }
+
+    constexpr float kSepW = 20.0f;
+    const float kElideW = 22.0f;
+
+    size_t first = 0;
+    for (;;) {
+        float total = (first > 0) ? kElideW : 0.0f;
+        for (size_t i = first; i < crumbs.size(); ++i) {
+            total += crumbs[i].w;
+            if (i + 1 < crumbs.size()) total += kSepW;
+        }
+        if (total <= avail || first + 1 >= crumbs.size()) break;
+        ++first;
+    }
+
+    float x = area.x + layout::kPad;
+    const float baseY = area.y + 11.0f;
+
+    if (first > 0) {
+        DrawText(L"\u2026", g_app.fmtBody.get(),
+                 Rect{x, baseY, kElideW, layout::kLineBody}, theme::kMute);
+        x += kElideW;
+    }
+
+    for (size_t i = first; i < crumbs.size(); ++i) {
+        const bool last = (i + 1 == crumbs.size());
+        const Rect box{x, baseY, crumbs[i].w, layout::kLineBody};
+
+        DrawText(crumbs[i].text, g_app.fmtBody.get(), box,
+                 last ? theme::kType : theme::kMute);
+
+        if (g_app.crumbHits.empty()) g_app.crumbFirst = i;
+        g_app.crumbHits.push_back(Rect{x, area.y, crumbs[i].w, area.h});
+        x += crumbs[i].w;
+
+        if (!last) {
+            DrawText(L"\u203A", g_app.fmtBody.get(),
+                     Rect{x + 6.0f, baseY, 14.0f, layout::kLineBody},
+                     theme::kRule);
+            x += kSepW;
+        }
+    }
+}
+
+static void DrawCell(const Cell& c, const Rect& r, bool hovered,
+                     float scaleY, float alpha = 1.0f,
+                     float hoverT = 1.0f) {
+    if (r.w < 1.0f || r.h < 1.0f) return;
+    if (alpha <= 0.01f) return;
+
+    const int catIdx = static_cast<int>(c.node->cat);
+    const uint32_t base =
+        theme::kCat[(catIdx >= 0 && catIdx < static_cast<int>(Cat::COUNT))
+                        ? catIdx
+                        : static_cast<int>(Cat::Other)];
+    const uint32_t shade = ShadeForDepth(base, c.depth);
+    const float fillA = (c.node->dir ? 0.32f : 0.92f) * alpha;
+
+    // Hovered cells lift slightly as well as gaining an outline. The lift is
+    // what makes the pointer feel attached to the map.
+    const float lift = 0.10f * hoverT;
+    FillRect(r, shade, std::min(1.0f, fillA + lift));
+
+    // A single reused gradient gives every cell a top-lit edge, which is what
+    // makes the map read as stacked blocks rather than flat colour fields.
+    if (r.w > 6.0f && r.h > 6.0f && g_app.sheen && alpha > 0.9f) {
+        g_app.sheen->SetStartPoint(D2D1_POINT_2F{r.x, r.y});
+        g_app.sheen->SetEndPoint(D2D1_POINT_2F{r.x, r.y + r.h});
+        g_app.rt->FillRectangle(ToD2D(r), g_app.sheen.get());
+    }
+
+    if (r.w > 3.0f && r.h > 3.0f) {
+        StrokeRect(r, theme::kInk, (c.node->dir ? 0.65f : 0.45f) * alpha, 1.0f);
+    }
+    if (hovered && hoverT > 0.01f) {
+        StrokeRect(r, theme::kSignal, hoverT, 1.0f + hoverT);
+    }
+
+    const float header = c.header * scaleY;
+
+    if (c.expanded) {
+        // Children are drawn over this cell's body. Its label goes in the
+        // reserved strip, or nowhere at all if no strip was reserved --
+        // drawing it in the body is what caused labels to pile up.
+        if (header < 11.0f || r.w < 52.0f) return;
+
+        const Rect strip{r.x, r.y, r.w, header};
+        FillRect(strip, theme::kInk, 0.34f);
+
+        const uint32_t ink = LabelInkFor(shade, fillA + 0.34f);
+        const std::wstring size = FormatSize(c.node->size);
+
+        // Size is right-aligned and the name is clipped short of it, so a long
+        // directory name cannot run underneath its own size.
+        float sizeW = 0.0f;
+        if (r.w > 130.0f) {
+            sizeW = std::min(72.0f, r.w * 0.34f);
+            DrawText(size, g_app.fmtSmall.get(),
+                     Rect{r.right() - sizeW - 5.0f, r.y, sizeW, header},
+                     ink, 0.72f * alpha, true,
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+
+        DrawText(SanitizeForDisplay(c.node->name), g_app.fmtSmall.get(),
+                 Rect{r.x + 5.0f, r.y,
+                      r.w - 10.0f - sizeW - (sizeW > 0.0f ? 6.0f : 0.0f),
+                      header},
+                 ink, 0.95f * alpha);
+        return;
+    }
+
+    // Leaf cell: nothing is drawn on top, so the body carries the label.
+    if (r.w > 74.0f && r.h > 21.0f) {
+        const uint32_t ink = LabelInkFor(shade, fillA);
+        DrawText(SanitizeForDisplay(c.node->name), g_app.fmtSmall.get(),
+                 Rect{r.x + 5.0f, r.y + 2.0f, r.w - 10.0f,
+                      layout::kLineSmall}, ink, 0.94f * alpha);
+
+        if (r.h > 38.0f) {
+            DrawText(FormatSize(c.node->size), g_app.fmtSmall.get(),
+                     Rect{r.x + 5.0f, r.y + 18.0f, r.w - 10.0f,
+                          layout::kLineSmall}, ink, 0.66f * alpha, true);
+        }
+    }
+}
+
+static void DrawTreemap(const Rect& area) {
+    FillRect(area, theme::kInk);
+
+    if (g_app.scanning) {
+        const uint64_t f = g_app.progress.files.load(std::memory_order_relaxed);
+        const uint64_t b = g_app.progress.bytes.load(std::memory_order_relaxed);
+
+        const Rect centre{area.x, area.y + area.h * 0.42f, area.w,
+                          layout::kLineHead};
+        DrawText(L"Scanning", g_app.fmtHead.get(), centre, theme::kType, 1.0f,
+                 false, DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawText(FormatCount(f) + L" files  \u00B7  " + FormatSize(b),
+                 g_app.fmtBody.get(),
+                 Rect{area.x, centre.bottom() + 6.0f, area.w,
+                      layout::kLineBody},
+                 theme::kMute, 1.0f, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
+    if (g_app.cells.empty()) {
+        const Rect centre{area.x, area.y + area.h * 0.44f, area.w,
+                          layout::kLineBody};
+        DrawText(g_app.result ? L"Nothing large enough to map here"
+                              : L"Pick a drive to map it",
+                 g_app.fmtBody.get(), centre, theme::kMute, 1.0f, false,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
+    const float zoomT = ease::OutQuint(g_app.zoom.Raw());
+    const bool  zooming = zoomT < 1.0f;
+
+    const float revealRaw = g_app.reveal.Raw();
+    const bool  revealing = revealRaw < 1.0f;
+
+    const float sx = (g_app.mapBounds.w > 0.0f)
+                         ? g_app.zoomFrom.w / g_app.mapBounds.w : 1.0f;
+    const float sy = (g_app.mapBounds.h > 0.0f)
+                         ? g_app.zoomFrom.h / g_app.mapBounds.h : 1.0f;
+
+    // Hover strength is animated rather than binary, so sweeping the pointer
+    // across the map does not strobe.
+    const float hoverT = ease::OutCubic(g_app.hoverFade.Raw());
+
+    // Deepest cell drawn, so the reveal stagger can be normalised against it.
+    int maxDepth = 1;
+    for (const Cell& c : g_app.cells) maxDepth = std::max(maxDepth, c.depth);
+
+    for (const Cell& c : g_app.cells) {
+        Rect r = c.rect;
+        float scaleY = 1.0f;
+
+        if (zooming) {
+            const Rect start{
+                g_app.zoomFrom.x + (c.rect.x - g_app.mapBounds.x) * sx,
+                g_app.zoomFrom.y + (c.rect.y - g_app.mapBounds.y) * sy,
+                c.rect.w * sx, c.rect.h * sy};
+            r = Lerp(start, c.rect, zoomT);
+            // The label strip must shrink with the cell, or a mid-animation
+            // frame draws a strip taller than the cell holding it.
+            scaleY = (c.rect.h > 0.01f) ? (r.h / c.rect.h) : 1.0f;
+        }
+
+        // Entrance: shallow cells settle first, deeper ones follow. The map
+        // assembles outside-in, which reads as structure appearing rather
+        // than as a single flat fade.
+        float alpha = 1.0f;
+        if (revealing) {
+            const float lead =
+                0.45f * static_cast<float>(c.depth) /
+                static_cast<float>(maxDepth);
+            const float local =
+                (revealRaw - lead) / std::max(0.15f, 1.0f - lead);
+            alpha = ease::OutCubic(std::max(0.0f, std::min(1.0f, local)));
+            if (alpha <= 0.01f) continue;
+
+            // A small settle inward as it fades up, anchored on the centre.
+            const float shrink = (1.0f - alpha) * 0.06f;
+            const float dx = r.w * shrink * 0.5f;
+            const float dy = r.h * shrink * 0.5f;
+            r = Rect{r.x + dx, r.y + dy, r.w - dx * 2.0f, r.h - dy * 2.0f};
+        }
+
+        const bool hot = !zooming && c.node == g_app.hoverNode;
+        DrawCell(c, r, hot, scaleY, alpha, hot ? hoverT : 0.0f);
+    }
+}
+
+static void DrawStatus(const Rect& area) {
+    FillRect(area, theme::kSlab, 0.7f);
+    FillRect(Rect{area.x, area.y, area.w, 1.0f}, theme::kRule);
+
+    const float pad = layout::kPad;
+
+    if (g_app.hoverNode) {
+        const std::wstring path =
+            SanitizeForDisplay(CellPath(g_app.hoverIndex));
+        DrawText(path, g_app.fmtSmall.get(),
+                 Rect{area.x + pad, area.y + 8.0f,
+                      area.w - pad * 2 - 220.0f, layout::kLineSmall},
+                 theme::kType);
+
+        std::wstring right = FormatSize(g_app.hoverNode->size);
+        if (g_app.hoverNode->dir) {
+            right += L"  \u00B7  " + FormatCount(g_app.hoverNode->files) +
+                     L" files";
+        }
+        DrawText(right, g_app.fmtSmall.get(),
+                 Rect{area.right() - 214.0f, area.y + 8.0f, 200.0f,
+                      layout::kLineSmall},
+                 theme::kSignal, 1.0f, true);
+        return;
+    }
+
+    if (g_app.result) {
+        const ScanStats& s = g_app.result->stats;
+        wchar_t buf[64];
+        const int written = std::swprintf(buf, 64, L"%.1fs", s.seconds);
+        const std::wstring elapsed =
+            (written > 0 && written < 64)
+                ? std::wstring(buf, static_cast<size_t>(written))
+                : std::wstring(L"--");
+
+        std::wstring line = FormatCount(s.fileCount) + L" files  \u00B7  " +
+                            FormatCount(s.dirCount) + L" folders  \u00B7  " +
+                            FormatSize(s.bytes) + L"  \u00B7  " + elapsed;
+        if (s.usedMft) line += L"  \u00B7  MFT";
+        if (s.deniedCount > 0) {
+            line += L"  \u00B7  " + FormatCount(s.deniedCount) +
+                    L" unreadable";
+        }
+        if (s.faulted) line += L"  \u00B7  incomplete";
+        DrawText(line, g_app.fmtSmall.get(),
+                 Rect{area.x + pad, area.y + 8.0f, area.w - pad * 2,
+                      layout::kLineSmall},
+                 theme::kMute, 1.0f, true);
+        return;
+    }
+
+    DrawText(L"Click a drive to scan it. Click a block to go deeper, "
+             L"backspace to come back. Ctrl+F to search, Ctrl+E to export.",
+             g_app.fmtSmall.get(),
+             Rect{area.x + pad, area.y + 8.0f, area.w - pad * 2,
+                  layout::kLineSmall},
+             theme::kMute);
+}
+
+// ------------------------------------------------------------------ resources
+
+// Window DPI, resolved at runtime: GetDpiForWindow is Windows 10 1607+.
+static float QueryDpiScale(HWND hwnd) {
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using GetDpiFn = UINT(WINAPI*)(HWND);
+        const FARPROC raw = GetProcAddress(user32, "GetDpiForWindow");
+        if (raw) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+            const auto fn = reinterpret_cast<GetDpiFn>(raw);
+#pragma GCC diagnostic pop
+            const UINT dpi = fn(hwnd);
+            if (dpi >= 48 && dpi <= 480) {
+                return static_cast<float>(dpi) / 96.0f;
+            }
+        }
+    }
+    return 1.0f;
+}
+
+static bool CreateDeviceResources() {
+    if (g_app.rt) return true;
+    if (!g_app.d2d) return false;
+
+    RECT rc{};
+    GetClientRect(g_app.hwnd, &rc);
+    const D2D1_SIZE_U size{static_cast<UINT32>(std::max<LONG>(rc.right, 1)),
+                           static_cast<UINT32>(std::max<LONG>(rc.bottom, 1))};
+
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties();
+    props.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          D2D1_ALPHA_MODE_IGNORE);
+
+    if (FAILED(g_app.d2d->CreateHwndRenderTarget(
+            props, D2D1::HwndRenderTargetProperties(g_app.hwnd, size),
+            g_app.rt.put()))) {
+        return false;
+    }
+
+    // Grayscale rather than ClearType. Subpixel rendering puts coloured
+    // fringes on glyph edges, which is unobtrusive on white and clearly
+    // visible on a dark background -- especially on the muted greys used for
+    // secondary text.
+    g_app.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+
+    // Declaring per-monitor awareness stops Windows scaling the window for us,
+    // so Direct2D has to be told the real DPI or every dimension below is
+    // interpreted at 96 and the whole interface renders undersized.
+    const float dpi = g_app.dpiScale * 96.0f;
+    g_app.rt->SetDpi(dpi, dpi);
+
+    if (FAILED(g_app.rt->CreateSolidColorBrush(theme::Hex(theme::kType),
+                                               g_app.brush.put()))) {
+        return false;
+    }
+
+    D2D1_GRADIENT_STOP stops[2];
+    stops[0].position = 0.0f;
+    stops[0].color    = D2D1_COLOR_F{1.0f, 1.0f, 1.0f, 0.09f};
+    stops[1].position = 1.0f;
+    stops[1].color    = D2D1_COLOR_F{0.0f, 0.0f, 0.0f, 0.13f};
+
+    Com<ID2D1GradientStopCollection> coll;
+    if (SUCCEEDED(g_app.rt->CreateGradientStopCollection(
+            stops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, coll.put()))) {
+        g_app.rt->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(D2D1_POINT_2F{0, 0},
+                                                D2D1_POINT_2F{0, 1}),
+            coll.get(), g_app.sheen.put());
+    }
+    return true;
+}
+
+static void DiscardDeviceResources() {
+    g_app.sheen.reset();
+    g_app.brush.reset();
+    g_app.rt.reset();
+}
+
+static bool CreateTextFormats() {
+    struct Spec {
+        Com<IDWriteTextFormat>* out;
+        float                   size;
+        DWRITE_FONT_WEIGHT      weight;
+    };
+    struct Spec2 { Com<IDWriteTextFormat>* out; float size;
+                   DWRITE_FONT_WEIGHT weight; float line; };
+    const Spec2 specs[] = {
+        {&g_app.fmtBody,  14.0f, DWRITE_FONT_WEIGHT_NORMAL,    layout::kLineBody},
+        {&g_app.fmtSmall, 12.0f, DWRITE_FONT_WEIGHT_NORMAL,    layout::kLineSmall},
+        {&g_app.fmtHead,  19.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, layout::kLineHead},
+        {&g_app.fmtNum,   12.0f, DWRITE_FONT_WEIGHT_NORMAL,    layout::kLineSmall},
+    };
+
+    for (const Spec2& s : specs) {
+        if (FAILED(g_app.dwrite->CreateTextFormat(
+                L"Segoe UI", nullptr, s.weight, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL, s.size, L"en-us", s.out->put()))) {
+            return false;
+        }
+        (*s.out)->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+        // Centred vertically inside whatever rect it is given, with a fixed
+        // line box. A rect that is a little too generous now centres the text
+        // rather than pinning it to the top, and one that is a little too
+        // tight can no longer crop it.
+        (*s.out)->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        (*s.out)->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, s.line,
+                                 s.line * 0.78f);
+        // An ellipsis sign makes truncation legible. A hard character clip
+        // leaves a half-word that reads like a different name entirely.
+        DWRITE_TRIMMING trim{};
+        trim.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER;
+
+        Com<IDWriteInlineObject> sign;
+        if (SUCCEEDED(g_app.dwrite->CreateEllipsisTrimmingSign(s.out->get(),
+                                                               sign.put()))) {
+            (*s.out)->SetTrimming(&trim, sign.get());
+        } else {
+            (*s.out)->SetTrimming(&trim, nullptr);
+        }
+    }
+
+    if (SUCCEEDED(g_app.dwrite->CreateTypography(g_app.typoTabular.put()))) {
+        const DWRITE_FONT_FEATURE f{
+            DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1};
+        g_app.typoTabular->AddFontFeature(f);
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------- rendering
+
+static void Render() {
+    if (!CreateDeviceResources()) return;
+
+    const D2D1_SIZE_F sz = g_app.rt->GetSize();
+
+    g_app.rt->BeginDraw();
+    g_app.rt->Clear(theme::Hex(theme::kInk));
+
+    const Rect side{0, 0, layout::kSidebar, sz.height};
+    const Rect main{layout::kSidebar, 0, sz.width - layout::kSidebar,
+                    sz.height};
+    const Rect crumb{main.x, 0, main.w, layout::kCrumbH};
+    const Rect status{main.x, sz.height - layout::kStatusH, main.w,
+                      layout::kStatusH};
+    const Rect map{main.x, layout::kCrumbH, main.w,
+                   sz.height - layout::kCrumbH - layout::kStatusH};
+
+    const bool boundsChanged =
+        std::fabs(map.w - g_app.mapBounds.w) > 0.5f ||
+        std::fabs(map.h - g_app.mapBounds.h) > 0.5f ||
+        std::fabs(map.x - g_app.mapBounds.x) > 0.5f ||
+        std::fabs(map.y - g_app.mapBounds.y) > 0.5f;
+
+    if (boundsChanged && !g_app.trail.empty()) {
+        if (g_app.resizing && !g_app.cells.empty()) {
+            ScaleCells(g_app.mapBounds, map);
+            g_app.mapBounds = map;
+        } else {
+            g_app.mapBounds = map;
+            RebuildTreemap();
+        }
+    } else {
+        g_app.mapBounds = map;
+    }
+
+    DrawSidebar(side);
+    DrawBreadcrumb(crumb);
+    FillRect(Rect{crumb.x, crumb.bottom() - 1.0f, crumb.w, 1.0f}, theme::kRule);
+    DrawTreemap(map);
+    DrawStatus(status);
+
+    const HRESULT hr = g_app.rt->EndDraw();
+    if (hr == static_cast<HRESULT>(D2DERR_RECREATE_TARGET)) {
+        DiscardDeviceResources();
+    }
+}
+
+// ------------------------------------------------------------------ commands
+
+static void CopyPathToClipboard(const std::wstring& path) {
+    if (path.empty()) return;
+    if (!OpenClipboard(g_app.hwnd)) return;
+
+    EmptyClipboard();
+    const size_t bytes = (path.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* dst = GlobalLock(h)) {
+            memcpy(dst, path.c_str(), bytes);
+            GlobalUnlock(h);
+            if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+        } else {
+            GlobalFree(h);
+        }
+    }
+    CloseClipboard();
+}
+
+static void RevealInExplorer(const std::wstring& path) {
+    if (path.empty()) return;
+    // Select the item inside its parent rather than opening it, so clicking a
+    // file lands you on the file.
+    const std::wstring arg = L"/select,\"" + path + L"\"";
+    ShellExecuteW(g_app.hwnd, L"open", L"explorer.exe", arg.c_str(), nullptr,
+                  SW_SHOWNORMAL);
+}
+
+// CSV export, the interchange format every comparable tool offers.
+static void DoExport() {
+    if (g_app.trail.empty() || !g_app.result) return;
+
+    wchar_t file[MAX_PATH] = L"spindle-export.csv";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = g_app.hwnd;
+    ofn.lpstrFilter = L"CSV file\0*.csv\0All files\0*.*\0";
+    ofn.lpstrFile   = file;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrDefExt = L"csv";
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
+                      OFN_NOCHANGEDIR;
+
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const bool ok = ExportCsv(*g_app.trail.back(), TrailPath(g_app.trail),
+                              file);
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+
+    if (!ok) {
+        MessageBoxW(g_app.hwnd, L"Could not write that file. Check the "
+                                L"folder is writable and try again.",
+                    L"Spindle", MB_OK | MB_ICONWARNING);
+    }
+}
+
+static void ShowCellMenu(int cellIndex, POINT screenPt) {
+    if (cellIndex < 0 ||
+        static_cast<size_t>(cellIndex) >= g_app.cells.size()) {
+        return;
+    }
+    const Node* node = g_app.cells[static_cast<size_t>(cellIndex)].node;
+    if (!node) return;
+    const std::wstring path = CellPath(cellIndex);
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+
+    AppendMenuW(menu, MF_STRING, 1, L"Show in Explorer");
+    AppendMenuW(menu, MF_STRING, 2, L"Copy path");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 3, L"Move to Recycle Bin\tDel");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 4, L"Export this folder to CSV\tCtrl+E");
+
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                   screenPt.x, screenPt.y, 0, g_app.hwnd,
+                                   nullptr);
+    DestroyMenu(menu);
+
+    if (cmd == 1) {
+        RevealInExplorer(path);
+    } else if (cmd == 2) {
+        CopyPathToClipboard(path);
+    } else if (cmd == 3) {
+        // Refuse anything that is not clearly below a drive root. "C:\" is
+        // four characters with the terminator; a shorter or root-equal path
+        // would hand the whole volume to the shell.
+        if (path.size() < 4) {
+            MessageBoxW(g_app.hwnd, L"That path is a drive root. Spindle will "
+                                    L"not delete a whole volume.",
+                        L"Spindle", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        const std::wstring prompt =
+            L"Move this to the Recycle Bin?\n\n" + path + L"\n\n" +
+            FormatSize(node->size) +
+            (node->dir ? L" across " + FormatCount(node->files) + L" files"
+                       : L"");
+        if (MessageBoxW(g_app.hwnd, prompt.c_str(), L"Spindle",
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+            return;
+        }
+
+        // SHFileOperationW takes a double-NUL-terminated list. Building it by
+        // hand rather than relying on the string's own terminator, because a
+        // missing second NUL makes the shell read past the buffer.
+        std::vector<wchar_t> from(path.begin(), path.end());
+        from.push_back(L'\0');
+        from.push_back(L'\0');
+
+        SHFILEOPSTRUCTW op{};
+        op.hwnd   = g_app.hwnd;
+        op.wFunc  = FO_DELETE;
+        op.pFrom  = from.data();
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING;
+
+        if (SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted) {
+            StartScan(g_app.selected);   // sizes are now stale; rescan
+        }
+    } else if (cmd == 4) {
+        DoExport();
+    }
+}
+
+// -------------------------------------------------------------- window proc
+
+static void OnMouseMove(int x, int y) {
+    // Mouse coordinates are physical pixels; the layout is in DIPs.
+    const float inv = (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
+    const float fx = static_cast<float>(x) * inv;
+    const float fy = static_cast<float>(y) * inv;
+
+    const Node* before = g_app.hoverNode;
+    g_app.hoverNode  = nullptr;
+    g_app.hoverIndex = -1;
+
+    for (size_t i = 0; i < g_app.rowHits.size(); ++i) {
+        if (g_app.rowHits[i].contains(fx, fy) && i < g_app.fileList.size()) {
+            g_app.hoverNode = g_app.fileList[i].node;
+            g_app.hoverIndex = -1;
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            return;
+        }
+    }
+
+    if (!g_app.zoom.Running() && g_app.mapBounds.contains(fx, fy)) {
+        const int idx = HitTestIndex(g_app.cells, fx, fy);
+        if (idx >= 0) {
+            const Cell& c = g_app.cells[static_cast<size_t>(idx)];
+            g_app.hoverNode  = c.node;
+            g_app.hoverIndex = idx;
+            g_app.hoverRect  = c.rect;
+        }
+    }
+    if (g_app.hoverNode != before) {
+        if (g_app.hoverNode) {
+            g_app.hoverPrev = g_app.hoverNode;
+            g_app.hoverFade.Begin(g_app.motion ? kHoverMs : 0);
+            SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+        }
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    }
+}
+
+static void OnLeftClick(int x, int y) {
+    const float inv = (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
+    const float fx = static_cast<float>(x) * inv;
+    const float fy = static_cast<float>(y) * inv;
+
+    for (const DriveHit& d : g_app.driveHits) {
+        if (d.rect.contains(fx, fy)) {
+            StartScan(d.index);
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            return;
+        }
+    }
+
+    for (size_t i = 0; i < g_app.panelTabs.size(); ++i) {
+        if (!g_app.panelTabs[i].contains(fx, fy)) continue;
+        if (static_cast<int>(g_app.panel) != static_cast<int>(i)) {
+            g_app.tabFrom = g_app.tabTo;
+            g_app.tabSlide.Begin(g_app.motion ? kTabMs : 0);
+            SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+        }
+        g_app.panel = static_cast<App::Panel>(i);
+        g_app.searchFocus = (g_app.panel == App::Panel::Search);
+        g_app.panelDirty = true;
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if (g_app.panel == App::Panel::Search &&
+        g_app.searchBox.contains(fx, fy)) {
+        g_app.searchFocus = true;
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        return;
+    }
+
+    for (size_t i = 0; i < g_app.rowHits.size(); ++i) {
+        if (!g_app.rowHits[i].contains(fx, fy)) continue;
+
+        // Clicking a row in Kinds searches for that extension. The panel is
+        // already a list of the things worth looking at, so it should be the
+        // way you look at them.
+        if (g_app.panel == App::Panel::Kinds) {
+            if (i >= g_app.extStats.size()) return;
+            const ExtStat& e = g_app.extStats[i];
+            if (e.ext == L"\u2026") return;     // the folded remainder row
+            g_app.query = e.ext.empty() ? std::wstring(L"is:file")
+                                        : (L"ext:" + e.ext);
+            g_app.tabFrom = g_app.tabTo;
+            g_app.tabSlide.Begin(g_app.motion ? kTabMs : 0);
+            g_app.panel = App::Panel::Search;
+            g_app.searchFocus = true;
+            g_app.panelDirty = true;
+            SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            return;
+        }
+
+        // A row in the file list opens that file's location, which is the
+        // point of having the list next to the map.
+        if (i >= g_app.fileList.size()) return;
+        RevealInExplorer(TrailPath(g_app.trail) + L"\\" +
+                         g_app.fileList[i].path);
+        return;
+    }
+
+    if (fx < layout::kSidebar) {
+        g_app.searchFocus = false;
+        return;
+    }
+
+    for (size_t i = 0; i < g_app.crumbHits.size(); ++i) {
+        if (!g_app.crumbHits[i].contains(fx, fy)) continue;
+        const size_t target = g_app.crumbFirst + i;
+        if (target + 1 >= g_app.trail.size()) return;
+        g_app.trail.resize(target + 1);
+        g_app.hoverNode = nullptr;
+        NavigateTo(g_app.trail.back(), g_app.mapBounds);
+        return;
+    }
+
+    if (g_app.zoom.Running()) return;
+    const int idx = HitTestIndex(g_app.cells, fx, fy);
+    if (idx < 0) return;
+
+    const Cell& cell = g_app.cells[static_cast<size_t>(idx)];
+    if (!cell.node->dir || cell.node->children.empty()) return;
+
+    // Push every directory between the current view and the clicked cell, so
+    // the breadcrumb matches the path actually navigated to.
+    for (const Node* n : CellChain(g_app.cells, idx)) g_app.trail.push_back(n);
+    g_app.hoverNode  = nullptr;
+    g_app.hoverIndex = -1;
+    NavigateTo(cell.node, cell.rect);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_app.hwnd = hwnd;
+
+            // Dark titlebar on Win10 1809+. Ignored on older builds, which is
+            // why the return value is not checked.
+            const BOOL dark = TRUE;
+            DwmSetWindowAttribute(hwnd, 20 /* USE_IMMERSIVE_DARK_MODE */,
+                                  &dark, sizeof(dark));
+
+            // Explicit IIDs rather than __uuidof: the templated
+            // D2D1CreateFactory overload deduces its type parameter from the
+            // out-pointer, and a void** deduces to void, which then fails to
+            // link against __mingw_uuidof<void>.
+            if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                         kIidD2D1Factory, nullptr,
+                                         g_app.d2d.putVoid()))) {
+                return -1;
+            }
+            if (FAILED(DWriteCreateFactory(
+                    DWRITE_FACTORY_TYPE_SHARED, kIidDWriteFactory,
+                    reinterpret_cast<IUnknown**>(g_app.dwrite.put())))) {
+                return -1;
+            }
+            if (!CreateTextFormats()) return -1;
+
+            // System-wide reduced-motion preference. Every duration below
+            // becomes zero when it is off, which skips the animation rather
+            // than shortening it.
+            BOOL animate = TRUE;
+            if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate,
+                                      0)) {
+                g_app.motion = (animate != FALSE);
+            }
+
+            g_app.dpiScale = QueryDpiScale(hwnd);
+            g_app.volumes  = EnumerateVolumes();
+            return 0;
+        }
+
+        case WM_SIZE: {
+            if (g_app.rt) {
+                const D2D1_SIZE_U s{
+                    static_cast<UINT32>(std::max<int>(LOWORD(lp), 1)),
+                    static_cast<UINT32>(std::max<int>(HIWORD(lp), 1))};
+                g_app.rt->Resize(s);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_DPICHANGED: {
+            g_app.dpiScale = static_cast<float>(LOWORD(wp)) / 96.0f;
+            if (g_app.rt) {
+                const float d = g_app.dpiScale * 96.0f;
+                g_app.rt->SetDpi(d, d);
+            }
+            // Windows supplies the correctly scaled frame for the new monitor.
+            if (const RECT* target = reinterpret_cast<const RECT*>(lp)) {
+                SetWindowPos(hwnd, nullptr, target->left, target->top,
+                             target->right - target->left,
+                             target->bottom - target->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_SETTINGCHANGE: {
+            BOOL animate = TRUE;
+            if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate,
+                                      0)) {
+                g_app.motion = (animate != FALSE);
+            }
+            return 0;
+        }
+
+        case WM_ENTERSIZEMOVE:
+            g_app.resizing = true;
+            return 0;
+
+        case WM_EXITSIZEMOVE:
+            g_app.resizing = false;
+            if (!g_app.trail.empty()) RebuildTreemap();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;   // fully repainted in WM_PAINT; skip the flicker
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd, &ps);
+            Render();
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_TIMER: {
+            if (wp != kTimerId) break;
+            if (g_app.scanning || g_app.zoom.Running() ||
+                g_app.reveal.Running() || g_app.hoverFade.Running() ||
+                g_app.tabSlide.Running()) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else {
+                KillTimer(hwnd, kTimerId);
+            }
+            return 0;
+        }
+
+        case WM_SCAN_DONE: {
+            // Adopting the pointer first means a discarded result is still
+            // freed rather than leaked.
+            std::unique_ptr<ScanResult> res(
+                reinterpret_cast<ScanResult*>(lp));
+
+            // Superseded by a later scan: drop it. Its thread was already
+            // joined by the StartScan that replaced it, so nothing to clean up.
+            if (static_cast<uint64_t>(wp) != g_app.scanGen.load()) return 0;
+
+            if (g_app.worker) {
+                WaitForSingleObject(g_app.worker, INFINITE);
+                CloseHandle(g_app.worker);
+                g_app.worker = nullptr;
+            }
+            g_app.scanning = false;
+
+            // A null result means the scan thread aborted rather than
+            // finished. Say so instead of showing an empty map.
+            if (!res) {
+                MessageBoxW(hwnd, L"The scan stopped before it finished. "
+                                  L"Nothing was changed on disk.",
+                            L"Spindle", MB_OK | MB_ICONWARNING);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+
+            if (!g_app.progress.cancel.load(std::memory_order_relaxed)) {
+                g_app.result = std::move(res);
+                g_app.trail.clear();
+                g_app.trail.push_back(&g_app.result->root);
+                RebuildTreemap();
+                g_app.zoomFrom = g_app.mapBounds;
+                g_app.zoom.Begin(0);
+                g_app.reveal.Begin(g_app.motion ? kRevealMs : 0);
+                SetTimer(hwnd, kTimerId, kFrameMs, nullptr);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE:
+            OnMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
+
+        case WM_MOUSELEAVE:
+            g_app.hoverNode = nullptr;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+
+        case WM_LBUTTONDOWN:
+            SetFocus(hwnd);
+            OnLeftClick(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
+
+        case WM_RBUTTONDOWN: {
+            const float inv =
+                (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
+            const float fx = static_cast<float>(GET_X_LPARAM(lp)) * inv;
+            const float fy = static_cast<float>(GET_Y_LPARAM(lp)) * inv;
+            // Hit tests use final positions, so suppress the menu mid-zoom
+            // where the cell under the cursor is not the one being drawn there.
+            if (g_app.zoom.Running()) return 0;
+            const int idx = HitTestIndex(g_app.cells, fx, fy);
+            if (idx >= 0) {
+                POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                ClientToScreen(hwnd, &pt);
+                ShowCellMenu(idx, pt);
+            }
+            return 0;
+        }
+
+        case WM_XBUTTONDOWN:
+            if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) GoUp();
+            return TRUE;
+
+        case WM_CHAR: {
+            if (!g_app.searchFocus) return 0;
+            const wchar_t c = static_cast<wchar_t>(wp);
+            if (c == L'\b') {
+                if (!g_app.query.empty()) g_app.query.pop_back();
+            } else if (c >= 0x20 && c != 0x7F) {
+                if (g_app.query.size() < 128) g_app.query.push_back(c);
+            } else {
+                return 0;
+            }
+            g_app.panelDirty = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_KEYDOWN: {
+            // Backspace types into the search box when it has focus, rather
+            // than navigating up a level.
+            if (g_app.searchFocus && wp == VK_BACK) return 0;
+            if (wp == VK_ESCAPE && g_app.searchFocus) {
+                g_app.searchFocus = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (wp == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                g_app.panel = App::Panel::Search;
+                g_app.searchFocus = true;
+                g_app.panelDirty = true;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (wp == 'E' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                DoExport();
+                return 0;
+            }
+            switch (wp) {
+                case VK_BACK:   GoUp(); break;
+                case VK_ESCAPE:
+                    if (g_app.scanning) {
+                        g_app.progress.cancel.store(true,
+                                                    std::memory_order_relaxed);
+                    }
+                    break;
+                case VK_F5:
+                    if (g_app.selected >= 0) StartScan(g_app.selected);
+                    break;
+                default: break;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_GETMINMAXINFO: {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+            const float sc = (g_app.dpiScale > 0.0f) ? g_app.dpiScale : 1.0f;
+            mmi->ptMinTrackSize.x = static_cast<LONG>(900.0f * sc);
+            mmi->ptMinTrackSize.y = static_cast<LONG>(560.0f * sc);
+            return 0;
+        }
+
+        case WM_CLOSE:
+            JoinWorker();
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
+            JoinWorker();
+            DiscardDeviceResources();
+            PostQuitMessage(0);
+            return 0;
+
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+
+// ------------------------------------------------------------ crash report
+
+// If Spindle does fall over, leave something behind that can actually be
+// acted on. The report records the faulting address as an offset from the
+// module base, which is what makes it meaningful under ASLR: a raw address
+// differs every run, while base+offset maps straight onto the binary.
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_EXECUTE_HANDLER;
+
+    wchar_t path[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    std::wstring report(path);
+    const size_t slash = report.find_last_of(L'\\');
+    if (slash != std::wstring::npos) report.resize(slash + 1);
+    report += L"spindle-crash.txt";
+
+    const HANDLE f = CreateFileW(report.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                 nullptr);
+    if (f == INVALID_HANDLE_VALUE) return EXCEPTION_EXECUTE_HANDLER;
+
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto addr =
+        reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+
+    char buf[2048];
+    int n = _snprintf_s(
+        buf, sizeof(buf), _TRUNCATE,
+        "Spindle crash report\r\n"
+        "--------------------\r\n"
+        "exception code : 0x%08lX\r\n"
+        "exception addr : 0x%016llX\r\n"
+        "module base    : 0x%016llX\r\n"
+        "module offset  : 0x%llX      <- symbolise this\r\n"
+        "thread id      : %lu\r\n"
+        "scanning       : %s\r\n"
+        "cells          : %zu\r\n",
+        ep->ExceptionRecord->ExceptionCode,
+        static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(base),
+        addr - base,
+        GetCurrentThreadId(),
+        g_app.scanning ? "yes" : "no",
+        g_app.cells.size());
+
+    if (n > 0) {
+        DWORD written = 0;
+        WriteFile(f, buf, static_cast<DWORD>(n), &written, nullptr);
+
+        // Return addresses, same base+offset convention.
+        void* frames[32] = {};
+        const USHORT got = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+        const char* hdr = "\r\nreturn addresses (module offsets)\r\n";
+        WriteFile(f, hdr, static_cast<DWORD>(strlen(hdr)), &written, nullptr);
+        for (USHORT i = 0; i < got; ++i) {
+            const auto fa = reinterpret_cast<uintptr_t>(frames[i]);
+            n = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                            "  [%2u] 0x%llX%s\r\n", i,
+                            fa >= base ? fa - base : fa,
+                            fa >= base ? "" : "   (outside spindle.exe)");
+            if (n > 0) {
+                WriteFile(f, buf, static_cast<DWORD>(n), &written, nullptr);
+            }
+        }
+    }
+    CloseHandle(f);
+
+    MessageBoxW(nullptr,
+                L"Spindle hit a fault and has to close.\n\n"
+                L"A report was written to spindle-crash.txt next to the "
+                L"executable. Nothing on disk was changed.",
+                L"Spindle", MB_OK | MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// std::terminate does not go through the exception filter, so it needs its
+// own hook or an escaping exception still dies silently.
+static void OnTerminate() {
+    MessageBoxW(nullptr,
+                L"Spindle ran out of memory or hit an unrecoverable error "
+                L"and has to close.\n\nNothing on disk was changed.",
+                L"Spindle", MB_OK | MB_ICONERROR);
+    _exit(3);
+}
+
+// ---------------------------------------------------------------- entry point
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
+    SetUnhandledExceptionFilter(CrashHandler);
+    std::set_terminate(OnTerminate);
+
+    // Per-monitor DPI v2 where available. Resolved at runtime so the binary
+    // still starts on builds that predate the API.
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using SetCtxFn = BOOL(WINAPI*)(HANDLE);
+        const FARPROC raw =
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (raw) {
+            // GetProcAddress returns FARPROC, so reaching any real API means
+            // casting to a signature the compiler cannot verify. Scoped to
+            // this one call rather than turning the warning off globally.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+            const auto fn = reinterpret_cast<SetCtxFn>(raw);
+#pragma GCC diagnostic pop
+            static_cast<void>(fn(reinterpret_cast<HANDLE>(-4)));  // PMv2
+        }
+    }
+
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = inst;
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = L"SpindleWindow";
+
+    // LoadImage rather than LoadIcon so the large and small icons each come
+    // from the matching frame in the .ico. LoadIcon returns one size and lets
+    // the shell rescale it, which is visibly soft in the titlebar.
+    wc.hIcon = static_cast<HICON>(LoadImageW(
+        inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+        LR_DEFAULTCOLOR));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(
+        inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+        LR_DEFAULTCOLOR));
+
+    // Degrade in steps rather than straight to the stock icon: LoadIcon is
+    // more forgiving about which frame it picks, so it can still succeed
+    // where the explicit-size request did not.
+    if (!wc.hIcon)   wc.hIcon   = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APPICON));
+    if (!wc.hIconSm) wc.hIconSm = wc.hIcon;
+    if (!wc.hIcon)   wc.hIcon   = LoadIconW(nullptr, IDI_APPLICATION);
+
+    if (!RegisterClassExW(&wc)) {
+        CoUninitialize();
+        return 1;
+    }
+
+    HWND hwnd = CreateWindowExW(
+        0, wc.lpszClassName, L"Spindle", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+        CW_USEDEFAULT, 1280, 800, nullptr, nullptr, inst, nullptr);
+    if (!hwnd) {
+        CoUninitialize();
+        return 1;
+    }
+
+    ShowWindow(hwnd, show);
+    UpdateWindow(hwnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    CoUninitialize();
+    return static_cast<int>(msg.wParam);
+}
