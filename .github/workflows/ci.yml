@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host test suite (ASan, UBSan, TSan)
+        run: make test
+      - name: Concurrency stress walk
+        run: make stress
+
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+      - name: Cross-compile spindle.exe
+        run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindle-exe
+          path: build/spindle.exe
+          retention-days: 14

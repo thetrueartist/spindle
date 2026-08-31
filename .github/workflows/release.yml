@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+      - name: Test first
+        run: make test
+      - name: Cross-compile spindle.exe
+        run: make
+      - name: Checksum
+        run: |
+          cd build
+          sha256sum spindle.exe > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/spindle.exe
+            build/SHA256SUMS
+          generate_release_notes: true
+          draft: false
