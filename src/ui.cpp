@@ -145,7 +145,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.4.0";
+constexpr const wchar_t* kAppVersion = L"1.5.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -227,6 +227,15 @@ struct App {
     DupReport             dupes;
     bool                  dupesRun = false;
     Rect                  dupeButton;
+    Rect                  dupeAllButton;
+    // Pointer position in layout units, kept so panels can highlight the
+    // row under the cursor without each one recomputing the DPI scale.
+    float                 mouseX = -1.0f;
+    float                 mouseY = -1.0f;
+    // One rect per drawn duplicate row, and the file it points at, so a
+    // click can open the thing the user is looking at.
+    std::vector<Rect>         dupeRowHits;
+    std::vector<std::wstring> dupeRowPaths;
     // Separate from the scanner's, so the two never write each other's
     // counters or cancel one another.
     Progress              dupeProgress;
@@ -456,9 +465,11 @@ static void DropTreeReferences() {
     g_app.extStats.clear();
     g_app.fileList.clear();
     g_app.rowHits.clear();
-    // DupFile::node likewise.
-    g_app.dupes = DupReport{};
-    g_app.dupesRun = false;
+    // Duplicate results deliberately survive: every Node pointer is
+    // stripped before the hunt starts, so the report is owned strings only,
+    // and losing an expensive answer just because the user looked at
+    // another drive is the opposite of useful. Each row carries its own
+    // volume, so what is on screen stays unambiguous.
 }
 
 static void JoinDupeWorker();
@@ -568,6 +579,12 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
                           bool useCache) {
     if (root.empty()) return;
     JoinWorker();
+    // And stop any duplicate hunt: it is reading paths under the old root,
+    // and its generation is only bumped when a hunt starts - so left alone
+    // it would finish and post drive A's duplicates into a panel now
+    // showing drive B.
+    JoinDupeWorker();
+    g_app.dupeGen.fetch_add(1);
 
     // Order matters: everything that points into the old tree is dropped
     // before the tree itself is freed.
@@ -848,7 +865,13 @@ static void DrawSidebar(const Rect& area) {
 
     const float rowW = area.w - layout::kPad * 2.0f;
     g_app.rowHits.clear();
+    // Cleared every frame and repopulated only by the panel that owns them,
+    // or a stale rect from the Dupes tab would keep catching clicks after
+    // the user moved to another one.
     g_app.dupeButton = Rect{};
+    g_app.dupeAllButton = Rect{};
+    g_app.dupeRowHits.clear();
+    g_app.dupeRowPaths.clear();
 
     // --- duplicates
     if (g_app.panel == App::Panel::Dupes) {
@@ -890,6 +913,15 @@ static void DrawSidebar(const Rect& area) {
                      theme::kType, 1.0f, false,
                      DWRITE_TEXT_ALIGNMENT_CENTER);
             y += 32.0f;
+            g_app.dupeAllButton = Rect{area.x + layout::kPad, y, rowW, 26.0f};
+            FillRound(g_app.dupeAllButton, 4.0f, theme::kSlab);
+            DrawText(L"Across every scanned drive", g_app.fmtSmall.get(),
+                     Rect{g_app.dupeAllButton.x,
+                          g_app.dupeAllButton.y + 5.0f, rowW,
+                          layout::kLineSmall},
+                     theme::kType, 1.0f, false,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+            y += 32.0f;
             DrawText(L"Reads the files that share a size with another. "
                      L"Cloud files are never downloaded.",
                      g_app.fmtSmall.get(),
@@ -913,8 +945,7 @@ static void DrawSidebar(const Rect& area) {
         y += 20.0f;
 
         if (g_app.dupes.skippedCloud > 0 || g_app.dupes.skippedUnread > 0) {
-            DrawText(L"skipped " +
-                         FormatCount(g_app.dupes.skippedCloud) +
+            DrawText(L"skipped " + FormatCount(g_app.dupes.skippedCloud) +
                          L" cloud, " +
                          FormatCount(g_app.dupes.skippedUnread) +
                          L" unreadable",
@@ -924,9 +955,17 @@ static void DrawSidebar(const Rect& area) {
                      theme::kMute, 0.9f, true);
             y += 18.0f;
         }
+        DrawText(L"click a file to show it in Explorer",
+                 g_app.fmtSmall.get(),
+                 Rect{area.x + layout::kPad, y, rowW, layout::kLineSmall},
+                 theme::kMute, 0.8f, true);
+        y += 18.0f;
+
+        g_app.dupeRowHits.clear();
+        g_app.dupeRowPaths.clear();
 
         for (const DupGroup& g : g_app.dupes.groups) {
-            if (y + 34.0f > area.bottom() - layout::kPad) break;
+            if (y + 20.0f > area.bottom() - layout::kPad) break;
             DrawText(FormatSize(g.size) + L"  x" +
                          FormatCount(g.files.size()) + L"  (" +
                          FormatSize(g.wasted) + L" spare)",
@@ -935,13 +974,30 @@ static void DrawSidebar(const Rect& area) {
                           layout::kLineSmall},
                      theme::kType);
             y += 16.0f;
-            for (size_t i = 0; i < g.files.size() && i < 3; ++i) {
+            for (size_t i = 0; i < g.files.size() && i < 4; ++i) {
                 if (y + 16.0f > area.bottom() - layout::kPad) break;
-                DrawText(SanitizeForDisplay(g.files[i].path),
-                         g_app.fmtSmall.get(),
+                // The full path, because a pooled hunt spans volumes and
+                // "copy1.bin" on its own would not say which drive.
+                const std::wstring full = g.files[i].Full();
+                const Rect row{area.x + layout::kPad - 2.0f, y,
+                               rowW + 4.0f, 15.0f};
+                g_app.dupeRowHits.push_back(row);
+                g_app.dupeRowPaths.push_back(full);
+                if (row.contains(g_app.mouseX, g_app.mouseY)) {
+                    FillRound(row, 3.0f, theme::kSlabHi);
+                }
+                DrawText(SanitizeForDisplay(full), g_app.fmtSmall.get(),
                          Rect{area.x + layout::kPad + 10.0f, y,
                               rowW - 10.0f, layout::kLineSmall},
                          theme::kMute, 0.85f, true);
+                y += 15.0f;
+            }
+            if (g.files.size() > 4) {
+                DrawText(L"   +" + FormatCount(g.files.size() - 4) + L" more",
+                         g_app.fmtSmall.get(),
+                         Rect{area.x + layout::kPad + 10.0f, y,
+                              rowW - 10.0f, layout::kLineSmall},
+                         theme::kMute, 0.7f, true);
                 y += 15.0f;
             }
             y += 6.0f;
@@ -2076,6 +2132,8 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
 static void OnMouseMove(int x, int y) {
     // Mouse coordinates are physical pixels; the layout is in DIPs.
     const float inv = (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
+    g_app.mouseX = static_cast<float>(x) * inv;
+    g_app.mouseY = static_cast<float>(y) * inv;
     const float fx = static_cast<float>(x) * inv;
     const float fy = static_cast<float>(y) * inv;
 
@@ -2123,6 +2181,98 @@ static void OnLeftClick(int x, int y) {
         return;
     }
 
+    // A duplicate row opens the file where it actually lives. Each row
+    // carries its own full path, so this works for a pooled hunt spanning
+    // drives as well as one folder.
+    for (size_t i = 0; i < g_app.dupeRowHits.size() &&
+                       i < g_app.dupeRowPaths.size(); ++i) {
+        if (g_app.dupeRowHits[i].contains(fx, fy)) {
+            RevealInExplorer(g_app.dupeRowPaths[i]);
+            return;
+        }
+    }
+
+    // Across every drive: pooled from the cached scans, so nothing is
+    // re-walked. A file that exists once on C: and once on D: is exactly
+    // the duplicate a single-folder hunt can never find.
+    if (g_app.dupeAllButton.w > 0.0f &&
+        g_app.dupeAllButton.contains(fx, fy) && !g_app.dupeRunning) {
+        if (g_app.scanning) {
+            MessageBoxW(g_app.hwnd, L"Wait for the scan to finish first.",
+                        L"Spindle", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        auto req = std::make_unique<DupRequest>();
+        size_t drives = 0;
+        try {
+            for (const Volume& v : g_app.volumes) {
+                ScanResult cached;
+                CacheMeta meta;
+                const Node* tree = nullptr;
+                // The drive on screen is already in memory and fresher than
+                // anything on disk; the rest come from their caches.
+                if (g_app.result && g_app.selected >= 0 &&
+                    g_app.selected < static_cast<int>(g_app.volumes.size()) &&
+                    g_app.volumes[static_cast<size_t>(g_app.selected)].path ==
+                        v.path) {
+                    tree = &g_app.result->root;
+                } else if (LoadScanCache(v.path, cached, meta)) {
+                    tree = &cached.root;
+                }
+                if (!tree) continue;
+                ++drives;
+                // Collected, not filtered: the shared-size filter runs
+                // once over the pool below, because a file whose only twin
+                // is on another drive has a unique size on its own.
+                std::vector<DupFile> part =
+                    CollectDupFiles(*tree, v.path, kDefaultDupMinSize);
+                for (DupFile& f : part) {
+                    f.node = nullptr;   // `cached` dies at the end of this turn
+                    req->candidates.push_back(std::move(f));
+                }
+            }
+        } catch (...) {
+            MessageBoxW(g_app.hwnd,
+                        L"Ran out of memory gathering candidates.",
+                        L"Spindle", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (drives == 0) {
+            MessageBoxW(g_app.hwnd,
+                        L"No scanned drives to compare yet. Scan a drive "
+                        L"or two first - their results are remembered, and "
+                        L"this then compares across all of them.",
+                        L"Spindle", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        req->candidates = FilterBySharedSize(std::move(req->candidates));
+        for (DupFile& f : req->candidates) f.node = nullptr;
+        req->rootPath = std::wstring();   // each file carries its own volume
+        req->hwnd     = g_app.hwnd;
+        req->gen      = g_app.dupeGen.fetch_add(1) + 1;
+
+        g_app.dupes = DupReport{};
+        g_app.dupesRun = false;
+        g_app.dupeProgress.files.store(0);
+        g_app.dupeProgress.bytes.store(0);
+        g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
+
+        const uintptr_t h =
+            _beginthreadex(nullptr, 0, DupeThread, req.get(), 0, nullptr);
+        if (h == 0) {
+            MessageBoxW(g_app.hwnd,
+                        L"Could not start the duplicate search.",
+                        L"Spindle", MB_OK | MB_ICONERROR);
+            return;
+        }
+        static_cast<void>(req.release());
+        g_app.dupeWorker  = reinterpret_cast<HANDLE>(h);
+        g_app.dupeRunning = true;
+        SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        return;
+    }
+
     // Running the duplicate hunt is an explicit act, and it blocks: it is
     // reading files. The wait cursor is the honest signal, and Esc cancels
     // through the same flag a scan uses.
@@ -2145,8 +2295,9 @@ static void OnLeftClick(int x, int y) {
         // invalidated by anything the interface does while it runs.
         auto req = std::make_unique<DupRequest>();
         try {
-            req->candidates =
-                DuplicateCandidates(*g_app.trail.back(), kDefaultDupMinSize);
+            req->candidates = DuplicateCandidatesIn(
+                *g_app.trail.back(), TrailPath(g_app.trail),
+                kDefaultDupMinSize);
         } catch (...) {
             MessageBoxW(g_app.hwnd,
                         L"Ran out of memory looking for duplicates here. "

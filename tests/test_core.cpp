@@ -1415,6 +1415,37 @@ static void TestScanCache() {
     CacheMeta cm;
     CHECK(!DeserializeScan(nullptr, 0, r, cm), "null input refused");
 
+    // A real cache's root is named for the volume - "D:\\" - which is a
+    // path, not a path component. Validating it as a component rejected
+    // every cache the program wrote, and because an unreadable cache is
+    // deleted and rescanned the only symptom was that caching silently
+    // stopped working. The fixtures above use an empty root name, so they
+    // could never have caught it.
+    {
+        ScanResult vol;
+        vol.root = MakeDir(L"D:\\", {
+            MakeDir(L"Games", {MakeFile(L"a.pak", 4096)}),
+            MakeFile(L"top.bin", 2048),
+        });
+        vol.stats.bytes = vol.root.size;
+
+        std::vector<uint8_t> vb;
+        SerializeScan(vol, m, vb);
+        ScanResult back;
+        CacheMeta bm;
+        CHECK(DeserializeScan(vb.data(), vb.size(), back, bm),
+              "a cache rooted at a volume path round-trips");
+        CHECK(Narrow(back.root.name) == "D:\\", "root keeps its name");
+        CHECK(back.root.children.size() == 2, "and its children");
+
+        // The exemption is the root only: a child may not be a path.
+        ScanResult evil;
+        evil.root = MakeDir(L"D:\\", {MakeFile(L"..\\..\\Windows", 10)});
+        SerializeScan(evil, m, vb);
+        CHECK(!DeserializeScan(vb.data(), vb.size(), back, bm),
+              "a child carrying a separator is still refused");
+    }
+
     // A hand-built cache, which is what an attacker writes: the file lives
     // in the user's profile and is read by an elevated process. The
     // byte-flip sweep above starts from a valid file and structurally
@@ -1624,6 +1655,43 @@ static void TestDuplicates() {
     CHECK(ordered[1].wasted == 200, "the 100-byte trio follows");
 
     CHECK(GroupByDigest({}).empty(), "no candidates, no groups");
+
+    // Pooling across drives. Each tree holds one copy, so within its own
+    // tree that file's size is unique - filtering per tree would discard
+    // exactly the pair worth finding.
+    Node driveD = MakeDir(L"D:\\", {MakeFile(L"asset.bin", 5000)});
+    Node driveE = MakeDir(L"E:\\", {MakeFile(L"asset.bin", 5000)});
+
+    CHECK(DuplicateCandidatesIn(driveD, L"D:\\", 0).empty(),
+          "one copy alone in its own tree is not a candidate");
+
+    std::vector<DupFile> pool = CollectDupFiles(driveD, L"D:\\", 0);
+    for (DupFile& f : CollectDupFiles(driveE, L"E:\\", 0)) {
+        pool.push_back(f);
+    }
+    CHECK(pool.size() == 2, "both drives contribute before filtering");
+
+    const std::vector<DupFile> pooled = FilterBySharedSize(pool);
+    CHECK(pooled.size() == 2,
+          "the cross-drive pair survives the pooled filter");
+
+    // And each still knows which drive it is on, or the result would be
+    // two identical-looking rows.
+    bool sawD = false, sawE = false;
+    for (const DupFile& f : pooled) {
+        if (Narrow(f.Full()) == "D:\\asset.bin") sawD = true;
+        if (Narrow(f.Full()) == "E:\\asset.bin") sawE = true;
+    }
+    CHECK(sawD && sawE, "each file reports its own volume");
+
+    // A genuinely unique size is still discarded, pooled or not.
+    Node lone = MakeDir(L"F:\\", {MakeFile(L"only.bin", 999)});
+    std::vector<DupFile> withLone = pool;
+    for (DupFile& f : CollectDupFiles(lone, L"F:\\", 0)) {
+        withLone.push_back(f);
+    }
+    CHECK(FilterBySharedSize(withLone).size() == 2,
+          "a unique size is dropped from the pool");
 }
 
 // ------------------------------------------------------------ command line

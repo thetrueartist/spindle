@@ -196,9 +196,21 @@ private:
 // set. `path` is relative to the scanned subtree, as in FileHit.
 struct DupFile {
     const Node*  node = nullptr;
+    // The volume or folder `path` is relative to. Empty means "the root the
+    // hunt was given", which is the single-tree case; a hunt spanning
+    // several drives fills it in so every file still knows where it lives.
+    std::wstring root;
     std::wstring path;
     uint64_t     size = 0;
     Digest       digest;
+
+    // Where the file actually is, for opening and for display.
+    std::wstring Full() const {
+        if (root.empty()) return path;
+        std::wstring out = root;
+        if (!out.empty() && out.back() != L'\\') out += L'\\';
+        return out + path;
+    }
 };
 
 // A set of files with identical content. `wasted` is what deleting all but
@@ -229,6 +241,21 @@ struct DupReport {
 //
 // Portable and host-tested: the caller supplies the reading.
 std::vector<DupFile> DuplicateCandidates(const Node& root, uint64_t minSize);
+
+// As above, but stamping each candidate with the volume it came from, so
+// results from several drives can be pooled and still say where they are.
+std::vector<DupFile> DuplicateCandidatesIn(const Node& tree,
+                                           const std::wstring& rootPath,
+                                           uint64_t minSize);
+
+// The two halves, for a hunt spanning several trees: collect everything
+// eligible from each, then filter the pooled result once. Filtering per
+// tree would discard the file whose only twin lives on another drive -
+// which is the whole point of comparing drives against each other.
+std::vector<DupFile> CollectDupFiles(const Node& tree,
+                                     const std::wstring& rootPath,
+                                     uint64_t minSize);
+std::vector<DupFile> FilterBySharedSize(std::vector<DupFile> files);
 
 // Group candidates that have been given digests into confirmed sets.
 // Candidates with no digest (unreadable, skipped) are dropped.

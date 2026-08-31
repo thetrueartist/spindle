@@ -654,14 +654,19 @@ enum class OpenWhy { Ok, Cloud, Unreadable };
 // Open one candidate with every content-safety check applied to the handle
 // rather than to what the scan recorded.
 static HANDLE OpenCandidate(const std::wstring& rootPath,
-                            const std::wstring& rel, OpenWhy& why) {
-    // Names are validated where they enter (IsSafeNodeName), so `rel`
-    // cannot carry a separator, colon or NUL - and the join still goes
-    // through the extended-length form, which stops Win32 reinterpreting
-    // anything that did get through.
-    std::wstring full = rootPath;
-    if (!full.empty() && full.back() != L'\\') full += L'\\';
-    full += rel;
+                            const DupFile& f, OpenWhy& why) {
+    // Names are validated where they enter (IsSafeNodeName), so the
+    // components cannot carry a separator, colon or NUL - and the join
+    // still goes through the extended-length form, which stops Win32
+    // reinterpreting anything that did get through.
+    std::wstring full;
+    if (!f.root.empty()) {
+        full = f.Full();          // a pooled hunt: the file knows its volume
+    } else {
+        full = rootPath;
+        if (!full.empty() && full.back() != L'\\') full += L'\\';
+        full += f.path;
+    }
     const std::wstring extended = ExtendedPath(full);
 
     // FILE_FLAG_OPEN_NO_RECALL: if a file became a cloud placeholder since
@@ -791,7 +796,7 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                 return {};
             }
             OpenWhy why = OpenWhy::Unreadable;
-            const HANDLE h = OpenCandidate(rootPath, candidates[idx].path, why);
+            const HANDLE h = OpenCandidate(rootPath, candidates[idx], why);
             if (h == INVALID_HANDLE_VALUE) {
                 if (why == OpenWhy::Cloud) ++rep.skippedCloud;
                 else ++rep.skippedUnread;
@@ -868,7 +873,7 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                 }
                 OpenWhy why = OpenWhy::Unreadable;
                 const HANDLE h =
-                    OpenCandidate(rootPath, candidates[idx].path, why);
+                    OpenCandidate(rootPath, candidates[idx], why);
                 if (h == INVALID_HANDLE_VALUE) {
                     if (why == OpenWhy::Cloud) ++rep.skippedCloud;
                     else ++rep.skippedUnread;

@@ -833,7 +833,7 @@ private:
 // One node record into `n`. Returns false on any refusal; `childCount` is
 // bounded against the bytes actually remaining so a hostile count cannot
 // drive a huge reserve().
-bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount) {
+bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount, bool isRoot) {
     if (!r.Has(kCacheRecord)) return false;
     const uint16_t nameLen = r.U16();
     const uint8_t  flags   = r.U8();
@@ -874,9 +874,12 @@ bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount) {
     // elevation, while this reads it elevated. A name is a path component
     // once the tree is joined up, so one containing a separator, a colon or
     // a NUL is a way to aim a later delete somewhere it was never shown.
-    // The root's own name is a path and is exempt; the caller overwrites it
-    // with the volume it actually asked for.
-    if (!n.name.empty() && !IsSafeNodeName(n.name)) return false;
+    //
+    // The root is the exception and must be: its name is the volume itself,
+    // "D:\", which is a path and not a component. Checking it as one
+    // rejected every cache the program had ever written - silently, because
+    // an unreadable cache is deleted and rescanned rather than reported.
+    if (!isRoot && !n.name.empty() && !IsSafeNodeName(n.name)) return false;
     return true;
 }
 
@@ -960,7 +963,7 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
     if (nodeCount > r.Left() / kCacheRecord) return false;
 
     uint32_t rootKids = 0;
-    if (!ReadRecord(r, out.root, rootKids)) return false;
+    if (!ReadRecord(r, out.root, rootKids, /*isRoot=*/true)) return false;
     if (!out.root.dir) return false;
     // A valid file declares exactly nodeCount-1 children in total. Tracking
     // the running sum caps every reserve together: without it, a chain of
@@ -995,7 +998,7 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
         if (seen == nodeCount) return false;   // more records than declared
         Node child;
         uint32_t kids = 0;
-        if (!ReadRecord(r, child, kids)) return false;
+        if (!ReadRecord(r, child, kids, /*isRoot=*/false)) return false;
         ++seen;
 
         top.node->children.push_back(std::move(child));
@@ -1090,12 +1093,11 @@ Digest Hasher::Finish() const {
     return Digest{a, b};
 }
 
-std::vector<DupFile> DuplicateCandidates(const Node& root, uint64_t minSize) {
-    // Collect every eligible file with its path, then keep only those whose
-    // size is shared. Two files of different lengths cannot be identical, so
-    // this is exact - it discards nothing that could have matched.
-    std::vector<DupFile> all;
-    ForEachNodeWithPath(root, [&](const Node& n, const std::wstring& prefix) {
+std::vector<DupFile> CollectDupFiles(const Node& tree,
+                                     const std::wstring& rootPath,
+                                     uint64_t minSize) {
+    std::vector<DupFile> out;
+    ForEachNodeWithPath(tree, [&](const Node& n, const std::wstring& prefix) {
         if (n.dir) return;
         if (n.size < minSize) return;
         // A cloud placeholder would have to be downloaded to be read, and a
@@ -1105,25 +1107,43 @@ std::vector<DupFile> DuplicateCandidates(const Node& root, uint64_t minSize) {
 
         DupFile f;
         f.node = &n;
+        f.root = rootPath;
         f.path = JoinRel(prefix, n.name);
         f.size = n.size;
-        all.push_back(std::move(f));
+        out.push_back(std::move(f));
     });
+    return out;
+}
 
+std::vector<DupFile> FilterBySharedSize(std::vector<DupFile> files) {
+    // Two files of different lengths cannot be identical, so anything whose
+    // size is unique across the whole set is discarded before a byte is
+    // read. This must see every file being compared at once: run per-drive,
+    // it would throw away exactly the file that has its only twin on
+    // another drive.
     std::vector<uint64_t> sizes;
-    sizes.reserve(all.size());
-    for (const DupFile& f : all) sizes.push_back(f.size);
+    sizes.reserve(files.size());
+    for (const DupFile& f : files) sizes.push_back(f.size);
     std::sort(sizes.begin(), sizes.end());
 
     std::vector<DupFile> out;
-    out.reserve(all.size());
-    for (DupFile& f : all) {
-        // A size appearing once in the whole subtree cannot be a duplicate.
+    out.reserve(files.size());
+    for (DupFile& f : files) {
         const auto lo = std::lower_bound(sizes.begin(), sizes.end(), f.size);
         const auto hi = std::upper_bound(sizes.begin(), sizes.end(), f.size);
         if (hi - lo >= 2) out.push_back(std::move(f));
     }
     return out;
+}
+
+std::vector<DupFile> DuplicateCandidatesIn(const Node& tree,
+                                           const std::wstring& rootPath,
+                                           uint64_t minSize) {
+    return FilterBySharedSize(CollectDupFiles(tree, rootPath, minSize));
+}
+
+std::vector<DupFile> DuplicateCandidates(const Node& root, uint64_t minSize) {
+    return FilterBySharedSize(CollectDupFiles(root, std::wstring(), minSize));
 }
 
 std::vector<DupGroup> GroupByDigest(const std::vector<DupFile>& hashed) {

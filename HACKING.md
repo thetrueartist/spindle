@@ -12,7 +12,7 @@ scan take well under a second.
 
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
-make test       915 assertions under ASan, UBSan and ThreadSanitizer
+make test       924 assertions under ASan, UBSan and ThreadSanitizer
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
 make icon       regenerate spindle.ico (prints each frame's encoding)
@@ -89,6 +89,13 @@ bounded twice over.
 
 **Reparse points are never traversed.** Junctions and symlinks would loop or
 double-count.
+
+**The root of a cached tree is a path; every other name is a component.**
+The root is named for the volume - `D:\` - so validating it as a path
+component rejects it, and because an unreadable cache is deleted and
+rescanned, the only symptom was that caching silently stopped working
+everywhere. The test fixtures used an empty root name and so could not
+catch it; one now uses a real volume path.
 
 **A file is never read in full to prove it is different.** Sharing a size
 makes two files *possible* duplicates, not actual ones, and the original
