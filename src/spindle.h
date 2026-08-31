@@ -77,6 +77,38 @@ struct ScanResult {
 
 inline constexpr size_t kMaxDeniedRecorded = 512;
 
+// ----------------------------------------------------------------- scan cache
+//
+// A finished scan serialised for reuse: clicking a drive shows the cached
+// map immediately while a fresh scan revalidates behind it. The file is read
+// back and its tree dereferenced everywhere, so deserialisation trusts
+// nothing - every length, count and enum is validated before use, the same
+// posture as ntfs.cpp. The encoding is explicit little-endian UTF-16 so the
+// host-side tests exercise the identical bytes the Windows build writes.
+
+struct CacheMeta {
+    uint64_t savedUnixMs  = 0;   // when the cached scan finished
+    uint32_t volumeSerial = 0;   // rejects a cache from a re-lettered volume
+};
+
+// Refusal bounds. A cache is a convenience; anything implausible is discarded
+// and the ordinary scan runs instead.
+inline constexpr size_t   kMaxCacheBytes   = size_t{1} << 30;
+inline constexpr size_t   kMaxCacheNameLen = 4096;          // UTF-16 units
+inline constexpr uint64_t kMaxCacheNodes   = uint64_t{1} << 26;
+
+void SerializeScan(const ScanResult& in, const CacheMeta& meta,
+                   std::vector<uint8_t>& out);
+bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
+                     CacheMeta& meta);
+
+// Cache file location and I/O. Windows-only, implemented in scan.cpp; the
+// serialised bytes above are what travels through them.
+std::wstring CachePathForVolume(const std::wstring& volumePath);
+bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
+                   CacheMeta& meta);
+bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res);
+
 // Progress is polled by the UI thread while a scan runs. Relaxed ordering is
 // fine: these are display counters, nothing branches on them.
 struct Progress {

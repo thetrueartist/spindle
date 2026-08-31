@@ -743,6 +743,217 @@ bool ExportCsv(const Node& root, const std::wstring& rootPath,
     return WriteTextFileUtf8(outPath, text);
 }
 
+// -------------------------------------------------------------- scan cache
+//
+// Layout, little-endian throughout:
+//   u32 magic  u32 version  u64 savedUnixMs  u32 volumeSerial  u32 reserved
+//   u64 bytes  u64 fileCount  u64 dirCount  u64 nodeCount
+// then one record per node, preorder:
+//   u16 nameLen  u8 dir  u8 cat  u64 size  u32 files  u32 childCount
+//   nameLen x u16 name units
+//
+// Names travel as explicit UTF-16 units rather than raw wchar_t, because the
+// host tests run where wchar_t is four bytes and the file must mean the same
+// thing on both sides.
+
+namespace {
+
+constexpr uint32_t kCacheMagic   = 0x434E5053;   // "SPNC"
+constexpr uint32_t kCacheVersion = 1;
+constexpr size_t   kCacheHeader  = 4 + 4 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
+constexpr size_t   kCacheRecord  = 2 + 1 + 1 + 8 + 4 + 4;   // before the name
+
+void Put16(std::vector<uint8_t>& out, uint16_t v) {
+    out.push_back(static_cast<uint8_t>(v));
+    out.push_back(static_cast<uint8_t>(v >> 8));
+}
+void Put32(std::vector<uint8_t>& out, uint32_t v) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (i * 8)));
+}
+void Put64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (i * 8)));
+}
+
+// The same cannot-read-past-its-buffer cursor as ntfs.cpp, minus the parts a
+// sequential reader does not need.
+class CacheReader {
+public:
+    CacheReader(const uint8_t* d, size_t n) : d_(d), n_(n) {}
+    bool Has(size_t bytes) const { return bytes <= n_ - pos_; }
+    uint8_t U8() { return d_[pos_++]; }
+    uint16_t U16() {
+        const uint16_t v = static_cast<uint16_t>(
+            d_[pos_] | (static_cast<uint16_t>(d_[pos_ + 1]) << 8));
+        pos_ += 2;
+        return v;
+    }
+    uint32_t U32() {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= static_cast<uint32_t>(d_[pos_ + static_cast<size_t>(i)]) << (i * 8);
+        pos_ += 4;
+        return v;
+    }
+    uint64_t U64() {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(d_[pos_ + static_cast<size_t>(i)]) << (i * 8);
+        pos_ += 8;
+        return v;
+    }
+    size_t Left() const { return n_ - pos_; }
+
+private:
+    const uint8_t* d_;
+    size_t n_;
+    size_t pos_ = 0;
+};
+
+// One node record into `n`. Returns false on any refusal; `childCount` is
+// bounded against the bytes actually remaining so a hostile count cannot
+// drive a huge reserve().
+bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount) {
+    if (!r.Has(kCacheRecord)) return false;
+    const uint16_t nameLen = r.U16();
+    const uint8_t  dir     = r.U8();
+    const uint8_t  cat     = r.U8();
+    n.size  = r.U64();
+    n.files = r.U32();
+    childCount = r.U32();
+
+    if (nameLen > kMaxCacheNameLen) return false;
+    if (dir > 1) return false;
+    n.dir = (dir == 1);
+    if (!n.dir && childCount != 0) return false;
+    if (childCount > r.Left() / kCacheRecord) return false;
+
+    // Enum from disk: clamp rather than trust. Directories are always
+    // Cat::Directory and files never are; the scanner guarantees it, so the
+    // cache must too or the panel's colour lookups see nonsense.
+    if (n.dir) {
+        n.cat = Cat::Directory;
+    } else {
+        n.cat = (cat < static_cast<uint8_t>(Cat::COUNT) &&
+                 cat != static_cast<uint8_t>(Cat::Directory))
+                    ? static_cast<Cat>(cat) : Cat::Other;
+    }
+
+    if (!r.Has(static_cast<size_t>(nameLen) * 2)) return false;
+    n.name.clear();
+    n.name.reserve(nameLen);
+    for (uint16_t i = 0; i < nameLen; ++i) {
+        n.name.push_back(static_cast<wchar_t>(r.U16()));
+    }
+    return true;
+}
+
+}  // namespace
+
+void SerializeScan(const ScanResult& in, const CacheMeta& meta,
+                   std::vector<uint8_t>& out) {
+    out.clear();
+
+    uint64_t nodeCount = 1;   // ForEachNode visits children only, not root
+    ForEachNode(in.root, [&](const Node&) { ++nodeCount; });
+
+    out.reserve(kCacheHeader + static_cast<size_t>(nodeCount) * 40);
+    Put32(out, kCacheMagic);
+    Put32(out, kCacheVersion);
+    Put64(out, meta.savedUnixMs);
+    Put32(out, meta.volumeSerial);
+    Put32(out, 0);
+    Put64(out, in.stats.bytes);
+    Put64(out, in.stats.fileCount);
+    Put64(out, in.stats.dirCount);
+    Put64(out, nodeCount);
+
+    // Preorder, explicit stack: nesting depth comes off the disk, so this
+    // must not recurse (same rule as every other tree walk here).
+    std::vector<const Node*> stack;
+    stack.push_back(&in.root);
+    while (!stack.empty()) {
+        const Node* n = stack.back();
+        stack.pop_back();
+
+        const size_t nameLen = std::min(n->name.size(), kMaxCacheNameLen);
+        Put16(out, static_cast<uint16_t>(nameLen));
+        out.push_back(n->dir ? 1 : 0);
+        out.push_back(static_cast<uint8_t>(n->cat));
+        Put64(out, n->size);
+        Put32(out, n->files);
+        Put32(out, static_cast<uint32_t>(n->children.size()));
+        for (size_t i = 0; i < nameLen; ++i) {
+            Put16(out, static_cast<uint16_t>(n->name[i]));
+        }
+
+        // Reversed so children pop in their stored order.
+        for (size_t i = n->children.size(); i > 0; --i) {
+            stack.push_back(&n->children[i - 1]);
+        }
+    }
+}
+
+bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
+                     CacheMeta& meta) {
+    out = ScanResult{};
+    meta = CacheMeta{};
+    if (data == nullptr || len < kCacheHeader || len > kMaxCacheBytes) {
+        return false;
+    }
+
+    CacheReader r(data, len);
+    if (r.U32() != kCacheMagic) return false;
+    if (r.U32() != kCacheVersion) return false;
+    meta.savedUnixMs  = r.U64();
+    meta.volumeSerial = r.U32();
+    static_cast<void>(r.U32());   // reserved
+    out.stats.bytes     = r.U64();
+    out.stats.fileCount = r.U64();
+    out.stats.dirCount  = r.U64();
+    const uint64_t nodeCount = r.U64();
+
+    if (nodeCount == 0 || nodeCount > kMaxCacheNodes) return false;
+    if (nodeCount > r.Left() / kCacheRecord) return false;
+
+    uint32_t rootKids = 0;
+    if (!ReadRecord(r, out.root, rootKids)) return false;
+    if (!out.root.dir) return false;
+
+    // Frames hold a pointer into the parent's children vector; the exact
+    // reserve() below is what keeps those pointers valid while the frame is
+    // live, the same trick the scanner itself relies on.
+    struct Frame {
+        Node*    node;
+        uint32_t remaining;
+    };
+    std::vector<Frame> stack;
+    out.root.children.reserve(rootKids);
+    if (rootKids > 0) stack.push_back({&out.root, rootKids});
+
+    uint64_t seen = 1;
+    while (!stack.empty()) {
+        Frame& top = stack.back();
+        if (top.remaining == 0) {
+            stack.pop_back();
+            continue;
+        }
+        --top.remaining;
+
+        if (seen == nodeCount) return false;   // more records than declared
+        Node child;
+        uint32_t kids = 0;
+        if (!ReadRecord(r, child, kids)) return false;
+        ++seen;
+
+        top.node->children.push_back(std::move(child));
+        Node& placed = top.node->children.back();
+        placed.children.reserve(kids);
+        if (kids > 0) stack.push_back({&placed, kids});
+    }
+
+    if (seen != nodeCount) return false;
+    if (r.Left() != 0) return false;   // trailing bytes: not our file
+    return true;
+}
+
 
 // ------------------------------------------------------------------ search
 

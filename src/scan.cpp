@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <process.h>
+#include <shlobj.h>   // SHGetFolderPathW, for the cache directory
 
 #include <algorithm>
 #include <atomic>
@@ -470,6 +471,145 @@ bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text) {
     }
     CloseHandle(h);
     return ok;
+}
+
+// -------------------------------------------------------------- scan cache
+//
+// Serialisation lives in core.cpp where the tests can reach it; this is only
+// the Windows plumbing around it: where the file lives, and getting bytes in
+// and out without ever presenting a torn file to a reader.
+
+static std::wstring CacheDir() {
+    // %LOCALAPPDATA%: per-user, per-machine, excluded from roaming - right
+    // for data that describes this machine's drives and can be regenerated.
+    wchar_t buf[MAX_PATH + 1] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr,
+                                SHGFP_TYPE_CURRENT, buf))) {
+        return {};
+    }
+    std::wstring dir(buf);
+    dir += L"\\Spindle";
+    CreateDirectoryW(dir.c_str(), nullptr);   // fine if it already exists
+    return dir;
+}
+
+std::wstring CachePathForVolume(const std::wstring& volumePath) {
+    if (volumePath.empty()) return {};
+    const std::wstring dir = CacheDir();
+    if (dir.empty()) return {};
+    // "C:\" -> "...\Spindle\C.spincache". Drive letters only; a UNC root has
+    // no stable single-character identity, so it simply never caches.
+    const wchar_t letter = volumePath[0];
+    if (!((letter >= L'A' && letter <= L'Z') ||
+          (letter >= L'a' && letter <= L'z'))) {
+        return {};
+    }
+    std::wstring p = dir;
+    p += L'\\';
+    p += letter;
+    p += L".spincache";
+    return p;
+}
+
+static uint32_t VolumeSerial(const std::wstring& volumePath) {
+    DWORD serial = 0;
+    GetVolumeInformationW(volumePath.c_str(), nullptr, 0, &serial, nullptr,
+                          nullptr, nullptr, 0);
+    return serial;
+}
+
+bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
+                   CacheMeta& meta) {
+    const std::wstring path = CachePathForVolume(volumePath);
+    if (path.empty()) return false;
+
+    const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(h, &size) != 0 && size.QuadPart > 0 &&
+              static_cast<uint64_t>(size.QuadPart) <= kMaxCacheBytes;
+
+    std::vector<uint8_t> bytes;
+    if (ok) {
+        bytes.resize(static_cast<size_t>(size.QuadPart));
+        size_t got = 0;
+        while (ok && got < bytes.size()) {
+            const DWORD chunk = static_cast<DWORD>(
+                std::min<size_t>(bytes.size() - got, 1u << 24));
+            DWORD read = 0;
+            if (!ReadFile(h, bytes.data() + got, chunk, &read, nullptr) ||
+                read == 0) {
+                ok = false;
+            } else {
+                got += read;
+            }
+        }
+    }
+    CloseHandle(h);
+    if (!ok) return false;
+
+    if (!DeserializeScan(bytes.data(), bytes.size(), out, meta)) {
+        // Unreadable or hostile: it will only fail again, so remove it.
+        DeleteFileW(path.c_str());
+        return false;
+    }
+    // A cache written for a different volume that now has this letter is
+    // worse than no cache: it is confidently wrong.
+    if (meta.volumeSerial != VolumeSerial(volumePath)) return false;
+    return true;
+}
+
+bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
+    const std::wstring path = CachePathForVolume(volumePath);
+    if (path.empty()) return false;
+
+    CacheMeta meta;
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    // FILETIME is 100ns ticks since 1601; 11644473600s to the Unix epoch.
+    const uint64_t ticks =
+        (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    meta.savedUnixMs  = ticks / 10000 - 11644473600000ULL;
+    meta.volumeSerial = VolumeSerial(volumePath);
+
+    std::vector<uint8_t> bytes;
+    SerializeScan(res, meta, bytes);
+    if (bytes.empty() || bytes.size() > kMaxCacheBytes) return false;
+
+    // Write to a sibling and swap, so a crash mid-write leaves either the
+    // old cache or none - never a torn file for the next launch to read.
+    const std::wstring tmp = path + L".tmp";
+    const HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                 nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    bool ok = true;
+    size_t put = 0;
+    while (ok && put < bytes.size()) {
+        const DWORD chunk = static_cast<DWORD>(
+            std::min<size_t>(bytes.size() - put, 1u << 24));
+        DWORD written = 0;
+        if (!WriteFile(h, bytes.data() + put, chunk, &written, nullptr) ||
+            written == 0) {
+            ok = false;
+        } else {
+            put += written;
+        }
+    }
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 }  // namespace spindle

@@ -1278,6 +1278,123 @@ static void TestEasing() {
     CHECK(quintAtThird > cubicAtThird, "OutQuint leads OutCubic early");
 }
 
+// ------------------------------------------------------------- scan cache
+
+static bool TreesEqual(const Node& a, const Node& b) {
+    struct Pair { const Node* x; const Node* y; };
+    std::vector<Pair> stack{{&a, &b}};
+    while (!stack.empty()) {
+        const Pair p = stack.back();
+        stack.pop_back();
+        if (p.x->name != p.y->name || p.x->size != p.y->size ||
+            p.x->files != p.y->files || p.x->dir != p.y->dir ||
+            p.x->cat != p.y->cat ||
+            p.x->children.size() != p.y->children.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < p.x->children.size(); ++i) {
+            stack.push_back({&p.x->children[i], &p.y->children[i]});
+        }
+    }
+    return true;
+}
+
+static void TestScanCache() {
+    std::printf("Scan cache serialisation\n");
+
+    ScanResult in;
+    in.root = MakeDir(L"", {
+        MakeDir(L"Games", {
+            MakeFile(L"a.pak", 100),
+            MakeFile(L"bißchen ü.bin", 5),
+        }),
+        MakeDir(L"empty", {}),
+        MakeDir(L"deep", { MakeDir(L"er", { MakeDir(L"est", {
+            MakeFile(L"leaf.txt", 1) }) }) }),
+        MakeFile(L"root.iso", 12345678901ULL),
+    });
+    in.stats.bytes     = in.root.size;
+    in.stats.fileCount = 4;
+    in.stats.dirCount  = 5;
+
+    CacheMeta m;
+    m.savedUnixMs  = 1725100000000ULL;
+    m.volumeSerial = 0xDEADBEEFu;
+
+    std::vector<uint8_t> buf;
+    SerializeScan(in, m, buf);
+    CHECK(!buf.empty(), "serialises to something");
+
+    ScanResult out;
+    CacheMeta om;
+    CHECK(DeserializeScan(buf.data(), buf.size(), out, om), "round-trips");
+    CHECK(om.savedUnixMs == m.savedUnixMs, "timestamp survives");
+    CHECK(om.volumeSerial == m.volumeSerial, "serial survives");
+    CHECK(out.stats.bytes == in.stats.bytes, "byte total survives");
+    CHECK(out.stats.fileCount == in.stats.fileCount, "file count survives");
+    CHECK(out.stats.dirCount == in.stats.dirCount, "dir count survives");
+    CHECK(TreesEqual(in.root, out.root), "tree survives byte-identically");
+
+    // Every strict prefix must be refused: a torn write may leave one behind.
+    bool anyPrefixParsed = false;
+    for (size_t cut = 0; cut < buf.size(); ++cut) {
+        ScanResult r;
+        CacheMeta cm;
+        if (DeserializeScan(buf.data(), cut, r, cm)) anyPrefixParsed = true;
+    }
+    CHECK(!anyPrefixParsed, "no truncation parses");
+
+    {   // Trailing bytes mean it is not our file.
+        std::vector<uint8_t> t = buf;
+        t.push_back(0);
+        ScanResult r;
+        CacheMeta cm;
+        CHECK(!DeserializeScan(t.data(), t.size(), r, cm),
+              "trailing garbage refused");
+    }
+    {   // Wrong magic and wrong version are both someone else's file.
+        std::vector<uint8_t> t = buf;
+        t[0] ^= 0xFF;
+        ScanResult r;
+        CacheMeta cm;
+        CHECK(!DeserializeScan(t.data(), t.size(), r, cm), "magic checked");
+        t = buf;
+        t[4] ^= 0xFF;
+        CHECK(!DeserializeScan(t.data(), t.size(), r, cm), "version checked");
+    }
+    {   // A root that claims to be a file is structurally meaningless.
+        std::vector<uint8_t> t = buf;
+        t[56 + 2] = 0;   // header, then nameLen; the dir byte follows
+        ScanResult r;
+        CacheMeta cm;
+        CHECK(!DeserializeScan(t.data(), t.size(), r, cm),
+              "file-as-root refused");
+    }
+
+    // Flip every byte in turn: any answer is fine, crashing is not. The
+    // sanitisers turn a stray read into a failure here.
+    for (size_t i = 0; i < buf.size(); ++i) {
+        std::vector<uint8_t> t = buf;
+        t[i] ^= 0xFF;
+        ScanResult r;
+        CacheMeta cm;
+        static_cast<void>(DeserializeScan(t.data(), t.size(), r, cm));
+    }
+    CHECK(true, "byte-flip sweep completed without incident");
+
+    ScanResult r;
+    CacheMeta cm;
+    CHECK(!DeserializeScan(nullptr, 0, r, cm), "null input refused");
+
+    // An empty-but-valid tree: bare root, nothing else.
+    ScanResult bare;
+    bare.root = MakeDir(L"", {});
+    SerializeScan(bare, m, buf);
+    CHECK(DeserializeScan(buf.data(), buf.size(), out, om),
+          "bare root round-trips");
+    CHECK(out.root.children.empty(), "bare root stays bare");
+}
+
 int main() {
     std::printf("\n=== Spindle core tests ===\n\n");
 
@@ -1309,6 +1426,7 @@ int main() {
     TestExpandedFlagConsistency();
     FuzzSanitize();
     FuzzTreemap();
+    TestScanCache();
 
     std::printf("\n=== %d passed, %d failed ===\n\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
