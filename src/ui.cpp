@@ -466,6 +466,13 @@ static void StartScan(int volumeIndex) {
     g_app.cells.clear();
     g_app.hoverNode  = nullptr;
     g_app.hoverIndex = -1;
+    // The panel caches too: fileList holds Node pointers into the tree that
+    // dies on the next line, and a paint arrives mid-scan (the progress
+    // timer forces one every frame), so leaving them populated is a
+    // use-after-free the first time the panel draws a row.
+    g_app.extStats.clear();
+    g_app.fileList.clear();
+    g_app.rowHits.clear();
     g_app.result.reset();
 
     g_app.progress.files.store(0);
@@ -1672,6 +1679,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.trail.clear();
                 g_app.trail.push_back(&g_app.result->root);
                 RebuildTreemap();
+                // The panel lists were dropped when the scan started; without
+                // this they stay empty (or worse, would describe the old tree)
+                // until the user next changes view.
+                g_app.panelDirty = true;
                 g_app.zoomFrom = g_app.mapBounds;
                 g_app.zoom.Begin(0);
                 g_app.reveal.Begin(g_app.motion ? kRevealMs : 0);
