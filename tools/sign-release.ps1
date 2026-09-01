@@ -23,6 +23,7 @@
 #>
 param(
     [string]$Tag,
+    [string]$File,      # a build you downloaded yourself; skips needing gh
     [string]$Key  = "$HOME\Documents\spindle-signing.key",
     [string]$Repo = "thetrueartist/spindle",
     [string]$Exe  = ".\spindle.exe"
@@ -35,8 +36,44 @@ if (-not (Test-Path $Exe)) {
 if (-not (Test-Path $Key)) {
     throw "Signing key not found at $Key. Generate one with: .\spindle.exe --gen-update-key  (keep the private line offline, pass -Key to point here)"
 }
-if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-    throw "The GitHub CLI (gh) is needed to read and update releases. Install it, run 'gh auth login', and try again."
+$haveGh = [bool](Get-Command gh -ErrorAction SilentlyContinue)
+
+# Without the GitHub CLI the script still signs; it just cannot fetch the
+# build or upload the result, so it asks for the file and hands the two
+# products back to attach by hand.
+if (-not $haveGh) {
+    if (-not $File -or -not $Tag) {
+        Write-Host ""
+        Write-Host "The GitHub CLI (gh) is not installed, so this cannot download or upload for you." -ForegroundColor Yellow
+        Write-Host "Two ways forward:" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  1. Install it once, then this script needs no arguments ever again:" -ForegroundColor Yellow
+        Write-Host "       winget install --id GitHub.cli"
+        Write-Host "       gh auth login"
+        Write-Host ""
+        Write-Host "  2. Or do it by hand this time: download the release exe, then" -ForegroundColor Yellow
+        Write-Host "       .\sign-release.ps1 -File .\spindle-v2.3.0.exe -Tag v2.3.0"
+        Write-Host "     and attach the two files it writes to the release page."
+        Write-Host ""
+        exit 1
+    }
+    if (-not (Test-Path $File)) { throw "No such file: $File" }
+    $work = Split-Path -Parent (Resolve-Path $File)
+    Write-Host "Signing $File as $Tag. The private key never leaves this machine." -ForegroundColor Cyan
+    Start-Process -FilePath (Resolve-Path $Exe) -Wait -NoNewWindow -ArgumentList @(
+        "--sign-release", "`"$(Resolve-Path $File)`"", "`"$(Resolve-Path $Key)`"", $Tag)
+    $m = Join-Path $work "manifest.json"
+    $g = Join-Path $work "manifest.sig"
+    if (-not (Test-Path $m) -or -not (Test-Path $g)) {
+        $err = Get-Content (Join-Path $work "sign-error.txt") -ErrorAction SilentlyContinue
+        throw "Signing produced no manifest. $err"
+    }
+    Write-Host ""
+    Write-Host "Signed. Attach these two files to the $Tag release:" -ForegroundColor Green
+    Write-Host "  $m"
+    Write-Host "  $g"
+    Write-Host "(Release page, Edit release, drop them in, Update release.)"
+    exit 0
 }
 
 # Which release? Default to the newest one that has no manifest attached,
