@@ -55,6 +55,19 @@ else, and the whole thing can be turned off in the `···` menu. The cache
 is keyed to the volume serial and parsed with the same validation as
 everything else read from disk.
 
+The map has a twin: a details list. The Map | List toggle beside the
+breadcrumb switches the same view between the treemap and a list with
+name, size, kind and file count columns, and because the list is a view
+over the scan the program already holds, every folder row shows its
+real rolled-up size instantly, sorted by any column in either
+direction. Double-click descends, the ".." row and Backspace come back
+out, and right-click carries the same actions as the map plus rename.
+Selection speaks the usual grammar (click, ctrl, shift), the status bar
+sums what is selected, and a right-click on the selection copies every
+path or recycles the lot behind one confirmation.
+
+![browse mode](docs/browse.png)
+
 Views come in tabs. Right-click anything and open it in its own tab: a
 folder on the map, a row in Largest or Find, a duplicate (its drive
 opens with the file outlined), or a Kinds row, which opens a tab running

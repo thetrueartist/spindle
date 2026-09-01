@@ -219,9 +219,18 @@ code:
   refusals, same confirmations, plus open in a new tab.
 - The Map/List choice lives per tab, next to the breadcrumb, and a tab
   remembers it like it remembers its panel and search.
-- Rename and multi-select are phase two, after the read-only list has
-  earned trust. Inline editing drags in caret, IME and commit
-  semantics, and none of it should ship half-done.
+- Selection speaks the standard grammar: click, ctrl-click toggle,
+  shift-click range, empty-space clear. The set holds Node pointers and
+  is dropped with every tree swap like every other holder. A
+  right-click inside a bigger selection acts on all of it.
+- Rename is a real EDIT child window over the name cell, not a drawn
+  imitation: the control brings the caret, selection and IME for free.
+  Commit order is disk first (MoveFileW after IsSafeNodeName), then the
+  tree patched in place by walking to the parent by name, then the
+  cache re-saved from the patched tree. A walk that misses patches
+  nothing and the next scan shows the truth; the first cut proved the
+  value of that fail-safe when the parent lost its trailing separator
+  and the disk renamed while the view lagged.
 
 ## Launch prefetch
 
