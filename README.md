@@ -451,18 +451,20 @@ written verbatim into a CSV and carry the spoof into whatever opens it.
 
 ### Import audit
 
-About 210 functions across 11 DLLs, all Microsoft. What is absent
+About 256 functions across 14 DLLs, all Microsoft. What is absent
 matters as much as what is present:
 
-- Networking exists for exactly one purpose and is dormant by default:
-  the auto-updater (WinHTTP, HTTPS to the GitHub release API only). It
-  is compiled in but disabled until the maintainer embeds a release
-  signing key; in that state there is no code path that reaches the
-  network. When enabled, an update is accepted only if a manifest
-  signed by the maintainer's offline ECDSA P-256 key (verified through
-  CNG) vouches for the exact bytes, it is offered and never installed
-  silently, and every failure leaves the current install untouched.
-  There is still no Winsock, WinINet or DNS use anywhere.
+- Networking exists for exactly one purpose: the auto-updater, over
+  WinHTTP, HTTPS, to the GitHub release API for this repository and the
+  release assets it names. Nothing else in the program reaches the
+  network, and there is no Winsock, WinINet or DNS use anywhere. Release
+  builds carry the maintainer's public key, so the check runs at launch
+  and can be turned off in the menu; a build with no key embedded
+  compiles the same code but never opens a socket. An update is accepted
+  only when a manifest signed by the maintainer's offline ECDSA P-256
+  key, verified through CNG, vouches for the exact SHA-256 of the file,
+  it is offered rather than installed, and every failure leaves the
+  current install untouched.
 - No process creation. No `CreateProcess`, no `WinExec`. `ShellExecuteW`
   is used to open Explorer at a path and for nothing else.
 - No injection primitives. No `CreateRemoteThread`, `WriteProcessMemory`,

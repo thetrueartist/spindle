@@ -971,7 +971,12 @@ bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount, bool isRoot) {
     // "D:\", which is a path and not a component. Checking it as one
     // rejected every cache the program had ever written - silently, because
     // an unreadable cache is deleted and rescanned rather than reported.
-    if (!isRoot && !n.name.empty() && !IsSafeNodeName(n.name)) return false;
+    // No empty-name exemption. An empty component makes AppendComponent a
+    // no-op, so a child of "C:\Users\sam" builds the path of its own
+    // parent, and a delete aimed at the child takes the parent with it. The
+    // cache is user-writable and read by a possibly elevated process, so
+    // that is a planted-file profile wipe, not a curiosity.
+    if (!isRoot && !IsSafeNodeName(n.name)) return false;
     return true;
 }
 
@@ -1692,6 +1697,17 @@ bool IsProtectedSystemPath(const std::wstring& path) {
         p.pop_back();
     }
 
+    // Interior repeats collapse in Win32 too: "C:\\Windows" opens
+    // C:\Windows. Comparing the uncollapsed string against a literal
+    // would miss it, so the doubling is refused outright rather than
+    // normalised, which is how every other awkward spelling is handled
+    // here.
+    for (size_t i = 2; i + 1 < p.size(); ++i) {
+        const bool sepA = (p[i] == L'\\' || p[i] == L'/');
+        const bool sepB = (p[i + 1] == L'\\' || p[i + 1] == L'/');
+        if (sepA && sepB) return true;
+    }
+
     // Everything below compares strings, but every caller hands the same
     // string to a Win32 API that re-parses and re-canonicalises it. Any
     // spelling Win32 resolves differently than this function reads is a
@@ -1822,6 +1838,16 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 s.prefetchAll = value;
             } else if (key == "check_updates") {
                 s.checkUpdates = value;
+            } else if (key == "update_serial") {
+                // Not a flag: parse the number, bounded, refusing junk.
+                const std::string v = line.substr(eq + 1);
+                uint64_t n = 0;
+                bool ok = !v.empty() && v.size() <= 20;
+                for (char c : v) {
+                    if (c < '0' || c > '9') { ok = false; break; }
+                    n = n * 10 + static_cast<uint64_t>(c - '0');
+                }
+                if (ok) s.updateSerial = n;
             }
         }
         line.clear();
@@ -1835,7 +1861,8 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
         std::string("keep_caches=") + (s.keepCaches ? "1" : "0") +
         "\nresume_on_launch=" + (s.resumeOnLaunch ? "1" : "0") +
         "\nprefetch_all=" + (s.prefetchAll ? "1" : "0") +
-        "\ncheck_updates=" + (s.checkUpdates ? "1" : "0") + "\n";
+        "\ncheck_updates=" + (s.checkUpdates ? "1" : "0") +
+        "\nupdate_serial=" + std::to_string(s.updateSerial) + "\n";
     out.assign(text.begin(), text.end());
 }
 

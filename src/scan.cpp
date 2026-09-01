@@ -733,6 +733,32 @@ static HANDLE OpenForRead(const std::wstring& full, OpenWhy& why) {
     return h;
 }
 
+// Two paths can name one file: a junction anywhere above them, a second
+// mount point or SUBST letter for the same volume, or a hardlink. The
+// duplicate gate proves "another copy survives" by comparing bytes, and
+// a file always compares equal to itself, so without this the last copy
+// can be deleted while the user is told a copy remains.
+static bool SameUnderlyingFile(HANDLE a, HANDLE b) {
+    BY_HANDLE_FILE_INFORMATION ia{}, ib{};
+    if (!GetFileInformationByHandle(a, &ia) ||
+        !GetFileInformationByHandle(b, &ib)) {
+        return true;   // cannot tell them apart: refuse, do not delete
+    }
+    return ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+           ia.nFileIndexHigh == ib.nFileIndexHigh &&
+           ia.nFileIndexLow == ib.nFileIndexLow;
+}
+
+// More than one directory entry points at these bytes, so deleting this
+// name frees nothing. The MFT path marks these during the scan; the
+// directory walker cannot see link counts without a handle, and by here
+// we have one.
+static bool IsMultiplyLinked(HANDLE h) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h, &info)) return false;
+    return info.nNumberOfLinks > 1;
+}
+
 static HANDLE OpenCandidate(const std::wstring& rootPath,
                             const DupFile& f, OpenWhy& why) {
     // Names are validated where they enter (IsSafeNodeName), so the
@@ -839,6 +865,16 @@ static VerifyResult VerifyIdentical(const std::wstring& rootPath,
         return VerifyResult::Unreadable;
     }
 
+    // One file reached by two names is not two copies, and neither is a
+    // hardlink pair: deleting either frees nothing, and calling them
+    // duplicates would report space that cannot be recovered.
+    if (SameUnderlyingFile(ha, hb) || IsMultiplyLinked(ha) ||
+        IsMultiplyLinked(hb)) {
+        CloseHandle(ha);
+        CloseHandle(hb);
+        return VerifyResult::Different;
+    }
+
     VerifyResult res = VerifyResult::Equal;
     for (;;) {
         if (progress && progress->cancel.load(std::memory_order_relaxed)) {
@@ -881,6 +917,15 @@ bool VerifyFilesIdentical(const std::wstring& a, const std::wstring& b,
     OpenWhy whyB = OpenWhy::Unreadable;
     const HANDLE hb = OpenForRead(b, whyB);
     if (hb == INVALID_HANDLE_VALUE) { CloseHandle(ha); return false; }
+
+    // The whole point of this function is to prove that deleting `a`
+    // leaves a copy behind. If `a` and `b` are one file, or `a` has other
+    // links, that proof fails no matter how the bytes compare.
+    if (SameUnderlyingFile(ha, hb) || IsMultiplyLinked(ha)) {
+        CloseHandle(ha);
+        CloseHandle(hb);
+        return false;
+    }
 
     std::vector<uint8_t> bufA(8u << 20), bufB(8u << 20);
     bool equal = true;
@@ -979,6 +1024,12 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
             if (h == INVALID_HANDLE_VALUE) {
                 if (why == OpenWhy::Cloud) ++rep.skippedCloud;
                 else ++rep.skippedUnread;
+                continue;
+            }
+            if (IsMultiplyLinked(h)) {
+                // The MFT scan marks these; a walked scan cannot, so this
+                // is where they are caught on that path.
+                CloseHandle(h);
                 continue;
             }
             if (onFile) onFile(onFileCtx, candidates[idx].Full());
@@ -1440,6 +1491,24 @@ bool TakeOwnershipAndGrant(const std::wstring& path) {
     return ok;
 }
 
+// More than one name points at these bytes, so this file's security
+// descriptor is shared with entries elsewhere on the volume. Rewriting it
+// from here would rewrite theirs.
+static bool PathIsMultiplyLinked(const std::wstring& path) {
+    const HANDLE h = CreateFileW(
+        path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool many = GetFileInformationByHandle(h, &info) != 0 &&
+                      info.nNumberOfLinks > 1;
+    CloseHandle(h);
+    return many;
+}
+
 // Delete one file, escalating only as far as it has to.
 bool DeleteOneFile(const std::wstring& path, DWORD& lastError,
                    bool isReparse) {
@@ -1447,11 +1516,15 @@ bool DeleteOneFile(const std::wstring& path, DWORD& lastError,
     lastError = GetLastError();
 
     if (lastError == ERROR_ACCESS_DENIED) {
-        ClearBlockingAttributes(path);
-        if (DeleteFileW(path.c_str())) return true;
-        // A link's own ACL is not why the delete failed, and escalating on
-        // one is how an attacker aims this at whatever it points to.
-        if (!isReparse) {
+        // A hardlink shares its security descriptor and its attributes
+        // with every other name for the same bytes, so clearing or
+        // rewriting them here reaches files this delete was never aimed
+        // at. A reparse point's own ACL is likewise not why the delete
+        // failed. Neither is worth escalating on: refuse and report.
+        const bool shared = isReparse || PathIsMultiplyLinked(path);
+        if (!shared) {
+            ClearBlockingAttributes(path);
+            if (DeleteFileW(path.c_str())) return true;
             TakeOwnershipAndGrant(path);
             if (DeleteFileW(path.c_str())) return true;
         }
@@ -1546,6 +1619,41 @@ bool DeleteTreeIterative(const std::wstring& root, uint64_t& deleted,
                 allOk = false;
                 continue;
             }
+
+            // The attribute read above answered about the directory as it
+            // was a moment ago. Between then and the enumeration below, a
+            // process running as this user can swap an ordinary directory
+            // for a junction aimed at anywhere, and an elevated walk would
+            // then enumerate and delete through it. Opening a handle that
+            // explicitly refuses to traverse a reparse point, and asking
+            // that handle what it actually is, closes the window: the
+            // enumeration that follows can only be about the object this
+            // check passed.
+            const HANDLE dh = CreateFileW(
+                wide.c_str(), FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                nullptr);
+            if (dh == INVALID_HANDLE_VALUE) {
+                lastError = GetLastError();
+                allOk = false;
+                continue;
+            }
+            FILE_ATTRIBUTE_TAG_INFO ti{};
+            const bool told = GetFileInformationByHandleEx(
+                                  dh, FileAttributeTagInfo, &ti,
+                                  sizeof(ti)) != 0;
+            CloseHandle(dh);
+            if (!told ||
+                (ti.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                (ti.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                // It became a link, or stopped being a directory, since
+                // the attribute read. Refuse rather than follow it.
+                allOk = false;
+                continue;
+            }
+
             stack.push_back({frame.path, true});   // remove after children
 
             WIN32_FIND_DATAW fd{};
@@ -1586,7 +1694,8 @@ bool DeleteTreeIterative(const std::wstring& root, uint64_t& deleted,
 }  // namespace
 
 ForceRemoveResult ForceRemove(const std::wstring& path,
-                              bool terminateLockers) {
+                              bool terminateLockers,
+                              const std::vector<Locker>& approved) {
     ForceRemoveResult res;
 
     // The refusal lives here, not only in the dialog, so that no future
@@ -1597,7 +1706,11 @@ ForceRemoveResult ForceRemove(const std::wstring& path,
     }
 
     if (terminateLockers) {
-        for (const Locker& l : FindLockers(path)) {
+        // The list the user actually saw and agreed to. Asking the system
+        // again would produce a different set - anything started while the
+        // dialog was open would be in it - and terminating from that set
+        // would be acting beyond the consent that was given.
+        for (const Locker& l : approved) {
             if (l.critical) {
                 res.remaining.push_back(l);
                 continue;   // never, whatever the user clicked

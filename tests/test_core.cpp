@@ -1890,6 +1890,12 @@ static void TestForceRemovalGuards() {
           "deep inside Program Files allowed");
     CHECK(!IsProtectedSystemPath(L"C:\\ProgramData\\DeadApp"),
           "leftover ProgramData allowed");
+    // A doubled separator collapses in Win32, so the guard must not be
+    // fooled by the spelling.
+    CHECK(IsProtectedSystemPath(L"C:\\\\Windows"),
+          "doubled separator cannot smuggle a protected path past");
+    CHECK(IsProtectedSystemPath(L"C:\\Windows\\\\System32"),
+          "doubled separator refused anywhere in the path");
     CHECK(!IsProtectedSystemPath(L"C:\\Users\\sam"),
           "a whole profile is allowed (it is the user's own)");
     CHECK(IsProtectedSystemPath(L"D:\\System Volume Information"),

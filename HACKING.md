@@ -247,7 +247,7 @@ counter so cancelling it can never touch the foreground scan's flags, and
 `CancelPrefetch` bumps the generation before joining so the
 already-posted completion message is recognised as stale.
 
-## Auto-update (dormant until keyed)
+## Auto-update
 
 Modelled on Audio-Switcher's updater, which got the trust model right:
 a release is only an update once a manifest signed by the maintainer's
@@ -277,9 +277,14 @@ the CI-built exe for a tag, signs it locally, and attaches the manifest
 pair to the release. Signing lives in the exe itself: --gen-update-key writes a keypair
 (keep the private half offline), --sign-release hashes a build and
 writes manifest.json plus manifest.sig for attaching to the release.
-The embedded public key constant ships EMPTY, which disables the whole
-feature: no key, no network, no menu entry. Enabling it is the owner's
-act: generate the pair, embed the public half, rebuild.
+The embedded public key constant decides whether any of this runs at
+all: empty means no key, no network and no menu entry, which is how the
+feature sat until the owner generated a pair, kept the private half
+offline and embedded the public half. Release builds from v2.2.0 carry
+it, so the launch check is live and the menu can turn it off. A fork
+that wants its own update channel replaces the constant with its own
+public key; leaving someone else's in place would mean trusting their
+signatures.
 
 ## Security posture
 

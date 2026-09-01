@@ -50,11 +50,13 @@ spaces.
 
 ## Updates
 
-The updater is dormant unless a release signing key is embedded in the
-build. When it is enabled, an update is accepted only if a manifest
-signed with the maintainer's ECDSA P-256 key vouches for the exact
-SHA-256 of the downloaded file, and the manifest names the same tag the
-release does.
+Release builds check for updates at launch, which the menu can turn off.
+An update is accepted only if a manifest signed with the maintainer's
+ECDSA P-256 key vouches for the exact SHA-256 of the downloaded file,
+and only if that manifest names the same tag the release does, so an old
+signed manifest cannot be replayed onto a newer release. A build with no
+public key embedded, which is what the source ships as, never opens a
+socket at all.
 
 The private key is offline and exists on no build machine, no CI runner
 and nothing GitHub can reach. A full compromise of this repository, its

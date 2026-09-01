@@ -65,6 +65,13 @@ inline uint64_t SatAdd(uint64_t a, uint64_t b) {
     return (a > UINT64_MAX - b) ? UINT64_MAX : a + b;
 }
 
+// Saturating multiply, for "this many copies of this size". Same reason:
+// the count comes from a report built out of what a disk claimed.
+inline uint64_t SatMul(uint64_t a, uint64_t b) {
+    if (a == 0 || b == 0) return 0;
+    return (a > UINT64_MAX / b) ? UINT64_MAX : a * b;
+}
+
 // --------------------------------------------------------------- scan result
 
 struct ScanStats {
@@ -449,8 +456,14 @@ struct ForceRemoveResult {
 // Refuses outright if IsProtectedSystemPath says so, whatever the caller
 // asks for: the confirmations live in the interface, but the refusal lives
 // here so no future caller can route around it.
+// `approved` is the exact set of lockers the user was shown and consented
+// to. Only members of it are ever terminated: re-sampling here would let
+// the program end a process that appeared after the dialog, which nobody
+// agreed to.
 ForceRemoveResult ForceRemove(const std::wstring& path,
-                              bool terminateLockers);
+                              bool terminateLockers,
+                              const std::vector<Locker>& approved =
+                                  std::vector<Locker>());
 
 // ------------------------------------------------------------------ settings
 //
@@ -463,6 +476,10 @@ struct Settings {
     bool resumeOnLaunch = true;   // open the freshest cached drive at start
     bool prefetchAll    = true;   // read the other fixed drives at launch
     bool checkUpdates   = true;   // ask GitHub for a newer release at launch
+    // Highest signed manifest serial ever accepted. Anti-replay: a
+    // genuine but superseded release carries a lower serial and is
+    // refused, so nobody can be pinned on an old signed version.
+    uint64_t updateSerial = 0;
 };
 
 inline constexpr size_t kMaxSettingsBytes = 4096;
@@ -690,8 +707,11 @@ bool JsonFindString(const std::string& json, const std::string& key,
 // Auto-update (src/update.cpp, Windows only). Dormant until the embedded
 // public key is set; every failure is the fail-closed path. See HACKING.
 bool UpdateFeatureEnabled();
-bool CheckForUpdate(const wchar_t* currentVersion, std::wstring& tagOut);
-std::wstring ApplyUpdate(const wchar_t* currentVersion);
+bool CheckForUpdate(const wchar_t* currentVersion, uint64_t minSerial,
+                    std::wstring& tagOut);
+std::wstring ApplyUpdate(const wchar_t* currentVersion,
+                         const std::wstring& expectedTag,
+                         uint64_t minSerial, uint64_t& serialOut);
 void CleanupOldUpdate();
 bool GenerateUpdateKeypair(std::wstring& outText);
 bool SignReleaseFile(const std::wstring& exePath,

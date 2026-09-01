@@ -244,6 +244,11 @@ struct App {
     float                    browseScroll = 0.0f;
     std::vector<const Node*> browseOrder;
     const Node*              browseSel = nullptr;   // the lead row
+    // Which directory browseOrder was built for. Navigation changes the
+    // trail without touching the order, and a list addressing a different
+    // directory than the breadcrumb names is how a delete hits the wrong
+    // file.
+    const Node*              browseOrderOwner = nullptr;
     std::vector<const Node*> browseSelSet;          // everything selected
     int                      browseAnchor = -1;     // shift-range start
     // Inline rename: a real EDIT child over the name cell, because a real
@@ -312,6 +317,10 @@ struct App {
     const Node*                      flashNode = nullptr;
     Anim                             dupeFlash;
     std::wstring                     pendingReveal;
+    // Where a tab wanted to be when its drive had no cache to restore
+    // from. Replayed once the scan lands, or the tab silently forgets how
+    // deep it was and the next snapshot overwrites the memory of it.
+    std::vector<std::wstring>        pendingTrail;
     std::unordered_set<std::wstring> dupePaths;
     std::vector<uint8_t>             cellDupe;   // parallel to `cells`
     // Separate from the scanner's, so the two never write each other's
@@ -396,6 +405,11 @@ static Rect Lerp(const Rect& a, const Rect& b, float t) {
 }
 
 static void AppendComponent(std::wstring& p, const std::wstring& name) {
+    // An empty component would leave the parent's path unchanged, so a
+    // path built for a child would name its parent and a delete aimed at
+    // one would take the other. Names are validated at every boundary they
+    // enter by; this makes the collapse impossible rather than unlikely.
+    if (name.empty()) { p.clear(); return; }
     if (p.empty()) { p = name; return; }
     if (p.back() != L'\\') p += L'\\';
     p += name;
@@ -590,6 +604,7 @@ static void DropTreeReferences() {
     g_app.flashNode = nullptr;   // points into the tree being dropped
     g_app.cellDupe.clear();
     g_app.browseOrder.clear();
+    g_app.browseOrderOwner = nullptr;
     g_app.browseRowHits.clear();
     g_app.browseRowNodes.clear();
     g_app.browseSel = nullptr;
@@ -611,6 +626,7 @@ static void DropTreeReferences() {
 }
 
 static void JoinDupeWorker();
+static void ResetBrowseView();
 
 // "1 file", "2 files". The bare plural after a count of one reads as a
 // mistake everywhere it appears.
@@ -844,7 +860,8 @@ unsigned __stdcall UpdateCheckThread(void* param) {
     HWND hwnd = static_cast<HWND>(param);
     try {
         std::wstring tag;
-        if (CheckForUpdate(kAppVersion, tag) && !tag.empty()) {
+        if (CheckForUpdate(kAppVersion, g_app.settings.updateSerial, tag) &&
+            !tag.empty()) {
             auto copy = std::make_unique<std::wstring>(tag);
             if (PostMessageW(hwnd, WM_UPDATE_FOUND, 0,
                              reinterpret_cast<LPARAM>(copy.get()))) {
@@ -1033,6 +1050,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     // Order matters: everything that points into the old tree is dropped
     // before the tree itself is freed.
     g_app.pendingReveal.clear();
+    g_app.pendingTrail.clear();
     g_app.selected  = volumeIndex;
     DropTreeReferences();
     g_app.result.reset();
@@ -1186,6 +1204,7 @@ static void NavigateTo(const Node* node, const Rect& from) {
 static void GoUp() {
     if (g_app.trail.size() <= 1) return;
     g_app.trail.pop_back();
+    ResetBrowseView();
     g_app.hoverNode  = nullptr;
     g_app.hoverIndex = -1;
     NavigateTo(g_app.trail.back(), g_app.mapBounds);
@@ -1816,10 +1835,36 @@ constexpr float kHeadH = 26.0f;
 constexpr float kRowH  = 22.0f;
 }
 
+// Every place the trail moves calls this. EnsureBrowseOrder rebuilds the
+// order on the next paint, but mouse messages outrank WM_PAINT, so the
+// hit rectangles from the previous directory must go immediately or a
+// fast right-click acts on rows that are no longer on screen.
+static void ResetBrowseView() {
+    g_app.browseOrder.clear();
+    g_app.browseOrderOwner = nullptr;
+    g_app.browseRowHits.clear();
+    g_app.browseRowNodes.clear();
+    g_app.browseSelSet.clear();
+    g_app.browseSel    = nullptr;
+    g_app.browseAnchor = -1;
+    g_app.browseScroll = 0.0f;
+}
+
 static void EnsureBrowseOrder() {
-    if (!g_app.browseOrder.empty() || g_app.trail.empty()) return;
+    if (g_app.trail.empty()) return;
     const Node* cur = g_app.trail.back();
     if (!cur) return;
+    // Rebuild whenever the viewed directory changed, not merely when the
+    // order is empty. Every way the trail moves - Backspace, a breadcrumb,
+    // a tab switch, a duplicate reveal - would otherwise leave rows that
+    // name one directory while every path built from them names another.
+    if (g_app.browseOrderOwner == cur && !g_app.browseOrder.empty()) return;
+    g_app.browseOrder.clear();
+    g_app.browseSelSet.clear();
+    g_app.browseSel    = nullptr;
+    g_app.browseAnchor = -1;
+    g_app.browseScroll = 0.0f;
+    g_app.browseOrderOwner = cur;
     g_app.browseOrder.reserve(cur->children.size());
     for (const Node& c : cur->children) g_app.browseOrder.push_back(&c);
     const int  key = g_app.browseSort;
@@ -2771,6 +2816,7 @@ static void RestoreTrailComps(const std::vector<std::wstring>& comps) {
         cur = next;
     }
     g_app.trail      = std::move(trail);
+    ResetBrowseView();
     g_app.hoverNode  = nullptr;
     g_app.hoverPrev  = nullptr;
     g_app.hoverIndex = -1;
@@ -2781,7 +2827,10 @@ static void RestoreTrailComps(const std::vector<std::wstring>& comps) {
 // Make a stored tab the live view: switch roots if it lives elsewhere
 // (instant when the cache is fresh, which the launch prefetch makes the
 // normal case), then walk back to where it was.
-static void ApplyView(const ViewTab& t) {
+// Takes its tab BY VALUE: StartScanPath below can reach a message box,
+// which pumps, and anything that grows viewTabs would leave a reference
+// dangling mid-function. The struct is a few strings.
+static void ApplyView(ViewTab t) {
     g_app.panel  = static_cast<App::Panel>(t.panel);
     g_app.query  = t.query;
     g_app.browse = t.browse;
@@ -2790,6 +2839,11 @@ static void ApplyView(const ViewTab& t) {
     if (!t.root.empty() &&
         lstrcmpiW(t.root.c_str(), CurrentRootPath().c_str()) != 0) {
         StartScanPath(t.root, t.volumeIndex, true);
+    }
+    if (!g_app.result && !t.comps.empty()) {
+        // No cache to land on, so the tree is still being walked. Keep the
+        // destination and let the scan's completion take the tab there.
+        g_app.pendingTrail = t.comps;
     }
     RestoreTrailComps(t.comps);
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
@@ -2897,6 +2951,7 @@ static bool NavigateToPath(const std::wstring& full) {
     if (!fileNode) return false;
 
     g_app.trail      = std::move(trail);
+    ResetBrowseView();
     g_app.hoverNode  = nullptr;
     g_app.hoverPrev  = nullptr;
     g_app.hoverIndex = -1;
@@ -2962,6 +3017,12 @@ static void PasteIntoSearch() {
 static void DoExport() {
     if (g_app.trail.empty() || !g_app.result) return;
 
+    // What the menu item promised, captured before the file dialog pumps
+    // messages: a rescan landing mid-dialog re-seeds the trail at the
+    // volume root, and exporting the whole drive under the name the user
+    // chose for one folder is a quiet lie.
+    const std::wstring wantPath = TrailPath(g_app.trail);
+
     wchar_t file[MAX_PATH] = L"spindle-export.csv";
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
@@ -2974,6 +3035,19 @@ static void DoExport() {
                       OFN_NOCHANGEDIR;
 
     if (!GetSaveFileNameW(&ofn)) return;
+
+    // Re-derive the target: if the tree swapped while the dialog was open,
+    // walk back to the folder the user asked about rather than exporting
+    // whatever is on screen now.
+    if (g_app.trail.empty() || !g_app.result) return;
+    if (lstrcmpiW(TrailPath(g_app.trail).c_str(), wantPath.c_str()) != 0) {
+        MessageBoxW(g_app.hwnd,
+                    L"The scan finished while the dialog was open, so the "
+                    L"view moved. Nothing was written; try the export "
+                    L"again.",
+                    L"Spindle", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
 
     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     const bool ok = ExportCsv(*g_app.trail.back(), TrailPath(g_app.trail),
@@ -3167,9 +3241,23 @@ static void ShowAppMenu(POINT screenPt) {
                 break;
             }
             SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-            const std::wstring said = ApplyUpdate(kAppVersion);
+            uint64_t serial = 0;
+            std::wstring said;
+            try {
+                // Wrapped: this allocates buffers sized by a remote
+                // answer, and an exception escaping a window procedure
+                // is undefined behaviour rather than an error message.
+                said = ApplyUpdate(kAppVersion, g_app.updateTag,
+                                   g_app.settings.updateSerial, serial);
+            } catch (...) {
+                said = L"The update could not be completed.";
+            }
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             if (said.empty()) {
+                if (serial > g_app.settings.updateSerial) {
+                    g_app.settings.updateSerial = serial;
+                    SaveSettings(g_app.settings);
+                }
                 g_app.updateTag.clear();
                 MessageBoxW(g_app.hwnd,
                             L"Staged. Restart Spindle to finish; the "
@@ -3273,13 +3361,17 @@ static void DoForceRemove(const std::wstring& path, uint64_t nodeSize,
     if (!lockers.empty()) {
         std::wstring msg =
             L"These programs currently have it open:\n\n";
+        // Counted over every locker, not merely the twelve listed: the
+        // question being consented to is how many processes would end,
+        // and answering it from a truncated list understates it.
         size_t killable = 0;
+        for (const Locker& l : lockers) {
+            if (!l.critical) ++killable;
+        }
         for (size_t i = 0; i < lockers.size() && i < 12; ++i) {
             msg += L"    " + SanitizeForDisplay(lockers[i].name);
             if (lockers[i].critical) {
                 msg += L"  (system - will not be touched)";
-            } else {
-                ++killable;
             }
             msg += L'\n';
         }
@@ -3302,7 +3394,7 @@ static void DoForceRemove(const std::wstring& path, uint64_t nodeSize,
     }
 
     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    const ForceRemoveResult r = ForceRemove(path, terminate);
+    const ForceRemoveResult r = ForceRemove(path, terminate, lockers);
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
 
     if (r.ok) {
@@ -3387,11 +3479,16 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
         ref.first >= static_cast<int>(g_app.dupes.groups.size())) {
         return;
     }
-    DupGroup& g = g_app.dupes.groups[static_cast<size_t>(ref.first)];
+    // Scoped, not held: the confirmations below pump, and a report
+    // arriving mid-dialog reallocates this vector. Re-found afterwards.
     std::wstring twin;
-    for (size_t j = 0; j < g.files.size(); ++j) {
-        const std::wstring cand = g.files[j].Full();
-        if (cand != path) { twin = cand; break; }
+    {
+        const DupGroup& g =
+            g_app.dupes.groups[static_cast<size_t>(ref.first)];
+        for (size_t j = 0; j < g.files.size(); ++j) {
+            const std::wstring cand = g.files[j].Full();
+            if (cand != path) { twin = cand; break; }
+        }
     }
     if (twin.empty()) {
         MessageBoxW(g_app.hwnd,
@@ -3434,19 +3531,29 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
         return;
     }
 
-    // Drop the recycled file from the report so the panel reflects it. Below
-    // two members a group is no longer a duplicate and goes entirely.
-    for (size_t j = 0; j < g.files.size(); ++j) {
-        if (g.files[j].Full() == path) {
-            g.files.erase(g.files.begin() + static_cast<long>(j));
-            break;
+    // Drop the recycled file from the report so the panel reflects it. The
+    // group is located again rather than remembered: every dialog above
+    // pumped messages, and a hunt finishing in one of them replaces the
+    // whole report. An index from before means nothing now, so match on
+    // the path, which is what was actually deleted.
+    for (size_t gi = 0; gi < g_app.dupes.groups.size(); ++gi) {
+        DupGroup& grp = g_app.dupes.groups[gi];
+        bool hit = false;
+        for (size_t j = 0; j < grp.files.size(); ++j) {
+            if (grp.files[j].Full() == path) {
+                grp.files.erase(grp.files.begin() + static_cast<long>(j));
+                hit = true;
+                break;
+            }
         }
-    }
-    if (g.files.size() >= 2) {
-        g.wasted = g.size * (g.files.size() - 1);
-    } else {
-        g_app.dupes.groups.erase(
-            g_app.dupes.groups.begin() + ref.first);
+        if (!hit) continue;
+        if (grp.files.size() >= 2) {
+            grp.wasted = SatMul(grp.size, grp.files.size() - 1);
+        } else {
+            g_app.dupes.groups.erase(g_app.dupes.groups.begin() +
+                                     static_cast<long>(gi));
+        }
+        break;
     }
     RebuildDupePathSet();
     MarkDupeCells();
@@ -3506,8 +3613,12 @@ static void ShowRowMenu(int rowIndex, POINT screenPt) {
     // Snapshot before any modal loop runs: the row's node can die with the
     // next adopted tree.
     const bool isDir = g_app.fileList[i].node && g_app.fileList[i].node->dir;
+    // By value, not by reference: the menu below runs a modal loop that
+    // dispatches WM_SCAN_DONE, which clears fileList and refills it from a
+    // different tree. An index taken now means nothing afterwards.
+    const std::wstring rel = g_app.fileList[i].path;
     std::wstring full = TrailPath(g_app.trail);
-    AppendComponent(full, g_app.fileList[i].path);
+    AppendComponent(full, rel);
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -3529,7 +3640,6 @@ static void ShowRowMenu(int rowIndex, POINT screenPt) {
         if (g_app.trail[k]) comps.push_back(g_app.trail[k]->name);
     }
     {
-        const std::wstring& rel = g_app.fileList[i].path;
         size_t pos = 0;
         while (pos < rel.size()) {
             const size_t sep = rel.find(L'\\', pos);
@@ -4143,9 +4253,11 @@ static void OnLeftClick(int x, int y) {
             InvalidateRect(g_app.hwnd, nullptr, FALSE);
             return;
         }
-        if (fx >= layout::kSidebar) {
-            // Empty list space: the click lands nowhere, so nothing stays
-            // selected. Explorer's grammar.
+        // Empty space inside the list itself, which is below the
+        // breadcrumb: the click lands nowhere, so nothing stays selected.
+        // Bounded by the map area, or this would swallow every breadcrumb
+        // click and make the crumbs dead in list mode.
+        if (fx >= layout::kSidebar && fy >= g_app.mapBounds.y) {
             if (!g_app.browseSelSet.empty()) {
                 g_app.browseSelSet.clear();
                 g_app.browseSel = nullptr;
@@ -4160,6 +4272,7 @@ static void OnLeftClick(int x, int y) {
         const size_t target = g_app.crumbFirst + i;
         if (target + 1 >= g_app.trail.size()) return;
         g_app.trail.resize(target + 1);
+        ResetBrowseView();
         g_app.hoverNode = nullptr;
         NavigateTo(g_app.trail.back(), g_app.mapBounds);
         return;
@@ -4175,6 +4288,7 @@ static void OnLeftClick(int x, int y) {
     // Push every directory between the current view and the clicked cell, so
     // the breadcrumb matches the path actually navigated to.
     for (const Node* n : CellChain(g_app.cells, idx)) g_app.trail.push_back(n);
+    ResetBrowseView();
     g_app.hoverNode  = nullptr;
     g_app.hoverIndex = -1;
     NavigateTo(cell.node, cell.rect);
@@ -4356,7 +4470,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp != kTimerId) break;
             if (g_app.scanning || g_app.dupeRunning || g_app.zoom.Running() ||
                 g_app.reveal.Running() || g_app.hoverFade.Running() ||
-                g_app.dupeFlash.Running() ||
+                g_app.dupeFlash.Running() || g_app.bulkRunning ||
+                g_app.prefetching ||
                 g_app.tabSlide.Running()) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else {
@@ -4410,6 +4525,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.zoom.Begin(0);
                 g_app.reveal.Begin(g_app.motion ? kRevealMs : 0);
                 SetTimer(hwnd, kTimerId, kFrameMs, nullptr);
+                if (!g_app.pendingTrail.empty()) {
+                    const std::vector<std::wstring> comps =
+                        g_app.pendingTrail;
+                    g_app.pendingTrail.clear();
+                    RestoreTrailComps(comps);   // as deep as still exists
+                }
                 if (!g_app.pendingReveal.empty()) {
                     const std::wstring full = g_app.pendingReveal;
                     g_app.pendingReveal.clear();
@@ -4489,9 +4610,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                   0;
                                        }),
                         grp.files.end());
-                    grp.wasted = grp.size * (grp.files.size() > 0
-                                                 ? grp.files.size() - 1
-                                                 : 0);
+                    grp.wasted = SatMul(grp.size,
+                                        grp.files.size() > 0
+                                            ? grp.files.size() - 1
+                                            : 0);
                 }
                 g_app.dupes.groups.erase(
                     std::remove_if(g_app.dupes.groups.begin(),

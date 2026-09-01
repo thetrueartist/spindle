@@ -205,7 +205,8 @@ bool VerifyManifestFile(const std::wstring& manifestPath,
 // hard cap on how much we will read. Anything else fails the update, not
 // the program.
 static bool HttpsGet(const std::wstring& host, const std::wstring& path,
-                     std::vector<uint8_t>& out, size_t maxBytes) {
+                     std::vector<uint8_t>& out, size_t maxBytes,
+                     std::string* redirectTo = nullptr) {
     out.clear();
     HINTERNET ses = WinHttpOpen(L"Spindle-Updater",
                                 WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -221,6 +222,11 @@ static bool HttpsGet(const std::wstring& host, const std::wstring& path,
             con, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
             WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
         if (req) {
+            // WinHTTP would otherwise follow up to ten hops to any host.
+            // The allowlist is only meaningful if it survives redirection.
+            DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &policy,
+                             sizeof(policy));
             const wchar_t* hdrs =
                 L"User-Agent: Spindle\r\nAccept: */*\r\n";
             if (WinHttpSendRequest(req, hdrs, static_cast<DWORD>(-1),
@@ -232,11 +238,36 @@ static bool HttpsGet(const std::wstring& host, const std::wstring& path,
                     WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                     WINHTTP_HEADER_NAME_BY_INDEX, &status, &cb,
                     WINHTTP_NO_HEADER_INDEX);
+                // A redirect is handed back to the caller rather than
+                // followed here, so the destination passes the same host
+                // allowlist the first request did.
+                if (redirectTo != nullptr &&
+                    (status == 301 || status == 302 || status == 303 ||
+                     status == 307 || status == 308)) {
+                    wchar_t loc[2048] = {};
+                    DWORD lc = sizeof(loc);
+                    if (WinHttpQueryHeaders(req, WINHTTP_QUERY_LOCATION,
+                                            WINHTTP_HEADER_NAME_BY_INDEX,
+                                            loc, &lc,
+                                            WINHTTP_NO_HEADER_INDEX)) {
+                        redirectTo->clear();
+                        for (const wchar_t* q = loc; *q; ++q) {
+                            if (*q < 0x20 || *q >= 0x7F) {
+                                redirectTo->clear();
+                                break;
+                            }
+                            redirectTo->push_back(static_cast<char>(*q));
+                        }
+                    }
+                }
                 if (status == 200) {
                     for (;;) {
                         DWORD avail = 0;
-                        if (!WinHttpQueryDataAvailable(req, &avail) ||
-                            avail == 0) {
+                        // A failed query is a broken transfer, not the
+                        // end of the body. Conflating them reports a
+                        // truncated download as a complete one.
+                        if (!WinHttpQueryDataAvailable(req, &avail)) break;
+                        if (avail == 0) {
                             ok = true;
                             break;
                         }
@@ -268,14 +299,31 @@ static bool HttpsGetFollowingOneRedirect(const std::wstring& host,
                                          std::vector<uint8_t>& out,
                                          size_t maxBytes);
 
+// Only these hosts, ever. The release JSON is written by whoever controls
+// the API response, and the manifest is fetched before there is any
+// signature to judge it by, so an unrestricted host here turns every
+// install into a fetcher for an address of the attacker's choosing.
+static bool HostAllowed(const std::string& host) {
+    return host == "api.github.com" || host == "github.com" ||
+           host == "objects.githubusercontent.com" ||
+           host == "release-assets.githubusercontent.com";
+}
+
 static bool SplitHttpsUrl(const std::string& url, std::wstring& host,
                           std::wstring& path) {
     if (url.rfind("https://", 0) != 0) return false;
+    // Nothing but unreserved URL bytes: a raw CR or LF reaching
+    // WinHttpOpenRequest would be a header-splitting primitive.
+    for (unsigned char c : url) {
+        if (c <= 0x20 || c >= 0x7F || c == '"' || c == '\\') return false;
+    }
     const size_t hostAt = 8;
     const size_t slash = url.find('/', hostAt);
     if (slash == std::string::npos || slash == hostAt) return false;
-    host.assign(url.begin() + static_cast<long>(hostAt),
-                url.begin() + static_cast<long>(slash));
+    const std::string h(url.begin() + static_cast<long>(hostAt),
+                        url.begin() + static_cast<long>(slash));
+    if (!HostAllowed(h)) return false;
+    host.assign(h.begin(), h.end());
     path.assign(url.begin() + static_cast<long>(slash), url.end());
     return true;
 }
@@ -286,11 +334,39 @@ struct UpdateInfo {
     std::string tag;        // e.g. "v2.1.0"
     std::string exeUrl;     // browser_download_url of spindle.exe
     std::string sha256;     // promised by the signed manifest
+    uint64_t    serial = 0; // monotonic, signed: the anti-replay counter
+    uint64_t    size   = 0; // signed length, used to cap the download
 };
+
+// Small unsigned parse for a numeric JSON field, refusing anything that is
+// not plainly a number. Used only on manifest fields, and only after the
+// signature over them has been checked.
+static bool JsonNumber(const std::string& json, const std::string& key,
+                       uint64_t& out) {
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) {
+        ++pos;
+    }
+    if (pos >= json.size() || json[pos] < '0' || json[pos] > '9') {
+        return false;
+    }
+    uint64_t v = 0;
+    size_t digits = 0;
+    while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+        if (digits++ > 19) return false;          // no overflow, ever
+        v = v * 10 + static_cast<uint64_t>(json[pos] - '0');
+        ++pos;
+    }
+    out = v;
+    return true;
+}
 
 // Fetch the latest release, verify its signed manifest, and fill `info`.
 // Every early return is the fail-closed path.
-static bool FetchVerifiedUpdate(UpdateInfo& info) {
+static bool FetchVerifiedUpdate(UpdateInfo& info, uint64_t minSerial) {
     if (!UpdateFeatureEnabled()) return false;
 
     std::vector<uint8_t> body;
@@ -311,7 +387,10 @@ static bool FetchVerifiedUpdate(UpdateInfo& info) {
     // the next "browser_download_url" after it.
     std::string manifestUrl, sigUrl, exeUrl;
     size_t at = 0;
-    for (;;) {
+    // Bounded: each lookup scans the rest of the body, so an answer made
+    // of nothing but "name" keys would be quadratic. A real release has a
+    // handful of assets.
+    for (int asset = 0; asset < 64; ++asset) {
         std::string name;
         size_t here = 0;
         if (!JsonFindString(json, "name", at, name, &here)) break;
@@ -370,15 +449,34 @@ static bool FetchVerifiedUpdate(UpdateInfo& info) {
         !JsonFindString(mjson, "sha256", 0, msha)) {
         return false;
     }
-    // The manifest must be about this release and this artifact, or a
-    // valid old manifest could be replayed onto a newer tag.
     if (mtag != tag || masset != "spindle.exe" || msha.size() != 64) {
+        return false;
+    }
+    for (char c : msha) {
+        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!hex) return false;
+    }
+
+    // The anti-replay counter, and the only thing that actually stops a
+    // rollback. Comparing the manifest's tag to the release's proves
+    // nothing: both come from the same response, so an attacker serving a
+    // genuine older release simply echoes its own tag. The serial is
+    // signed, is only ever issued upwards, and is remembered across runs,
+    // so a superseded release cannot be replayed to pin anyone on it.
+    uint64_t mserial = 0, msize = 0;
+    if (!JsonNumber(mjson, "serial", mserial) || mserial <= minSerial) {
+        return false;
+    }
+    if (!JsonNumber(mjson, "size", msize) || msize == 0 ||
+        msize > (64u << 20)) {
         return false;
     }
 
     info.tag    = tag;
     info.exeUrl = exeUrl;
     info.sha256 = msha;
+    info.serial = mserial;
+    info.size   = msize;
     return true;
 }
 
@@ -386,9 +484,16 @@ static bool HttpsGetFollowingOneRedirect(const std::wstring& host,
                                          const std::wstring& path,
                                          std::vector<uint8_t>& out,
                                          size_t maxBytes) {
-    // First try the plain GET; WinHTTP follows same-scheme redirects on
-    // its own by default, so this usually just works.
-    return HttpsGet(host, path, out, maxBytes);
+    // Release assets redirect to a storage host, so exactly one hop is
+    // expected and allowed. The destination is re-checked against the
+    // same allowlist, so redirection cannot widen where this will fetch
+    // from, and a second redirect is refused rather than chased.
+    std::string next;
+    if (HttpsGet(host, path, out, maxBytes, &next)) return true;
+    if (next.empty()) return false;
+    std::wstring host2, path2;
+    if (!SplitHttpsUrl(next, host2, path2)) return false;
+    return HttpsGet(host2, path2, out, maxBytes);
 }
 
 // ------------------------------------------------------------- public API
@@ -420,9 +525,11 @@ static bool TagIsNewer(const std::string& tag, const wchar_t* current) {
     return a[2] > b[2];
 }
 
-bool CheckForUpdate(const wchar_t* currentVersion, std::wstring& tagOut) {
+bool CheckForUpdate(const wchar_t* currentVersion, uint64_t minSerial,
+                    std::wstring& tagOut) {
     UpdateInfo info;
-    if (!FetchVerifiedUpdate(info)) return false;
+    if (!FetchVerifiedUpdate(info, minSerial)) return false;
+    // Belt and braces with the serial: never sideways, never backwards.
     if (!TagIsNewer(info.tag, currentVersion)) return false;
     tagOut.assign(info.tag.begin(), info.tag.end());
     return true;
@@ -430,19 +537,33 @@ bool CheckForUpdate(const wchar_t* currentVersion, std::wstring& tagOut) {
 
 // Download, hash, require the promised hash, swap by rename. Returns a
 // short status the caller can show; empty on success.
-std::wstring ApplyUpdate(const wchar_t* currentVersion) {
+std::wstring ApplyUpdate(const wchar_t* currentVersion,
+                         const std::wstring& expectedTag,
+                         uint64_t minSerial, uint64_t& serialOut) {
     UpdateInfo info;
-    if (!FetchVerifiedUpdate(info)) {
+    if (!FetchVerifiedUpdate(info, minSerial)) {
         return L"The update could not be verified, so nothing was changed.";
     }
     if (!TagIsNewer(info.tag, currentVersion)) {
         return L"This is already the newest version.";
     }
+    // The consent named a version. This fetch is a second, independent
+    // one, so it must agree with what was actually agreed to.
+    if (!expectedTag.empty()) {
+        std::wstring gotTag(info.tag.begin(), info.tag.end());
+        if (gotTag != expectedTag) {
+            return L"The release changed while you were deciding, so "
+                   L"nothing was downloaded.";
+        }
+    }
     std::wstring host, path;
     std::vector<uint8_t> exe;
+    // Capped at the length the manifest signed for, not an arbitrary
+    // ceiling: a signed size is a promise about how much to read.
     if (!SplitHttpsUrl(info.exeUrl, host, path) ||
-        !HttpsGetFollowingOneRedirect(host, path, exe, 64u << 20) ||
-        exe.empty()) {
+        !HttpsGetFollowingOneRedirect(host, path, exe,
+                                      static_cast<size_t>(info.size)) ||
+        exe.size() != info.size) {
         return L"The download failed, so nothing was changed.";
     }
     uint8_t digest[32];
@@ -451,6 +572,7 @@ std::wstring ApplyUpdate(const wchar_t* currentVersion) {
         return L"The download did not match its signed manifest, so "
                L"nothing was changed.";
     }
+    serialOut = info.serial;
 
     wchar_t self[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, self, MAX_PATH) == 0) {
@@ -460,8 +582,12 @@ std::wstring ApplyUpdate(const wchar_t* currentVersion) {
     const std::wstring fresh = cur + L".new";
     const std::wstring old   = cur + L".old";
 
-    const HANDLE h = CreateFileW(fresh.c_str(), GENERIC_WRITE, 0, nullptr,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+    // Never through a reparse point: the staging name is predictable, and
+    // a link planted at it would otherwise redirect a verified write.
+    const HANDLE h = CreateFileW(fresh.c_str(), GENERIC_WRITE,
+                                 FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL |
+                                     FILE_FLAG_OPEN_REPARSE_POINT,
                                  nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         return L"Could not write next to the program. Move it somewhere "
@@ -579,11 +705,22 @@ bool SignReleaseFile(const std::wstring& exePath,
     }
     std::string tagUtf;
     for (wchar_t c : tag) tagUtf.push_back(static_cast<char>(c));
+    // The serial is the signing moment in seconds, which is monotonic in
+    // practice and needs no state kept between signings. An updater
+    // refuses anything at or below the highest serial it has accepted, so
+    // a genuine but superseded release cannot be replayed at users.
+    FILETIME nowFt{};
+    GetSystemTimeAsFileTime(&nowFt);
+    const uint64_t ticks =
+        (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) |
+        nowFt.dwLowDateTime;
+    const uint64_t serial = ticks / 10000000ull;   // seconds since 1601
     const std::string manifest =
         std::string("{\"tag\":\"") + tagUtf +
         "\",\"asset\":\"spindle.exe\",\"sha256\":\"" +
         HexOf(digest, 32) + "\",\"size\":" +
-        std::to_string(exe.size()) + "}";
+        std::to_string(exe.size()) + ",\"serial\":" +
+        std::to_string(serial) + "}";
 
     // Sign the exact manifest bytes.
     std::string privUtf;
