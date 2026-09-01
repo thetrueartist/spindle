@@ -20,7 +20,9 @@ namespace spindle {
 // is off: no network, no menu entry, nothing. Enabling it is the owner's
 // deliberate act: spindle.exe --gen-update-key, keep the private half
 // offline, paste the public half here, rebuild.
-static const char kUpdatePublicKeyB64[] = "";
+static const char kUpdatePublicKeyB64[] =
+    "QTPCug6/3n/9X4E3jp/FC8zMsPCkCmW+i46q3PsdfvhweKGqUyKXxOSVsgFxDhsy"
+    "zSk590AXaNVcEsLVOsmNCQ==";
 
 bool UpdateFeatureEnabled() { return kUpdatePublicKeyB64[0] != '\0'; }
 
