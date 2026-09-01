@@ -10,6 +10,10 @@ on:
         required: true
         type: string
 
+# The only workflow that may write, and only to publish a release. Note
+# that a compromise here still cannot ship an update to anyone: releases
+# are only trusted once signed with the maintainer's offline key, which
+# does not exist on any runner.
 permissions:
   contents: write
 
@@ -31,8 +35,10 @@ jobs:
           cd build
           sha256sum spindle.exe > SHA256SUMS
           cat SHA256SUMS
+      # Third-party action, so it is pinned to a commit rather than a
+      # movable tag: a tag can be repointed at new code, a commit cannot.
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: |

@@ -8,6 +8,16 @@ build/
 spindle.ico
 icon_preview.png
 
+# Release signing material. --gen-update-key writes update-key.txt into the
+# working directory, and the private half of that pair is the whole trust
+# model of the updater: it must never reach a commit, least of all a public
+# one. Ignored by name and by extension, belt and braces.
+update-key.txt
+*.key
+manifest.json
+manifest.sig
+sign-error.txt
+
 # Crash reports and exports produced at runtime
 spindle-crash.txt
 *.csv
