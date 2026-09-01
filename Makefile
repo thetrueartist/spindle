@@ -15,7 +15,7 @@ CXX_WIN  := $(ARCH)-w64-mingw32-g++
 CXX_HOST := g++
 WINDRES  := $(ARCH)-w64-mingw32-windres
 
-SRC      := src/core.cpp src/ntfs.cpp src/mft.cpp src/scan.cpp src/ui.cpp
+SRC      := src/core.cpp src/ntfs.cpp src/mft.cpp src/scan.cpp src/update.cpp src/ui.cpp
 RC       := res/spindle.rc
 RES      := build/spindle.res.o
 ICON     := build/spindle.ico
@@ -45,7 +45,7 @@ LDFLAGS  := -mwindows -static -static-libgcc -static-libstdc++ \
             -Wl,--gc-sections $(HARDEN_L)
 LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
             -ladvapi32 -lrstrtmgr \
-            -lcomdlg32 -luuid
+            -lcomdlg32 -lwinhttp -lbcrypt -luuid
 
 .PHONY: all test stress analyze clean dirs icon
 

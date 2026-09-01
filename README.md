@@ -454,8 +454,15 @@ written verbatim into a CSV and carry the spoof into whatever opens it.
 About 210 functions across 11 DLLs, all Microsoft. What is absent
 matters as much as what is present:
 
-- No network APIs. No Winsock, WinINet, WinHTTP or DNS. There is no code
-  path that can reach the network.
+- Networking exists for exactly one purpose and is dormant by default:
+  the auto-updater (WinHTTP, HTTPS to the GitHub release API only). It
+  is compiled in but disabled until the maintainer embeds a release
+  signing key; in that state there is no code path that reaches the
+  network. When enabled, an update is accepted only if a manifest
+  signed by the maintainer's offline ECDSA P-256 key (verified through
+  CNG) vouches for the exact bytes, it is offered and never installed
+  silently, and every failure leaves the current install untouched.
+  There is still no Winsock, WinINet or DNS use anywhere.
 - No process creation. No `CreateProcess`, no `WinExec`. `ShellExecuteW`
   is used to open Explorer at a path and for nothing else.
 - No injection primitives. No `CreateRemoteThread`, `WriteProcessMemory`,

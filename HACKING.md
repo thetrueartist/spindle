@@ -263,7 +263,7 @@ via CNG), compares the tag, and only then offers the update: a menu
 entry naming the version, never anything silent. Accepting downloads
 the exe asset, hashes it (SHA-256 via CNG), requires the hash the
 signed manifest promised, then swaps by rename: the running exe moves
-aside as spindle.old.exe, the verified download takes its name, and
+aside as spindle.exe.old, the verified download takes its name, and
 the user restarts when they choose. No process is created, the old
 version survives until the next launch cleans it, and every failure
 leaves the current install untouched.
@@ -272,7 +272,9 @@ The JSON off the API is untrusted input, so the field extractor lives
 in core.cpp with hard bounds and host tests, like every other parser
 of hostile bytes.
 
-Signing lives in the exe itself: --gen-update-key writes a keypair
+tools/sign-release.ps1 is the owner's post-release step: it downloads
+the CI-built exe for a tag, signs it locally, and attaches the manifest
+pair to the release. Signing lives in the exe itself: --gen-update-key writes a keypair
 (keep the private half offline), --sign-release hashes a build and
 writes manifest.json plus manifest.sig for attaching to the release.
 The embedded public key constant ships EMPTY, which disables the whole

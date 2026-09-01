@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, "dev-**"]
   pull_request:
 
 jobs:
@@ -53,3 +53,47 @@ jobs:
           name: spindle-exe-arm64
           path: build/spindle.exe
           retention-days: 14
+
+  # The auto-update crypto, exercised on real Windows: generate a keypair,
+  # sign the built exe, verify the manifest, then prove fail-closed by
+  # corrupting one byte and by verifying with the wrong key. Wine cannot
+  # run this (its ECDSA is incomplete), which is exactly why it lives here.
+  update-roundtrip:
+    runs-on: windows-latest
+    needs: cross-build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: spindle-exe
+      - name: Sign, verify, tamper, refuse
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Start-Process -FilePath .\spindle.exe -ArgumentList "--gen-update-key" -Wait -NoNewWindow
+          if (-not (Test-Path update-key.txt)) { throw "no keypair written" }
+          $lines = Get-Content update-key.txt
+          $pub  = ($lines | Where-Object { $_ -match "^public" })  -replace ".*: ", ""
+          $priv = ($lines | Where-Object { $_ -match "^private" }) -replace ".*: ", ""
+          if ($pub.Length -lt 80 -or $priv.Length -lt 100) { throw "keypair looks wrong" }
+          Set-Content -NoNewline priv.key $priv
+
+          Start-Process -FilePath .\spindle.exe -ArgumentList @("--sign-release", "spindle.exe", "priv.key", "v0.0.0-ci") -Wait -NoNewWindow
+          if (-not (Test-Path manifest.json)) { throw "signing wrote no manifest: $(Get-Content sign-error.txt -ErrorAction SilentlyContinue)" }
+          if (-not (Test-Path manifest.sig))  { throw "signing wrote no signature" }
+
+          $p = Start-Process -FilePath .\spindle.exe -ArgumentList @("--verify-update-manifest", "manifest.json", "manifest.sig", $pub) -Wait -NoNewWindow -PassThru
+          if ($p.ExitCode -ne 0) { throw "a freshly signed manifest failed to verify" }
+          Write-Host "verify: OK"
+
+          $bytes = [IO.File]::ReadAllBytes("manifest.json")
+          $bytes[$bytes.Length - 5] = $bytes[$bytes.Length - 5] -bxor 1
+          [IO.File]::WriteAllBytes("tampered.json", $bytes)
+          $p = Start-Process -FilePath .\spindle.exe -ArgumentList @("--verify-update-manifest", "tampered.json", "manifest.sig", $pub) -Wait -NoNewWindow -PassThru
+          if ($p.ExitCode -eq 0) { throw "a tampered manifest verified - fail-closed is broken" }
+          Write-Host "tamper: REJECTED (good)"
+
+          Start-Process -FilePath .\spindle.exe -ArgumentList "--gen-update-key" -Wait -NoNewWindow
+          $pub2 = ((Get-Content update-key.txt) | Where-Object { $_ -match "^public" }) -replace ".*: ", ""
+          $p = Start-Process -FilePath .\spindle.exe -ArgumentList @("--verify-update-manifest", "manifest.json", "manifest.sig", $pub2) -Wait -NoNewWindow -PassThru
+          if ($p.ExitCode -eq 0) { throw "the wrong key verified - fail-closed is broken" }
+          Write-Host "wrong key: REJECTED (good)"

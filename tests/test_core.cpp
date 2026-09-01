@@ -2047,6 +2047,58 @@ static void TestSettings() {
         CHECK(csv.find(L"'=cmd") != std::wstring::npos,
               "formula-shaped path is prefixed, not exported raw");
     }
+
+    {
+        const std::string j =
+            "{\"tag_name\": \"v2.1.0\", \"assets\": ["
+            "{\"name\":\"manifest.json\","
+            "\"browser_download_url\":\"https://x/m.json\"},"
+            "{\"name\":\"spindle.exe\","
+            "\"browser_download_url\":\"https://x/s.exe\"}]}";
+        std::string v;
+        CHECK(JsonFindString(j, "tag_name", 0, v) && v == "v2.1.0",
+              "json extractor finds a simple field");
+        size_t at = 0;
+        CHECK(JsonFindString(j, "name", 0, v, &at) &&
+                  v == "manifest.json",
+              "json extractor finds the first repeated key");
+        CHECK(JsonFindString(j, "name", at + 1, v) && v == "spindle.exe",
+              "json extractor walks to the next one");
+        CHECK(!JsonFindString(j, "absent", 0, v),
+              "a missing key is not found, not invented");
+        CHECK(!JsonFindString("{\"k\": \"unterminated", "k", 0, v),
+              "an unterminated string is refused");
+        const std::string esc =
+            "{\"k\": \"a\\\"b\"}";
+        CHECK(JsonFindString(esc, "k", 0, v) && v == "a\"b",
+              "escaped quotes stay inside the value");
+        const std::string spoof =
+            "{\"note\": \"the \\\"tag_name\\\": \\\"vFAKE\\\" here "
+            "is text\", \"tag_name\": \"v1.0.0\"}";
+        CHECK(JsonFindString(spoof, "tag_name", 0, v) && v == "v1.0.0",
+              "a key-shaped string in a value cannot spoof the field");
+        std::string big = "{\"k\": \"";
+        big.append(5000, 'x');
+        big += "\"}";
+        CHECK(!JsonFindString(big, "k", 0, v),
+              "an oversized value is refused");
+    }
+
+    {
+        using M = CommandLine::Mode;
+        CHECK(ParseCommandLine({L"--gen-update-key"}).mode ==
+                  M::GenUpdateKey,
+              "gen-update-key parses");
+        const CommandLine sc = ParseCommandLine(
+            {L"--sign-release", L"a.exe", L"key.txt", L"v9.9.9"});
+        CHECK(sc.mode == M::SignRelease && sc.signExe == L"a.exe" &&
+                  sc.signKey == L"key.txt" && sc.signTag == L"v9.9.9",
+              "sign-release takes its three arguments");
+        CHECK(!ParseCommandLine({L"--sign-release", L"a.exe"}).valid,
+              "sign-release refuses short argument lists");
+        CHECK(!ParseCommandLine({L"--verify-update-manifest"}).valid,
+              "verify refuses short argument lists");
+    }
 }
 
 int main() {
