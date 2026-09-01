@@ -1709,9 +1709,26 @@ static void DrawBrowse(const Rect& area) {
     if (g_app.browseScroll > maxScroll) g_app.browseScroll = maxScroll;
     if (g_app.browseScroll < 0.0f) g_app.browseScroll = 0.0f;
 
+    // The way back up, as a row: Backspace works too, but a list you can
+    // only leave by keyboard is half a list. Drawn pinned above the
+    // scrolling span, double-click to ascend.
+    float upH = 0.0f;
+    if (g_app.trail.size() > 1) {
+        upH = browse::kRowH;
+        const Rect row{area.x, listY, area.w - 12.0f, browse::kRowH};
+        if (row.contains(g_app.mouseX, g_app.mouseY)) {
+            FillRect(row, theme::kSlabHi, 0.45f);
+        }
+        DrawText(L"..", g_app.fmtSmall.get(),
+                 Rect{colX[0], listY + 3.0f, colW[0], layout::kLineSmall},
+                 theme::kMute, 0.9f, true);
+        g_app.browseRowHits.push_back(row);
+        g_app.browseRowNodes.push_back(nullptr);   // the ascend sentinel
+    }
+
     if (n == 0) {
         DrawText(L"Nothing in this folder.", g_app.fmtSmall.get(),
-                 Rect{area.x + pad, listY + 14.0f, area.w - pad * 2,
+                 Rect{area.x + pad, listY + upH + 14.0f, area.w - pad * 2,
                       layout::kLineSmall},
                  theme::kMute);
         return;
@@ -1723,9 +1740,10 @@ static void DrawBrowse(const Rect& area) {
         static_cast<size_t>(listH / browse::kRowH) + 2;
     for (size_t i = first; i < n && i < first + visible; ++i) {
         const Node* nd = g_app.browseOrder[i];
-        const float y = listY + static_cast<float>(i) * browse::kRowH -
+        const float y = listY + upH +
+                        static_cast<float>(i) * browse::kRowH -
                         g_app.browseScroll;
-        if (y + browse::kRowH < listY || y > area.bottom()) continue;
+        if (y + browse::kRowH < listY + upH || y > area.bottom()) continue;
         const Rect row{area.x, y, area.w - 12.0f, browse::kRowH};
 
         const bool hot = row.contains(g_app.mouseX, g_app.mouseY);
@@ -2125,6 +2143,24 @@ static void DrawStatus(const Rect& area) {
     FillRect(Rect{area.x, area.y, area.w, 1.0f}, theme::kRule);
 
     const float pad = layout::kPad;
+
+    if (g_app.browse && g_app.browseSel) {
+        std::wstring full = TrailPath(g_app.trail);
+        AppendComponent(full, g_app.browseSel->name);
+        DrawText(SanitizeForDisplay(full), g_app.fmtSmall.get(),
+                 Rect{area.x + pad, area.y + 8.0f,
+                      area.w - pad * 2 - 220.0f, layout::kLineSmall},
+                 theme::kType);
+        std::wstring right = FormatSize(g_app.browseSel->size);
+        if (g_app.browseSel->dir) {
+            right += L"  \u00B7  " + FormatFiles(g_app.browseSel->files);
+        }
+        DrawText(right, g_app.fmtSmall.get(),
+                 Rect{area.right() - 214.0f, area.y + 8.0f, 200.0f,
+                      layout::kLineSmall},
+                 theme::kSignal, 1.0f, true);
+        return;
+    }
 
     if (g_app.hoverNode) {
         const std::wstring path =
@@ -4246,7 +4282,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                i < g_app.browseRowNodes.size(); ++i) {
                 if (!g_app.browseRowHits[i].contains(dx, dy)) continue;
                 const Node* nd = g_app.browseRowNodes[i];
-                if (!nd) break;
+                if (!nd) {
+                    // The ".." row: ascend on the same trail.
+                    if (g_app.trail.size() > 1) {
+                        g_app.trail.pop_back();
+                        g_app.browseOrder.clear();
+                        g_app.browseSel    = nullptr;
+                        g_app.browseScroll = 0.0f;
+                        RebuildTreemap();
+                        g_app.panelDirty = true;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    return 0;
+                }
                 if (nd->dir) {
                     // Descend, staying in the list. Same trail the map
                     // navigation uses, so Backspace walks back out.
@@ -4309,7 +4357,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                    i < g_app.browseRowNodes.size(); ++i) {
                     if (!g_app.browseRowHits[i].contains(fx, fy)) continue;
                     const Node* nd = g_app.browseRowNodes[i];
-                    if (!nd) break;
+                    if (!nd) return 0;   // the ".." row has no menu
                     std::wstring full = TrailPath(g_app.trail);
                     AppendComponent(full, nd->name);
                     std::vector<std::wstring> comps;
