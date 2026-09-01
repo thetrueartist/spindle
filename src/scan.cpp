@@ -30,6 +30,7 @@
 #include <exception>
 #include <cstring>
 #include <vector>
+#include <map>
 
 namespace spindle {
 namespace {
@@ -770,11 +771,12 @@ static bool HashRegion(HANDLE h, uint64_t offset, uint64_t length,
         if (got == 0) break;                  // end of file
         hasher.Update(buf.data(), got);
         bytesRead += got;
-        // Publish per chunk, not per file: a digest of one 60 GB image is
-        // minutes of reading, and a counter that only moves between files
-        // reads as a hang.
+        // Publish per chunk, additively: parallel readers on different
+        // volumes then sum into one live counter instead of overwriting
+        // each other's totals, and a digest of one 60 GB image still
+        // visibly progresses.
         if (progress) {
-            progress->bytes.store(bytesRead, std::memory_order_relaxed);
+            progress->bytes.fetch_add(got, std::memory_order_relaxed);
         }
         if (remaining != UINT64_MAX) remaining -= got;
     }
@@ -858,7 +860,7 @@ static VerifyResult VerifyIdentical(const std::wstring& rootPath,
         if (gotA == 0) break;                 // both at end, everything matched
         bytesRead += gotA;
         if (progress) {
-            progress->bytes.store(bytesRead, std::memory_order_relaxed);
+            progress->bytes.fetch_add(gotA, std::memory_order_relaxed);
         }
         if (std::memcmp(bufA.data(), bufB.data(), gotA) != 0) {
             res = VerifyResult::Different;     // stop at the first difference
@@ -994,10 +996,6 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                 continue;
             }
             digests.push_back({idx, d});
-            if (progress) {
-                progress->bytes.store(rep.bytesHashed,
-                                      std::memory_order_relaxed);
-            }
         }
         return Regroup(members, digests);
     };
@@ -1078,11 +1076,8 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                 } else if (vr == VerifyResult::Unreadable) {
                     ++rep.skippedUnread;
                 }
-                if (progress) {
-                    progress->files.store(rep.filesHashed,
-                                          std::memory_order_relaxed);
-                    progress->bytes.store(rep.bytesHashed,
-                                          std::memory_order_relaxed);
+                if (vr == VerifyResult::Equal && progress) {
+                    progress->files.fetch_add(2, std::memory_order_relaxed);
                 }
                 continue;
             }
@@ -1120,10 +1115,7 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                 hashed.push_back(candidates[idx]);
                 ++rep.filesHashed;
                 if (progress) {
-                    progress->files.store(rep.filesHashed,
-                                          std::memory_order_relaxed);
-                    progress->bytes.store(rep.bytesHashed,
-                                          std::memory_order_relaxed);
+                    progress->files.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -1150,6 +1142,126 @@ DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
     // first here and the second on a worker thread.
     return HashCandidates(DuplicateCandidates(root, minSize), rootPath,
                           progress);
+}
+
+namespace {
+
+struct VolumeHuntJob {
+    std::vector<DupFile> candidates;
+    Progress*            progress  = nullptr;
+    DupFileNote          onFile    = nullptr;
+    void*                onFileCtx = nullptr;
+    DupReport            report;
+};
+
+unsigned __stdcall VolumeHuntThread(void* param) {
+    auto* job = static_cast<VolumeHuntJob*>(param);
+    try {
+        job->report =
+            HashCandidates(std::move(job->candidates), std::wstring(),
+                           job->progress, job->onFile, job->onFileCtx);
+    } catch (...) {
+        job->report           = DupReport{};
+        job->report.cancelled = true;
+    }
+    return 0;
+}
+
+}  // namespace
+
+DupReport HashCandidatesAcrossVolumes(std::vector<DupFile> candidates,
+                                      Progress* progress,
+                                      DupFileNote onFile,
+                                      void* onFileCtx) {
+    // Only files sharing a size can group, so a size class is the unit of
+    // routing: a class wholly on one volume goes to that volume's worker,
+    // a class spanning volumes goes to the shared batch. Nothing else can
+    // change the grouping, so running the workers in parallel is safe by
+    // construction.
+    struct SizeHome {
+        wchar_t letter = 0;      // 0 = unset
+        bool    spans  = false;
+    };
+    std::map<uint64_t, SizeHome> homes;
+    for (const DupFile& f : candidates) {
+        const wchar_t letter =
+            f.root.empty() ? L'\0'
+                           : static_cast<wchar_t>(towupper(f.root[0]));
+        SizeHome& h = homes[f.size];
+        if (h.letter == 0) {
+            h.letter = letter;
+        } else if (h.letter != letter) {
+            h.spans = true;
+        }
+    }
+
+    std::map<wchar_t, VolumeHuntJob> jobs;
+    std::vector<DupFile>             spanning;
+    for (DupFile& f : candidates) {
+        const SizeHome& h = homes[f.size];
+        if (h.spans || h.letter == L'\0') {
+            spanning.push_back(std::move(f));
+        } else {
+            jobs[h.letter].candidates.push_back(std::move(f));
+        }
+    }
+
+    // One busy volume, or none: the plain engine already does this best.
+    if (jobs.size() <= 1) {
+        std::vector<DupFile> all = std::move(spanning);
+        for (auto& [letter, job] : jobs) {
+            for (DupFile& f : job.candidates) all.push_back(std::move(f));
+        }
+        return HashCandidates(std::move(all), std::wstring(), progress,
+                              onFile, onFileCtx);
+    }
+
+    std::vector<HANDLE> threads;
+    threads.reserve(jobs.size());
+    for (auto& [letter, job] : jobs) {
+        job.progress  = progress;
+        job.onFile    = onFile;
+        job.onFileCtx = onFileCtx;
+        const uintptr_t h = _beginthreadex(nullptr, 0, VolumeHuntThread,
+                                           &job, 0, nullptr);
+        if (h == 0) {
+            // Could not spawn: run this volume's share on this thread
+            // rather than dropping it.
+            VolumeHuntThread(&job);
+            continue;
+        }
+        threads.push_back(reinterpret_cast<HANDLE>(h));
+    }
+
+    // The spanning classes ride on this thread while the volumes read.
+    DupReport merged;
+    if (!spanning.empty()) {
+        merged = HashCandidates(std::move(spanning), std::wstring(),
+                                progress, onFile, onFileCtx);
+    }
+    for (HANDLE h : threads) {
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+    }
+
+    for (auto& [letter, job] : jobs) {
+        DupReport& r = job.report;
+        for (DupGroup& g : r.groups) merged.groups.push_back(std::move(g));
+        merged.filesHashed   += r.filesHashed;
+        merged.bytesHashed   += r.bytesHashed;
+        merged.skippedCloud  += r.skippedCloud;
+        merged.skippedUnread += r.skippedUnread;
+        merged.cancelled = merged.cancelled || r.cancelled;
+    }
+    std::sort(merged.groups.begin(), merged.groups.end(),
+              [](const DupGroup& a, const DupGroup& b) {
+                  return a.wasted > b.wasted;
+              });
+    merged.totalWasted = 0;
+    for (const DupGroup& g : merged.groups) {
+        merged.totalWasted = SatAdd(merged.totalWasted, g.wasted);
+    }
+    return merged;
 }
 
 // ------------------------------------------------------------ force removal

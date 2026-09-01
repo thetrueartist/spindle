@@ -156,7 +156,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.9.1";
+constexpr const wchar_t* kAppVersion = L"1.9.2";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -795,9 +795,16 @@ static void JoinBulkWorker() {
 unsigned __stdcall DupeThread(void* param) {
     std::unique_ptr<DupRequest> req(static_cast<DupRequest*>(param));
     try {
+        // An empty root marks the pooled hunt: files carry their own
+        // volumes, so the reads fan out one worker per drive.
         auto rep = std::make_unique<DupReport>(
-            HashCandidates(std::move(req->candidates), req->rootPath,
-                           &g_app.dupeProgress, DupeFileNote, req.get()));
+            req->rootPath.empty()
+                ? HashCandidatesAcrossVolumes(std::move(req->candidates),
+                                              &g_app.dupeProgress,
+                                              DupeFileNote, req.get())
+                : HashCandidates(std::move(req->candidates), req->rootPath,
+                                 &g_app.dupeProgress, DupeFileNote,
+                                 req.get()));
         if (PostMessageW(req->hwnd, WM_DUPES_DONE,
                          static_cast<WPARAM>(req->gen),
                          reinterpret_cast<LPARAM>(rep.get()))) {

@@ -286,6 +286,16 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                          DupFileNote onFile = nullptr,
                          void* onFileCtx = nullptr);
 
+// The pooled variant for candidates spanning volumes (each file carries
+// its own root). Size classes wholly on one volume are hashed by one
+// worker per volume, in parallel, so three drives read at three drives'
+// speed; a size class spanning volumes is hashed in a shared batch so
+// grouping stays global. Progress counts additively across workers.
+DupReport HashCandidatesAcrossVolumes(std::vector<DupFile> candidates,
+                                      Progress* progress,
+                                      DupFileNote onFile = nullptr,
+                                      void* onFileCtx = nullptr);
+
 // True only if the two files are byte-for-byte identical. This is the exact
 // check a deletion must pass before it touches anything: two files with the
 // same 128-bit digest are near-certainly the same, but "near-certain" is not

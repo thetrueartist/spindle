@@ -140,7 +140,10 @@ the Recycle Bin and asks first.
 The second button, "Across every scanned drive", pools candidates from
 every drive's remembered scan. That finds the file that exists once on
 `C:` and once on `D:`, which a single-folder search cannot see. Each row
-shows which drive it is on.
+shows which drive it is on. The reading fans out one worker per volume,
+so three drives read at three drives' speed; only files whose size class
+spans volumes are checked in a shared batch, which is what keeps the
+grouping global.
 
 ## What's really reclaimable
 
