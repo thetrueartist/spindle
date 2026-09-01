@@ -97,6 +97,17 @@ rescanned, the only symptom was that caching silently stopped working
 everywhere. The test fixtures used an empty root name and so could not
 catch it; one now uses a real volume path.
 
+**A pair is confirmed by comparison, not by hashing.** To prove two files
+identical you must read both in full either way; hashing's only advantage
+is that it turns an all-pairs comparison of a large group from O(n^2) into
+O(n). For a group of exactly two - the common case - there is no such
+advantage, so those are compared byte for byte instead: exact where a
+128-bit digest is only near-certain, stopped at the first differing byte
+where a hash must read to the end, and no crafted collision can make two
+different files look the same. Three or more still go through the digest.
+This is the verification the header used to claim without providing, and
+it is what any future deletion will pass through before touching a file.
+
 **A file is never read in full to prove it is different.** Sharing a size
 makes two files *possible* duplicates, not actual ones, and the original
 finder spent a whole file discovering otherwise - two 40 GB images differing

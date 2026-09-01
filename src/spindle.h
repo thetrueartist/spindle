@@ -156,11 +156,15 @@ bool ShellVerbRegistered();
 // ever opened, because two files of different lengths cannot be identical.
 // On a normal volume that eliminates almost everything before a byte is read.
 
-// A 128-bit content digest. Not a cryptographic hash and not presented as
-// one: it answers "are these two files the same", where the alternative
-// being defended against is coincidence, not an attacker crafting a
-// collision to make you delete your own file. Full verification is
-// available separately for anyone who wants it.
+// A 128-bit content digest, used to group files of three or more that share
+// a size. Not a cryptographic hash and not presented as one: for a group of
+// that many, reading each once and grouping by digest is O(n) where an
+// exact all-pairs comparison would be O(n^2), and coincidental collision is
+// the only thing being defended against. A group of exactly two - the
+// common case - is instead confirmed by VerifyIdentical, an exact
+// byte-for-byte comparison, so no crafted collision can make two different
+// files look the same. Any future deletion will go through that same exact
+// check before it touches a file.
 struct Digest {
     uint64_t a = 0;
     uint64_t b = 0;

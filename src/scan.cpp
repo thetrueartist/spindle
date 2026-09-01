@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <cstring>
 #include <vector>
 
 namespace spindle {
@@ -767,6 +768,60 @@ static std::vector<std::vector<size_t>> Regroup(
     return out;
 }
 
+enum class VerifyResult { Equal, Different, Unreadable };
+
+// Reads two files in lockstep and compares them byte for byte, stopping the
+// instant they differ. This is the exact confirmation the digest cannot
+// give: a 128-bit hash answers "almost certainly the same", which is fine
+// for honest data but not against a drive of malware samples where two
+// different files could be crafted to collide. It is also no more I/O than
+// hashing both - each file is read once - and strictly less when they turn
+// out to differ, because the read stops at the first mismatched byte.
+static VerifyResult VerifyIdentical(const std::wstring& rootPath,
+                                    const DupFile& a, const DupFile& b,
+                                    std::vector<uint8_t>& bufA,
+                                    std::vector<uint8_t>& bufB,
+                                    uint64_t& bytesRead, Progress* progress) {
+    OpenWhy whyA = OpenWhy::Unreadable;
+    const HANDLE ha = OpenCandidate(rootPath, a, whyA);
+    if (ha == INVALID_HANDLE_VALUE) return VerifyResult::Unreadable;
+    OpenWhy whyB = OpenWhy::Unreadable;
+    const HANDLE hb = OpenCandidate(rootPath, b, whyB);
+    if (hb == INVALID_HANDLE_VALUE) {
+        CloseHandle(ha);
+        return VerifyResult::Unreadable;
+    }
+
+    VerifyResult res = VerifyResult::Equal;
+    for (;;) {
+        if (progress && progress->cancel.load(std::memory_order_relaxed)) {
+            res = VerifyResult::Unreadable;   // cancelled: cannot confirm
+            break;
+        }
+        DWORD gotA = 0, gotB = 0;
+        if (!ReadFile(ha, bufA.data(), static_cast<DWORD>(bufA.size()),
+                      &gotA, nullptr) ||
+            !ReadFile(hb, bufB.data(), static_cast<DWORD>(bufB.size()),
+                      &gotB, nullptr)) {
+            res = VerifyResult::Unreadable;
+            break;
+        }
+        // Same size group, so the two should end together; a length that
+        // diverged (one shrank since the scan) means they are not the pair
+        // they were.
+        if (gotA != gotB) { res = VerifyResult::Different; break; }
+        if (gotA == 0) break;                 // both at end, everything matched
+        bytesRead += gotA;
+        if (std::memcmp(bufA.data(), bufB.data(), gotA) != 0) {
+            res = VerifyResult::Different;     // stop at the first difference
+            break;
+        }
+    }
+    CloseHandle(ha);
+    CloseHandle(hb);
+    return res;
+}
+
 DupReport HashCandidates(std::vector<DupFile> candidates,
                          const std::wstring& rootPath, Progress* progress) {
     DupReport rep;
@@ -776,6 +831,14 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
     // One reusable buffer. 1 MB keeps the read count low on a spinning disk
     // without the allocation itself being a spike.
     std::vector<uint8_t> buf(1u << 20);
+    std::vector<uint8_t> bufB(1u << 20);   // second lane for lockstep verify
+
+    // Groups of exactly two are confirmed by an exact byte comparison rather
+    // than by hashing both - same reads, but no collision can slip through
+    // and a non-match is rejected at the first differing byte. Larger groups
+    // still go through the digest, which is O(n) reads where pairwise
+    // comparison would be O(n^2).
+    std::vector<DupGroup> directGroups;
 
     // Exact size is the only free grouping, so it goes first.
     std::sort(candidates.begin(), candidates.end(),
@@ -861,9 +924,44 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
         }
 
         // Whatever still shares a size, a head and a tail is now read in
-        // full: only a complete digest is allowed to call two files equal.
+        // full: only a complete comparison is allowed to call two files
+        // equal.
         for (const auto& g : live) {
             if (rep.cancelled) break;
+
+            // The common case - a pair - is confirmed exactly, byte for
+            // byte, instead of hashed. A mismatch stops at the first
+            // differing byte; a match costs the same as hashing both would.
+            if (g.size() == 2) {
+                const VerifyResult vr =
+                    VerifyIdentical(rootPath, candidates[g[0]],
+                                    candidates[g[1]], buf, bufB,
+                                    rep.bytesHashed, progress);
+                if (progress &&
+                    progress->cancel.load(std::memory_order_relaxed)) {
+                    rep.cancelled = true;
+                    break;
+                }
+                if (vr == VerifyResult::Equal) {
+                    DupGroup grp;
+                    grp.size   = candidates[g[0]].size;
+                    grp.wasted = grp.size;   // keep one of two
+                    grp.files.push_back(candidates[g[0]]);
+                    grp.files.push_back(candidates[g[1]]);
+                    directGroups.push_back(std::move(grp));
+                    rep.filesHashed += 2;
+                } else if (vr == VerifyResult::Unreadable) {
+                    ++rep.skippedUnread;
+                }
+                if (progress) {
+                    progress->files.store(rep.filesHashed,
+                                          std::memory_order_relaxed);
+                    progress->bytes.store(rep.bytesHashed,
+                                          std::memory_order_relaxed);
+                }
+                continue;
+            }
+
             std::vector<std::pair<size_t, Digest>> digests;
             for (size_t idx : g) {
                 if (progress &&
@@ -906,6 +1004,13 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
     }
 
     rep.groups = GroupByDigest(hashed);
+    // Fold in the pairs confirmed by direct comparison, then order the whole
+    // lot by what deleting the extra copies would recover.
+    for (DupGroup& grp : directGroups) rep.groups.push_back(std::move(grp));
+    std::sort(rep.groups.begin(), rep.groups.end(),
+              [](const DupGroup& a, const DupGroup& b) {
+                  return a.wasted > b.wasted;
+              });
     for (const DupGroup& g : rep.groups) {
         rep.totalWasted = SatAdd(rep.totalWasted, g.wasted);
     }
