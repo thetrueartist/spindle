@@ -132,6 +132,10 @@ last copy can never go and a stale result cannot delete the wrong
 thing; a set that no longer matches is skipped whole and said so. The
 run shows its progress, can be stopped by Esc or a click, and ends with
 an exact accounting of what moved and what was skipped.
+
+The report also exports: "Export duplicates to CSV" in the menu writes
+one row per file with its set number, copy count, sizes and full path,
+so a spreadsheet can take the decision over.
 The delete only proceeds after Spindle has re-verified, byte for byte,
 that another identical copy still exists, so the last copy can never be
 the one deleted, and a hash match alone is never enough. Deletion goes to
