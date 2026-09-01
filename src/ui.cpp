@@ -236,6 +236,7 @@ struct App {
     bool                  dupesRun = false;
     Rect                  dupeButton;
     Rect                  dupeAllButton;
+    Rect                  dupeStopHit;   // "click here to stop" during a hunt
     // Pointer position in layout units, kept so panels can highlight the
     // row under the cursor without each one recomputing the DPI scale.
     float                 mouseX = -1.0f;
@@ -538,6 +539,12 @@ static void DropTreeReferences() {
 }
 
 static void JoinDupeWorker();
+
+// "1 file", "2 files". The bare plural after a count of one reads as a
+// mistake everywhere it appears.
+static std::wstring FormatFiles(uint64_t n) {
+    return FormatCount(n) + (n == 1 ? L" file" : L" files");
+}
 
 static uint64_t UnixNowMs() {
     FILETIME ft{};
@@ -1075,6 +1082,7 @@ static void DrawSidebar(const Rect& area) {
     // the user moved to another one.
     g_app.dupeButton = Rect{};
     g_app.dupeAllButton = Rect{};
+    g_app.dupeStopHit = Rect{};
     g_app.dupeRowHits.clear();
     g_app.dupeRowPaths.clear();
     g_app.dupeRowRef.clear();
@@ -1094,15 +1102,15 @@ static void DrawSidebar(const Rect& area) {
                 g_app.dupeProgress.files.load(std::memory_order_relaxed);
             const uint64_t nb =
                 g_app.dupeProgress.bytes.load(std::memory_order_relaxed);
-            DrawText(FormatCount(nf) + L" files  \u00B7  " + FormatSize(nb),
+            DrawText(FormatFiles(nf) + L"  \u00B7  " + FormatSize(nb),
                      g_app.fmtSmall.get(),
                      Rect{area.x + layout::kPad, y, rowW,
                           layout::kLineSmall},
                      theme::kMute, 1.0f, true);
             y += 20.0f;
-            DrawText(L"Esc to stop", g_app.fmtSmall.get(),
-                     Rect{area.x + layout::kPad, y, rowW,
-                          layout::kLineSmall},
+            g_app.dupeStopHit = Rect{area.x + layout::kPad, y, rowW, 15.0f};
+            DrawText(L"Esc to stop \u00B7 or click here", g_app.fmtSmall.get(),
+                     g_app.dupeStopHit,
                      theme::kMute, 0.85f, true);
             return;
         }
@@ -1521,7 +1529,7 @@ static void DrawTreemap(const Rect& area) {
                           layout::kLineHead};
         DrawText(L"Scanning", g_app.fmtHead.get(), centre, theme::kType, 1.0f,
                  false, DWRITE_TEXT_ALIGNMENT_CENTER);
-        DrawText(FormatCount(f) + L" files  \u00B7  " + FormatSize(b),
+        DrawText(FormatFiles(f) + L"  \u00B7  " + FormatSize(b),
                  g_app.fmtBody.get(),
                  Rect{area.x, centre.bottom() + 6.0f, area.w,
                       layout::kLineBody},
@@ -1631,7 +1639,7 @@ static void AppendPrefetchNote(std::wstring& line) {
     if (!g_app.prefetching || g_app.prefetchRoot.size() < 2) return;
     line += L"  \u00B7  reading " + g_app.prefetchRoot.substr(0, 2) +
             L" behind  (" +
-            FormatCount(g_app.prefetchProgress.files.load()) + L" files)";
+            FormatFiles(g_app.prefetchProgress.files.load()) + L")";
 }
 
 static void DrawStatus(const Rect& area) {
@@ -1650,8 +1658,7 @@ static void DrawStatus(const Rect& area) {
 
         std::wstring right = FormatSize(g_app.hoverNode->size);
         if (g_app.hoverNode->dir) {
-            right += L"  \u00B7  " + FormatCount(g_app.hoverNode->files) +
-                     L" files";
+            right += L"  \u00B7  " + FormatFiles(g_app.hoverNode->files);
         }
         DrawText(right, g_app.fmtSmall.get(),
                  Rect{area.right() - 214.0f, area.y + 8.0f, 200.0f,
@@ -1667,7 +1674,7 @@ static void DrawStatus(const Rect& area) {
         const ScanStats& s = g_app.result->stats;
         std::wstring line = L"cached " + FormatAge(g_app.cacheSavedMs);
         if (g_app.scanning) line += L"  \u00B7  rescanning\u2026";
-        line += L"  \u00B7  " + FormatCount(s.fileCount) + L" files  \u00B7  " +
+        line += L"  \u00B7  " + FormatFiles(s.fileCount) + L"  \u00B7  " +
                 FormatSize(s.bytes);
         AppendPrefetchNote(line);
         DrawText(line, g_app.fmtSmall.get(),
@@ -1686,7 +1693,7 @@ static void DrawStatus(const Rect& area) {
                 ? std::wstring(buf, static_cast<size_t>(written))
                 : std::wstring(L"--");
 
-        std::wstring line = FormatCount(s.fileCount) + L" files  \u00B7  " +
+        std::wstring line = FormatFiles(s.fileCount) + L"  \u00B7  " +
                             FormatCount(s.dirCount) + L" folders  \u00B7  " +
                             FormatSize(s.bytes) + L"  \u00B7  " + elapsed;
         if (s.usedMft) line += L"  \u00B7  MFT";
@@ -2644,6 +2651,14 @@ static void OnLeftClick(int x, int y) {
         POINT pt{x, y};
         ClientToScreen(g_app.hwnd, &pt);
         ShowAppMenu(pt);
+        return;
+    }
+
+    // Stop a running hunt by mouse alone. Esc does the same; a cancel that
+    // only a keyboard can reach is not much of a cancel.
+    if (g_app.dupeRunning && g_app.dupeStopHit.w > 0.0f &&
+        g_app.dupeStopHit.contains(fx, fy)) {
+        g_app.dupeProgress.cancel.store(true, std::memory_order_relaxed);
         return;
     }
 
