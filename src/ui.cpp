@@ -242,7 +242,15 @@ struct App {
     bool                     browseAsc = false;
     float                    browseScroll = 0.0f;
     std::vector<const Node*> browseOrder;
-    const Node*              browseSel = nullptr;
+    const Node*              browseSel = nullptr;   // the lead row
+    std::vector<const Node*> browseSelSet;          // everything selected
+    int                      browseAnchor = -1;     // shift-range start
+    // Inline rename: a real EDIT child over the name cell, because a real
+    // control brings the caret, selection and IME for free. Strings only,
+    // so a tree swap mid-edit cancels cleanly and can never dangle.
+    HWND                     renameEdit = nullptr;
+    std::wstring             renameParent;
+    std::wstring             renameOld;
     std::vector<Rect>        browseRowHits;     // visible rows only
     std::vector<const Node*> browseRowNodes;    // parallel to hits
     Rect                     browseHeadHits[4];
@@ -581,6 +589,15 @@ static void DropTreeReferences() {
     g_app.browseRowNodes.clear();
     g_app.browseSel = nullptr;
     g_app.browseScroll = 0.0f;
+    g_app.browseSelSet.clear();
+    g_app.browseAnchor = -1;
+    if (g_app.renameEdit) {
+        const HWND edit = g_app.renameEdit;
+        g_app.renameEdit = nullptr;
+        DestroyWindow(edit);
+        g_app.renameOld.clear();
+        g_app.renameParent.clear();
+    }
     // Duplicate results deliberately survive: every Node pointer is
     // stripped before the hunt starts, so the report is owned strings only,
     // and losing an expensive answer just because the user looked at
@@ -1624,6 +1641,150 @@ static void DrawSidebar(const Rect& area) {
     }
 }
 
+// Commit or cancel the inline rename. Commit validates the typed name
+// with the same rule every name off a disk passes, renames on disk, then
+// patches the tree by walking to the parent by name, so a tree swapped
+// mid-edit simply misses and the next scan shows the truth.
+static void EndRename(bool commit) {
+    if (!g_app.renameEdit) return;
+    wchar_t buf[512] = {};
+    GetWindowTextW(g_app.renameEdit, buf, 511);
+    const HWND edit = g_app.renameEdit;
+    g_app.renameEdit = nullptr;   // re-entry guard: WM_KILLFOCUS fires here
+    DestroyWindow(edit);
+
+    const std::wstring newName(buf);
+    const std::wstring oldName = g_app.renameOld;
+    const std::wstring parent  = g_app.renameParent;
+    g_app.renameOld.clear();
+    g_app.renameParent.clear();
+
+    if (!commit || newName.empty() || newName == oldName) return;
+    if (!IsSafeNodeName(newName)) {
+        MessageBoxW(g_app.hwnd,
+                    L"That name will not work: it contains a character "
+                    L"Windows reserves, or ends in a dot or space.",
+                    L"Spindle", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    std::wstring oldFull = parent;
+    AppendComponent(oldFull, oldName);
+    std::wstring newFull = parent;
+    AppendComponent(newFull, newName);
+    if (!MoveFileW(oldFull.c_str(), newFull.c_str())) {
+        MessageBoxW(g_app.hwnd,
+                    L"Could not rename it. A file with that name may "
+                    L"already exist, or the file may be in use.",
+                    L"Spindle", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Patch the tree in place so the list shows the new name without a
+    // rescan, then refresh the cache from the patched tree so the next
+    // launch agrees.
+    if (g_app.result) {
+        Node* cur = &g_app.result->root;
+        bool onPath =
+            lstrcmpiW(parent.c_str(), cur->name.c_str()) == 0;
+        if (!onPath && parent.size() > cur->name.size()) {
+            // Walk the parent's components below the root.
+            std::wstring rel = parent.substr(cur->name.size());
+            while (!rel.empty() && rel.front() == L'\\') rel.erase(0, 1);
+            onPath = true;
+            size_t pos = 0;
+            while (onPath && pos < rel.size()) {
+                const size_t sep = rel.find(L'\\', pos);
+                const std::wstring comp =
+                    (sep == std::wstring::npos)
+                        ? rel.substr(pos)
+                        : rel.substr(pos, sep - pos);
+                pos = (sep == std::wstring::npos) ? rel.size() : sep + 1;
+                if (comp.empty()) continue;
+                Node* next = nullptr;
+                for (Node& c : cur->children) {
+                    if (c.dir &&
+                        lstrcmpiW(c.name.c_str(), comp.c_str()) == 0) {
+                        next = &c;
+                        break;
+                    }
+                }
+                if (!next) onPath = false;
+                else cur = next;
+            }
+        }
+        if (onPath) {
+            for (Node& c : cur->children) {
+                if (lstrcmpiW(c.name.c_str(), oldName.c_str()) == 0) {
+                    c.name = newName;
+                    break;
+                }
+            }
+            if (g_app.settings.keepCaches) {
+                SaveScanCache(g_app.result->root.name, *g_app.result);
+            }
+        }
+    }
+    g_app.browseOrder.clear();
+    g_app.panelDirty = true;
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK RenameEditProc(HWND h, UINT msg, WPARAM wp,
+                                       LPARAM lp) {
+    const WNDPROC prev = reinterpret_cast<WNDPROC>(
+        GetWindowLongPtrW(h, GWLP_USERDATA));
+    switch (msg) {
+        case WM_KEYDOWN:
+            if (wp == VK_RETURN) { EndRename(true); return 0; }
+            if (wp == VK_ESCAPE) { EndRename(false); return 0; }
+            break;
+        case WM_KILLFOCUS:
+            // Clicking elsewhere commits, the way Explorer commits.
+            EndRename(true);
+            return 0;
+        default:
+            break;
+    }
+    return prev ? CallWindowProcW(prev, h, msg, wp, lp)
+                : DefWindowProcW(h, msg, wp, lp);
+}
+
+// Open the editor over a browse row's name cell. DIP rect in, pixels out.
+static void BeginRename(const std::wstring& parent,
+                        const std::wstring& name, const Rect& rowDip) {
+    EndRename(false);
+    const float sc = (g_app.dpiScale > 0.0f) ? g_app.dpiScale : 1.0f;
+    const int x = static_cast<int>((rowDip.x + 12.0f) * sc);
+    const int y = static_cast<int>(rowDip.y * sc);
+    const int w = static_cast<int>(rowDip.w * 0.45f * sc);
+    const int h = static_cast<int>(rowDip.h * sc);
+    const HWND edit = CreateWindowExW(
+        0, L"EDIT", name.c_str(),
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, x, y, w, h, g_app.hwnd,
+        nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!edit) return;
+    SendMessageW(edit, WM_SETFONT,
+                 reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+                 TRUE);
+    const LONG_PTR prev = SetWindowLongPtrW(
+        edit, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(RenameEditProc));
+    SetWindowLongPtrW(edit, GWLP_USERDATA, prev);
+    SendMessageW(edit, EM_SETSEL, 0, -1);
+    SetFocus(edit);
+    g_app.renameEdit   = edit;
+    g_app.renameParent = parent;
+    g_app.renameOld    = name;
+}
+
+static bool BrowseSelected(const Node* n) {
+    for (const Node* m : g_app.browseSelSet) {
+        if (m == n) return true;
+    }
+    return false;
+}
+
 namespace browse {
 constexpr float kHeadH = 26.0f;
 constexpr float kRowH  = 22.0f;
@@ -1747,7 +1908,7 @@ static void DrawBrowse(const Rect& area) {
         const Rect row{area.x, y, area.w - 12.0f, browse::kRowH};
 
         const bool hot = row.contains(g_app.mouseX, g_app.mouseY);
-        if (nd == g_app.browseSel) {
+        if (BrowseSelected(nd)) {
             FillRect(row, theme::kSlabHi, 0.9f);
         } else if (hot) {
             FillRect(row, theme::kSlabHi, 0.45f);
@@ -2144,6 +2305,26 @@ static void DrawStatus(const Rect& area) {
 
     const float pad = layout::kPad;
 
+    if (g_app.browse && g_app.browseSelSet.size() > 1) {
+        uint64_t selBytes = 0;
+        uint64_t selFiles = 0;
+        for (const Node* n : g_app.browseSelSet) {
+            selBytes = SatAdd(selBytes, n->size);
+            selFiles += n->dir ? n->files : 1u;
+        }
+        DrawText(FormatCount(g_app.browseSelSet.size()) +
+                     L" selected  \u00B7  " + FormatFiles(selFiles),
+                 g_app.fmtSmall.get(),
+                 Rect{area.x + pad, area.y + 8.0f,
+                      area.w - pad * 2 - 220.0f, layout::kLineSmall},
+                 theme::kType);
+        DrawText(FormatSize(selBytes), g_app.fmtSmall.get(),
+                 Rect{area.right() - 214.0f, area.y + 8.0f, 200.0f,
+                      layout::kLineSmall},
+                 theme::kSignal, 1.0f, true);
+        return;
+    }
+
     if (g_app.browse && g_app.browseSel) {
         std::wstring full = TrailPath(g_app.trail);
         AppendComponent(full, g_app.browseSel->name);
@@ -2452,15 +2633,15 @@ static void Render() {
 
 // ------------------------------------------------------------------ commands
 
-static void CopyPathToClipboard(const std::wstring& path) {
-    if (path.empty()) return;
+static void CopyTextToClipboard(const std::wstring& text) {
+    if (text.empty()) return;
     if (!OpenClipboard(g_app.hwnd)) return;
 
     EmptyClipboard();
-    const size_t bytes = (path.size() + 1) * sizeof(wchar_t);
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
     if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
         if (void* dst = GlobalLock(h)) {
-            memcpy(dst, path.c_str(), bytes);
+            memcpy(dst, text.c_str(), bytes);
             GlobalUnlock(h);
             if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
         } else {
@@ -2468,6 +2649,10 @@ static void CopyPathToClipboard(const std::wstring& path) {
         }
     }
     CloseClipboard();
+}
+
+static void CopyPathToClipboard(const std::wstring& path) {
+    CopyTextToClipboard(path);
 }
 
 static void RevealInExplorer(const std::wstring& path) {
@@ -3320,7 +3505,8 @@ static void ShowRowMenu(int rowIndex, POINT screenPt) {
 static void ShowNodeMenu(const std::wstring& path, uint64_t nodeSize,
                          uint32_t nodeFiles, bool nodeDir,
                          std::vector<std::wstring> newTabComps,
-                         POINT screenPt) {
+                         POINT screenPt,
+                         const Rect* renameRow = nullptr) {
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -3329,6 +3515,9 @@ static void ShowNodeMenu(const std::wstring& path, uint64_t nodeSize,
     AppendMenuW(menu, MF_STRING, 2, L"Copy path");
     if (nodeDir) {
         AppendMenuW(menu, MF_STRING, 6, L"Open in a new tab");
+    }
+    if (renameRow != nullptr) {
+        AppendMenuW(menu, MF_STRING, 7, L"Rename...");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     // No keyboard shortcut on purpose: deleting should take deliberate
@@ -3349,6 +3538,16 @@ static void ShowNodeMenu(const std::wstring& path, uint64_t nodeSize,
     if (cmd == 6 && nodeDir) {
         OpenViewTab(CurrentRootPath(), g_app.selected,
                     std::move(newTabComps));
+        return;
+    }
+    if (cmd == 7 && renameRow != nullptr) {
+        const size_t cut = path.find_last_of(L'\\');
+        if (cut != std::wstring::npos && cut > 0) {
+            // Keep the separator: "D:\" is the root's whole name, and the
+            // tree patch walks by comparing against it.
+            BeginRename(path.substr(0, cut + 1), path.substr(cut + 1),
+                        *renameRow);
+        }
         return;
     }
     if (cmd == 1) {
@@ -3832,13 +4031,59 @@ static void OnLeftClick(int x, int y) {
         }
         for (size_t i = 0; i < g_app.browseRowHits.size() &&
                            i < g_app.browseRowNodes.size(); ++i) {
-            if (g_app.browseRowHits[i].contains(fx, fy)) {
-                g_app.browseSel = g_app.browseRowNodes[i];
-                InvalidateRect(g_app.hwnd, nullptr, FALSE);
-                return;
+            if (!g_app.browseRowHits[i].contains(fx, fy)) continue;
+            const Node* nd = g_app.browseRowNodes[i];
+            if (!nd) return;   // the ".." row does not select
+            const bool ctrl =
+                (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shiftHeld =
+                (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            int orderIdx = -1;
+            for (size_t k = 0; k < g_app.browseOrder.size(); ++k) {
+                if (g_app.browseOrder[k] == nd) {
+                    orderIdx = static_cast<int>(k);
+                    break;
+                }
             }
+            if (shiftHeld && g_app.browseAnchor >= 0 && orderIdx >= 0) {
+                const int lo = std::min(g_app.browseAnchor, orderIdx);
+                const int hi = std::max(g_app.browseAnchor, orderIdx);
+                g_app.browseSelSet.clear();
+                for (int k = lo; k <= hi; ++k) {
+                    g_app.browseSelSet.push_back(
+                        g_app.browseOrder[static_cast<size_t>(k)]);
+                }
+            } else if (ctrl) {
+                bool removed = false;
+                for (size_t k = 0; k < g_app.browseSelSet.size(); ++k) {
+                    if (g_app.browseSelSet[k] == nd) {
+                        g_app.browseSelSet.erase(
+                            g_app.browseSelSet.begin() +
+                            static_cast<long>(k));
+                        removed = true;
+                        break;
+                    }
+                }
+                if (!removed) g_app.browseSelSet.push_back(nd);
+                g_app.browseAnchor = orderIdx;
+            } else {
+                g_app.browseSelSet.assign(1, nd);
+                g_app.browseAnchor = orderIdx;
+            }
+            g_app.browseSel = nd;
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            return;
         }
-        if (fx >= layout::kSidebar) return;   // empty list space
+        if (fx >= layout::kSidebar) {
+            // Empty list space: the click lands nowhere, so nothing stays
+            // selected. Explorer's grammar.
+            if (!g_app.browseSelSet.empty()) {
+                g_app.browseSelSet.clear();
+                g_app.browseSel = nullptr;
+                InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            }
+            return;
+        }
     }
 
     for (size_t i = 0; i < g_app.crumbHits.size(); ++i) {
@@ -4384,6 +4629,76 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (!g_app.browseRowHits[i].contains(fx, fy)) continue;
                     const Node* nd = g_app.browseRowNodes[i];
                     if (!nd) return 0;   // the ".." row has no menu
+                    POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    ClientToScreen(hwnd, &rp);
+
+                    // A right-click inside a bigger selection acts on the
+                    // whole selection, the way every file list does.
+                    if (g_app.browseSelSet.size() > 1 &&
+                        BrowseSelected(nd)) {
+                        // Snapshot before the modal loop: the set holds
+                        // tree pointers and the tree can swap mid-menu.
+                        std::vector<std::wstring> paths;
+                        uint64_t bytes = 0;
+                        uint64_t files = 0;
+                        for (const Node* n2 : g_app.browseSelSet) {
+                            std::wstring f2 = TrailPath(g_app.trail);
+                            AppendComponent(f2, n2->name);
+                            paths.push_back(std::move(f2));
+                            bytes = SatAdd(bytes, n2->size);
+                            files += n2->dir ? n2->files : 1u;
+                        }
+                        HMENU menu = CreatePopupMenu();
+                        if (!menu) return 0;
+                        AppendMenuW(menu, MF_STRING, 1,
+                                    (L"Copy " +
+                                     FormatCount(paths.size()) +
+                                     L" paths").c_str());
+                        AppendMenuW(menu, MF_STRING, 2,
+                                    (L"Recycle " +
+                                     FormatCount(paths.size()) +
+                                     L" items...").c_str());
+                        const int cmd = TrackPopupMenu(
+                            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, rp.x,
+                            rp.y, 0, g_app.hwnd, nullptr);
+                        DestroyMenu(menu);
+                        if (cmd == 1) {
+                            std::wstring all;
+                            for (const std::wstring& p2 : paths) {
+                                all += p2;
+                                all += L"\r\n";
+                            }
+                            CopyTextToClipboard(all);
+                        } else if (cmd == 2) {
+                            const std::wstring ask =
+                                L"Move " + FormatCount(paths.size()) +
+                                L" items to the Recycle Bin?\n\n" +
+                                FormatFiles(files) + L", " +
+                                FormatSize(bytes) + L" in total.";
+                            if (MessageBoxW(g_app.hwnd, ask.c_str(),
+                                            L"Spindle",
+                                            MB_YESNO | MB_DEFBUTTON2 |
+                                                MB_ICONWARNING) ==
+                                IDYES) {
+                                size_t done = 0;
+                                for (const std::wstring& p2 : paths) {
+                                    if (RecycleToBin(p2)) ++done;
+                                }
+                                std::wstring said =
+                                    L"Recycled " + FormatCount(done) +
+                                    L" of " + FormatCount(paths.size()) +
+                                    L" items.";
+                                MessageBoxW(g_app.hwnd, said.c_str(),
+                                            L"Spindle",
+                                            MB_OK | MB_ICONINFORMATION);
+                                if (done > 0 && g_app.selected >= 0) {
+                                    StartScan(g_app.selected, false);
+                                }
+                            }
+                        }
+                        return 0;
+                    }
+
                     std::wstring full = TrailPath(g_app.trail);
                     AppendComponent(full, nd->name);
                     std::vector<std::wstring> comps;
@@ -4393,10 +4708,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         }
                     }
                     comps.push_back(nd->name);
-                    POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-                    ClientToScreen(hwnd, &rp);
+                    const Rect rowRect = g_app.browseRowHits[i];
                     ShowNodeMenu(full, nd->size, nd->files, nd->dir,
-                                 std::move(comps), rp);
+                                 std::move(comps), rp, &rowRect);
                     return 0;
                 }
             }
