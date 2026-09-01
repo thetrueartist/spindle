@@ -66,6 +66,10 @@ they cannot sign one. The updater fails closed on anything unsigned,
 altered, replayed or unreachable, and it never installs anything without
 being asked.
 
+Signing happens on the maintainer's machine, never in CI. A signing key
+held by GitHub Actions could be used by anyone who compromised the
+repository, so it would defeat the only guarantee this scheme offers.
+
 ## Build integrity
 
 Releases are built by GitHub Actions from a tagged commit and carry a

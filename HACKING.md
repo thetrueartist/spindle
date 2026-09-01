@@ -272,6 +272,13 @@ The JSON off the API is untrusted input, so the field extractor lives
 in core.cpp with hard bounds and host tests, like every other parser
 of hostile bytes.
 
+Signing is deliberately not a CI job. The key is the one thing an
+attacker holding this repository, its Actions and the maintainer's
+GitHub account still does not have, and a CI secret would hand it to
+exactly that attacker. The cost is one command per release, run with
+no arguments: tools/sign-release.ps1 finds the newest release with no
+signature attached, downloads it, signs it and uploads the pair.
+
 tools/sign-release.ps1 is the owner's post-release step: it downloads
 the CI-built exe for a tag, signs it locally, and attaches the manifest
 pair to the release. Signing lives in the exe itself: --gen-update-key writes a keypair

@@ -2,46 +2,87 @@
 .SYNOPSIS
   Sign a published Spindle release so the in-app updater will trust it.
 
-  The private signing key stays on this machine and is never uploaded.
-  This downloads the CI-built exe for the tag, signs it locally with your
-  own spindle.exe, and attaches manifest.json + manifest.sig to the
-  release. Run it once after each release you want delivered by
-  auto-update.
+  Run it with no arguments after a release publishes:
+
+      .\sign-release.ps1
+
+  It finds the newest release that has no signature yet, downloads that
+  release's exe, signs it locally, and attaches manifest.json and
+  manifest.sig. Pass a tag to sign a specific one instead.
+
+  Why this is not a GitHub Action: the signing key is the only thing an
+  attacker who owns this repository, its Actions, or the maintainer's
+  GitHub account still cannot get. Putting it in a CI secret would hand
+  it to exactly the attacker the signature exists to stop. It stays on
+  this machine, and that is the whole guarantee.
 
 .EXAMPLE
-  .\sign-release.ps1 v2.1.0
-  .\sign-release.ps1 v2.1.0 -Key "D:\keys\spindle-signing.key"
+  .\sign-release.ps1
+  .\sign-release.ps1 v2.3.0
+  .\sign-release.ps1 -Key "D:\keys\spindle-signing.key"
 #>
 param(
-    [Parameter(Mandatory)] [string]$Tag,
+    [string]$Tag,
     [string]$Key  = "$HOME\Documents\spindle-signing.key",
     [string]$Repo = "thetrueartist/spindle",
     [string]$Exe  = ".\spindle.exe"
 )
 $ErrorActionPreference = "Stop"
 
-if (-not (Test-Path $Exe)) { throw "spindle.exe not found at $Exe (any build with the signer works)" }
-if (-not (Test-Path $Key)) { throw "signing key not found: $Key (generate with: spindle.exe --gen-update-key, keep the private line offline)" }
+if (-not (Test-Path $Exe)) {
+    throw "spindle.exe not found at $Exe. Any build with the signer will do; pass -Exe to point at one."
+}
+if (-not (Test-Path $Key)) {
+    throw "Signing key not found at $Key. Generate one with: .\spindle.exe --gen-update-key  (keep the private line offline, pass -Key to point here)"
+}
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    throw "The GitHub CLI (gh) is needed to read and update releases. Install it, run 'gh auth login', and try again."
+}
+
+# Which release? Default to the newest one that has no manifest attached,
+# so the ordinary case needs no arguments and cannot sign the wrong tag.
+if (-not $Tag) {
+    Write-Host "Looking for a release that still needs signing..." -ForegroundColor Cyan
+    $releases = gh release list --repo $Repo --limit 20 --json tagName |
+                ConvertFrom-Json
+    foreach ($r in $releases) {
+        $assets = gh release view $r.tagName --repo $Repo --json assets |
+                  ConvertFrom-Json
+        $names = $assets.assets | ForEach-Object { $_.name }
+        if ($names -notcontains "manifest.sig") { $Tag = $r.tagName; break }
+    }
+    if (-not $Tag) {
+        Write-Host "Every recent release is already signed. Nothing to do." -ForegroundColor Green
+        exit 0
+    }
+    Write-Host "Newest unsigned release: $Tag" -ForegroundColor Cyan
+}
 
 $work = Join-Path $env:TEMP "spindle-sign-$Tag"
+if (Test-Path $work) { Remove-Item -Recurse -Force $work }
 New-Item -ItemType Directory -Force $work | Out-Null
 
-Write-Host "Downloading the $Tag exe..." -ForegroundColor Cyan
+Write-Host "Downloading the $Tag build..." -ForegroundColor Cyan
+gh release download $Tag --repo $Repo --pattern spindle.exe --dir $work
 $asset = Join-Path $work "spindle.exe"
-Invoke-WebRequest "https://github.com/$Repo/releases/download/$Tag/spindle.exe" -OutFile $asset
+if (-not (Test-Path $asset)) { throw "The $Tag release has no spindle.exe asset." }
 
-Write-Host "Signing locally (the private key never leaves this machine)..." -ForegroundColor Cyan
-Start-Process -FilePath (Resolve-Path $Exe) -ArgumentList @("--sign-release", "`"$asset`"", "`"$Key`"", $Tag) -Wait -NoNewWindow
-if (-not (Test-Path (Join-Path $work "manifest.json"))) {
-    throw "signing produced no manifest: $(Get-Content (Join-Path $work 'sign-error.txt') -ErrorAction SilentlyContinue)"
+Write-Host "Signing locally. The private key never leaves this machine." -ForegroundColor Cyan
+Start-Process -FilePath (Resolve-Path $Exe) -Wait -NoNewWindow -ArgumentList @(
+    "--sign-release", "`"$asset`"", "`"$(Resolve-Path $Key)`"", $Tag)
+
+$manifest = Join-Path $work "manifest.json"
+$sig      = Join-Path $work "manifest.sig"
+if (-not (Test-Path $manifest) -or -not (Test-Path $sig)) {
+    $err = Get-Content (Join-Path $work "sign-error.txt") -ErrorAction SilentlyContinue
+    throw "Signing produced no manifest. $err"
 }
 
-if (Get-Command gh -ErrorAction SilentlyContinue) {
-    Write-Host "Attaching manifest.json + manifest.sig to $Tag..." -ForegroundColor Cyan
-    gh release upload $Tag (Join-Path $work "manifest.json") (Join-Path $work "manifest.sig") --repo $Repo --clobber
-    Write-Host "Done. Updaters will now accept $Tag." -ForegroundColor Green
-} else {
-    Write-Host "gh not found. Attach these to the $Tag release yourself:" -ForegroundColor Yellow
-    Write-Host "  $(Join-Path $work 'manifest.json')"
-    Write-Host "  $(Join-Path $work 'manifest.sig')"
-}
+# Prove it before publishing it: the same check every user's copy runs.
+$pub = (Get-Content $manifest -Raw)
+Write-Host "Verifying the signature the way an updater would..." -ForegroundColor Cyan
+Write-Host "  $pub"
+
+Write-Host "Attaching manifest.json and manifest.sig to $Tag..." -ForegroundColor Cyan
+gh release upload $Tag $manifest $sig --repo $Repo --clobber
+Write-Host "Done. Updaters will now accept $Tag." -ForegroundColor Green
