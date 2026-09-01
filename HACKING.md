@@ -161,6 +161,21 @@ object and must be restored after any non-leading draw.
 **ICO frames: DIB up to 128, PNG only at 256.** Windows will not decode PNG at
 small sizes, and `LoadImage` fails silently into the stock Windows icon.
 
+## Launch prefetch
+
+At startup the fixed drives that are not on screen are walked one at a time
+by a background scan whose only product is the cache file - the tree is
+freed on the worker thread and never shown. Invariants: at most one walk at
+a time; it is cancelled (and the drive re-queued) the moment a foreground
+scan or a duplicate hunt wants the disk; removable and network volumes are
+never queued; the whole thing is off when `keep_caches` or `prefetch_all`
+is. A cache younger than five minutes (`kFreshCacheMs`) is served without
+the revalidating rescan, which is what makes clicking between drives free.
+The prefetch has its own `Progress` and generation counter so cancelling it
+can never touch the foreground scan's flags, and `CancelPrefetch` bumps the
+generation before joining so the already-posted completion message is
+recognised as stale.
+
 ## Security posture
 
 The threat model is that every byte off a disk — names, sizes, on-disk

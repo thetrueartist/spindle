@@ -43,12 +43,17 @@ is locked, nothing is read, and files held under an exclusive kernel lock —
 **Reparse points are never traversed.** Junctions and symlinks are recorded
 but not followed, so nothing loops and nothing is counted twice.
 
-**Click a drive you've scanned before, see it immediately.** Finished scans
-are cached under `%LOCALAPPDATA%\Spindle`, so revisiting a drive puts the
-last map up in milliseconds while a fresh scan revalidates behind it — the
-status bar reads `cached 2h ago · rescanning` until it has. The cache is
-keyed to the volume serial and parsed with the same suspicion as everything
-else that comes off a disk.
+**Every drive is ready before you click it.** At launch, the fixed drives
+are walked once, one at a time, in the background — the status bar notes it
+— so within a few minutes of starting, every drive answers a click
+instantly. Finished scans are cached under `%LOCALAPPDATA%\Spindle`; a
+cache under five minutes old is served as-is, an older one goes up
+immediately while a rescan revalidates behind it (`cached 2h ago ·
+rescanning`), and F5 always forces a fresh walk. Removable and network
+drives are never read unprompted, the walk yields the moment you ask for
+anything, and the `···` menu turns it off. The cache is keyed to the volume
+serial and parsed with the same suspicion as everything else that comes off
+a disk.
 
 **Filenames are treated as hostile input.** See below.
 

@@ -440,6 +440,7 @@ std::vector<Volume> EnumerateVolumes() {
         }
 
         Volume v;
+        v.fixed = (type == DRIVE_FIXED);
         v.path = rootPath;
 
         wchar_t label[MAX_PATH + 1] = {};

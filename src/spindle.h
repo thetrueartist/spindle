@@ -436,6 +436,7 @@ ForceRemoveResult ForceRemove(const std::wstring& path,
 struct Settings {
     bool keepCaches     = true;   // write and load .spincache files
     bool resumeOnLaunch = true;   // open the freshest cached drive at start
+    bool prefetchAll    = true;   // read the other fixed drives at launch
 };
 
 inline constexpr size_t kMaxSettingsBytes = 4096;
@@ -481,6 +482,7 @@ struct Volume {
     uint64_t     capacity = 0;
     uint64_t     free     = 0;
     bool         ready    = false;
+    bool         fixed    = false;  // DRIVE_FIXED: safe to read unprompted
 };
 
 std::vector<Volume> EnumerateVolumes();

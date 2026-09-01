@@ -1979,7 +1979,8 @@ static void TestSettings() {
     std::printf("Settings\n");
 
     const Settings d;
-    CHECK(d.keepCaches && d.resumeOnLaunch, "defaults are on");
+    CHECK(d.keepCaches && d.resumeOnLaunch && d.prefetchAll,
+          "defaults are on");
     CHECK(ParseSettings(nullptr, 0).keepCaches, "null input keeps defaults");
 
     const char* junk = "\xFF\xFE not a settings file == = \n\n=";
@@ -2000,6 +2001,13 @@ static void TestSettings() {
     SerializeSettings(s, buf);
     r = ParseSettings(buf.data(), buf.size());
     CHECK(r.keepCaches && !r.resumeOnLaunch, "round-trips the other way");
+
+    s.prefetchAll = false;
+    SerializeSettings(s, buf);
+    r = ParseSettings(buf.data(), buf.size());
+    CHECK(!r.prefetchAll, "prefetch_all round-trips off");
+    CHECK(ParseSettings(nullptr, 0).prefetchAll,
+          "prefetch_all defaults on for an old settings file");
 
     const char* mixed = "unknown_key=7\r\nkeep_caches=0\r\nfuture=stuff\n";
     r = ParseSettings(reinterpret_cast<const uint8_t*>(mixed), strlen(mixed));

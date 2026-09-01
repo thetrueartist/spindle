@@ -1697,6 +1697,8 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 s.keepCaches = value;
             } else if (key == "resume_on_launch") {
                 s.resumeOnLaunch = value;
+            } else if (key == "prefetch_all") {
+                s.prefetchAll = value;
             }
         }
         line.clear();
@@ -1708,7 +1710,8 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
     out.clear();
     const std::string text =
         std::string("keep_caches=") + (s.keepCaches ? "1" : "0") +
-        "\nresume_on_launch=" + (s.resumeOnLaunch ? "1" : "0") + "\n";
+        "\nresume_on_launch=" + (s.resumeOnLaunch ? "1" : "0") +
+        "\nprefetch_all=" + (s.prefetchAll ? "1" : "0") + "\n";
     out.assign(text.begin(), text.end());
 }
 

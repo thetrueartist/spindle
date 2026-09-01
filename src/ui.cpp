@@ -131,8 +131,14 @@ constexpr float kLegendRowH = 22.0f;
 // Must match res/spindle.rc.
 constexpr WORD IDI_APPICON = 1;
 
-constexpr UINT WM_SCAN_DONE  = WM_APP + 1;
-constexpr UINT WM_DUPES_DONE = WM_APP + 2;
+constexpr UINT WM_SCAN_DONE     = WM_APP + 1;
+constexpr UINT WM_DUPES_DONE    = WM_APP + 2;
+constexpr UINT WM_PREFETCH_DONE = WM_APP + 3;
+
+// A cache this young is served without a revalidating rescan: the launch
+// prefetch (or a scan moments ago) already walked the drive, and walking it
+// again on every click buys nothing but disk noise. F5 always forces one.
+constexpr uint64_t kFreshCacheMs = 5u * 60u * 1000u;
 constexpr UINT_PTR kTimerId = 1;
 
 // Durations. Deliberately short: the job of these is to show what moved, not
@@ -145,7 +151,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.7.0";
+constexpr const wchar_t* kAppVersion = L"1.8.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -248,6 +254,16 @@ struct App {
     HANDLE                dupeWorker = nullptr;
     bool                  dupeRunning = false;
     std::atomic<uint64_t> dupeGen{0};
+    // The launch prefetch: the fixed drives not on screen, walked one at a
+    // time in the background so every drive has a fresh cache without being
+    // clicked. It owns nothing the interface shows - its whole product is
+    // the cache file - so cancelling one loses nothing but the walk.
+    std::vector<std::wstring> prefetchQueue;
+    HANDLE                prefetchWorker = nullptr;
+    bool                  prefetching = false;
+    std::wstring          prefetchRoot;
+    Progress              prefetchProgress;
+    std::atomic<uint64_t> prefetchGen{0};
     std::vector<Rect>     panelTabs;
     std::vector<Rect>     rowHits;
     bool                  panelDirty = true;
@@ -477,6 +493,14 @@ static void DropTreeReferences() {
 
 static void JoinDupeWorker();
 
+static uint64_t UnixNowMs() {
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    const uint64_t ticks =
+        (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return ticks / 10000 - 11644473600000ULL;
+}
+
 static void JoinWorker() {
     if (g_app.worker) {
         g_app.progress.cancel.store(true, std::memory_order_relaxed);
@@ -494,6 +518,13 @@ struct ScanRequest {
     // Copied from settings at start time so the scan thread never reads the
     // live settings struct the UI thread may be editing.
     bool         keepCache = true;
+    // Which Progress the walk reports through. The foreground scan and the
+    // launch prefetch each own one, so cancelling either never touches the
+    // other's flags.
+    Progress*    progress = nullptr;
+    // A prefetch exists to leave a cache file behind: the tree is freed on
+    // this thread and only a completion note is posted.
+    bool         prefetch = false;
 };
 
 // Scan thread entry. Wrapped end to end: an exception escaping here would
@@ -506,16 +537,26 @@ unsigned __stdcall ScanThread(void* param) {
         GetNativeSystemInfo(&si);
 
         auto res = std::make_unique<ScanResult>(
-            Scan(req->root, si.dwNumberOfProcessors, &g_app.progress));
+            Scan(req->root, si.dwNumberOfProcessors, req->progress));
 
         // Cache the tree while this thread still owns it, before the post
         // hands it to the UI thread. Cancelled or faulted scans are not
         // saved: a truncated tree served instantly next launch would look
         // authoritative and be wrong.
         if (req->keepCache &&
-            !g_app.progress.cancel.load(std::memory_order_relaxed) &&
+            !req->progress->cancel.load(std::memory_order_relaxed) &&
             !res->stats.faulted) {
             SaveScanCache(req->root, *res);
+        }
+
+        if (req->prefetch) {
+            // The cache file was the whole point; the tree dies here, on
+            // the thread that built it, and the post carries only the
+            // generation so the queue can move on.
+            res.reset();
+            PostMessageW(req->hwnd, WM_PREFETCH_DONE,
+                         static_cast<WPARAM>(req->gen), 0);
+            return 0;
         }
 
         // Ownership passes to the UI thread only if the post succeeds. If the
@@ -531,7 +572,9 @@ unsigned __stdcall ScanThread(void* param) {
     } catch (...) {
         // Report failure rather than dying: a null result tells the handler
         // the scan did not complete.
-        PostMessageW(req->hwnd, WM_SCAN_DONE, static_cast<WPARAM>(req->gen), 0);
+        PostMessageW(req->hwnd,
+                     req->prefetch ? WM_PREFETCH_DONE : WM_SCAN_DONE,
+                     static_cast<WPARAM>(req->gen), 0);
     }
     return 0;
 }
@@ -578,6 +621,94 @@ static void JoinDupeWorker() {
     g_app.dupeRunning = false;
 }
 
+// Stop the background walk, now. Bumping the generation first means the
+// completion note the joined thread already posted is recognised as stale
+// and dropped. `requeue` puts the interrupted drive back at the head of the
+// queue - false when whoever is cancelling is about to cover that drive
+// itself.
+static void CancelPrefetch(bool requeue) {
+    if (g_app.prefetchWorker) {
+        g_app.prefetchGen.fetch_add(1);
+        g_app.prefetchProgress.cancel.store(true, std::memory_order_relaxed);
+        WaitForSingleObject(g_app.prefetchWorker, INFINITE);
+        CloseHandle(g_app.prefetchWorker);
+        g_app.prefetchWorker = nullptr;
+        if (requeue && !g_app.prefetchRoot.empty()) {
+            g_app.prefetchQueue.insert(g_app.prefetchQueue.begin(),
+                                       g_app.prefetchRoot);
+        }
+    }
+    g_app.prefetching = false;
+    g_app.prefetchRoot.clear();
+}
+
+// Walk the next queued drive, if nothing that wants the disk is running.
+// Called wherever the disk goes quiet: a scan or hunt finishing, a prefetch
+// completing, launch.
+static void StartPrefetchNext() {
+    if (g_app.prefetchWorker || g_app.prefetchQueue.empty()) return;
+    if (g_app.scanning || g_app.dupeRunning) return;
+    if (!g_app.settings.keepCaches || !g_app.settings.prefetchAll) return;
+
+    const std::wstring root = g_app.prefetchQueue.front();
+    g_app.prefetchQueue.erase(g_app.prefetchQueue.begin());
+
+    g_app.prefetchProgress.files.store(0);
+    g_app.prefetchProgress.dirs.store(0);
+    g_app.prefetchProgress.bytes.store(0);
+    g_app.prefetchProgress.cancel.store(false);
+    g_app.prefetchProgress.done.store(false);
+
+    auto req = std::make_unique<ScanRequest>();
+    req->root      = root;
+    req->hwnd      = g_app.hwnd;
+    req->gen       = g_app.prefetchGen.fetch_add(1) + 1;
+    req->keepCache = true;
+    req->progress  = &g_app.prefetchProgress;
+    req->prefetch  = true;
+
+    const uintptr_t h =
+        _beginthreadex(nullptr, 0, ScanThread, req.get(), 0, nullptr);
+    if (h == 0) return;   // quietly: this work was never asked for out loud
+    static_cast<void>(req.release());  // NOLINT(bugprone-unused-return-value)
+    g_app.prefetchWorker = reinterpret_cast<HANDLE>(h);
+    g_app.prefetching    = true;
+    g_app.prefetchRoot   = root;
+    SetTimer(g_app.hwnd, kTimerId, 33, nullptr);
+}
+
+// Queue every ready fixed drive except `excludeRoot` (the one already on
+// screen). Removable and network drives are never touched unprompted -
+// spinning up a sleeping USB disk or hammering a share nobody asked about
+// is exactly what this program promises not to do. Cacheless drives go
+// first; the rest oldest cache first.
+static void QueueLaunchPrefetch(const std::wstring& excludeRoot) {
+    if (!g_app.settings.keepCaches || !g_app.settings.prefetchAll) return;
+
+    struct Entry { std::wstring root; uint64_t mtime; };
+    std::vector<Entry> entries;
+    for (const Volume& v : g_app.volumes) {
+        if (!v.ready || !v.fixed || v.path == excludeRoot) continue;
+        uint64_t mtime = 0;   // 0 = no cache yet = scan it first
+        const std::wstring cp = CachePathForVolume(v.path);
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!cp.empty() &&
+            GetFileAttributesExW(cp.c_str(), GetFileExInfoStandard, &fad)) {
+            mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime)
+                     << 32) |
+                    fad.ftLastWriteTime.dwLowDateTime;
+        }
+        entries.push_back(Entry{v.path, mtime});
+    }
+    std::stable_sort(entries.begin(), entries.end(),
+                     [](const Entry& a, const Entry& b) {
+                         return a.mtime < b.mtime;
+                     });
+    g_app.prefetchQueue.clear();
+    for (Entry& e : entries) g_app.prefetchQueue.push_back(std::move(e.root));
+    StartPrefetchNext();
+}
+
 static void StartScanPath(const std::wstring& root, int volumeIndex,
                           bool useCache) {
     if (root.empty()) return;
@@ -588,6 +719,14 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     // showing drive B.
     JoinDupeWorker();
     g_app.dupeGen.fetch_add(1);
+
+    // The prefetch yields the disk to anything the user actually asked for.
+    // Its interrupted drive goes back to the head of the queue - unless it
+    // is the very drive this scan is about to cover.
+    CancelPrefetch(g_app.prefetchRoot != root);
+    g_app.prefetchQueue.erase(std::remove(g_app.prefetchQueue.begin(),
+                                          g_app.prefetchQueue.end(), root),
+                              g_app.prefetchQueue.end());
 
     // Order matters: everything that points into the old tree is dropped
     // before the tree itself is freed.
@@ -612,6 +751,17 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
             g_app.panelDirty   = true;
             g_app.showingCache = true;
             g_app.cacheSavedMs = meta.savedUnixMs;
+
+            // Fresh enough to trust outright - the launch prefetch or a
+            // scan minutes ago walked this drive - so no revalidating
+            // rescan. Clicking between drives costs nothing; F5 forces.
+            const uint64_t now = UnixNowMs();
+            if (meta.savedUnixMs != 0 && now >= meta.savedUnixMs &&
+                now - meta.savedUnixMs <= kFreshCacheMs) {
+                StartPrefetchNext();
+                InvalidateRect(g_app.hwnd, nullptr, FALSE);
+                return;
+            }
         }
     }
 
@@ -1375,11 +1525,7 @@ static void DrawTreemap(const Rect& area) {
 // How old a cached map is, in the coarsest unit that still reads as true.
 // Precision is noise here: the point is "roughly now" versus "last week".
 static std::wstring FormatAge(uint64_t savedUnixMs) {
-    FILETIME ft{};
-    GetSystemTimeAsFileTime(&ft);
-    const uint64_t ticks =
-        (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-    const uint64_t nowMs = ticks / 10000 - 11644473600000ULL;
+    const uint64_t nowMs = UnixNowMs();
     if (nowMs <= savedUnixMs) return L"just now";
 
     const uint64_t s = (nowMs - savedUnixMs) / 1000;
@@ -1387,6 +1533,16 @@ static std::wstring FormatAge(uint64_t savedUnixMs) {
     if (s < 90 * 60) return std::to_wstring(s / 60) + L"m ago";
     if (s < 36 * 3600) return std::to_wstring(s / 3600) + L"h ago";
     return std::to_wstring(s / 86400) + L"d ago";
+}
+
+// One quiet clause, not a progress bar: the walk asks for no attention,
+// but a disk light blinking with no explanation on screen reads as
+// something being hidden.
+static void AppendPrefetchNote(std::wstring& line) {
+    if (!g_app.prefetching || g_app.prefetchRoot.size() < 2) return;
+    line += L"  \u00B7  reading " + g_app.prefetchRoot.substr(0, 2) +
+            L" behind  (" +
+            FormatCount(g_app.prefetchProgress.files.load()) + L" files)";
 }
 
 static void DrawStatus(const Rect& area) {
@@ -1424,6 +1580,7 @@ static void DrawStatus(const Rect& area) {
         if (g_app.scanning) line += L"  \u00B7  rescanning\u2026";
         line += L"  \u00B7  " + FormatCount(s.fileCount) + L" files  \u00B7  " +
                 FormatSize(s.bytes);
+        AppendPrefetchNote(line);
         DrawText(line, g_app.fmtSmall.get(),
                  Rect{area.x + pad, area.y + 8.0f, area.w - pad * 2,
                       layout::kLineSmall},
@@ -1458,6 +1615,7 @@ static void DrawStatus(const Rect& area) {
                     L" unreadable";
         }
         if (s.faulted) line += L"  \u00B7  incomplete";
+        AppendPrefetchNote(line);
         DrawText(line, g_app.fmtSmall.get(),
                  Rect{area.x + pad, area.y + 8.0f, area.w - pad * 2,
                       layout::kLineSmall},
@@ -1465,9 +1623,11 @@ static void DrawStatus(const Rect& area) {
         return;
     }
 
-    DrawText(L"Click a drive to scan it. Click a block to go deeper, "
-             L"backspace to come back. Ctrl+F to search, Ctrl+E to export.",
-             g_app.fmtSmall.get(),
+    std::wstring idle =
+        L"Click a drive to scan it. Click a block to go deeper, "
+        L"backspace to come back. Ctrl+F to search, Ctrl+E to export.";
+    AppendPrefetchNote(idle);
+    DrawText(idle, g_app.fmtSmall.get(),
              Rect{area.x + pad, area.y + 8.0f, area.w - pad * 2,
                   layout::kLineSmall},
              theme::kMute);
@@ -1842,6 +2002,9 @@ static void ShowAppMenu(POINT screenPt) {
                 MF_STRING | (g_app.settings.resumeOnLaunch ? MF_CHECKED : 0u),
                 4, L"Resume last drive at launch");
     AppendMenuW(menu,
+                MF_STRING | (g_app.settings.prefetchAll ? MF_CHECKED : 0u),
+                9, L"Read every drive at launch");
+    AppendMenuW(menu,
                 MF_STRING | (ShellVerbRegistered() ? MF_CHECKED : 0u), 7,
                 L"Show in Explorer's folder menu");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1886,6 +2049,24 @@ static void ShowAppMenu(POINT screenPt) {
         case 4:
             g_app.settings.resumeOnLaunch = !g_app.settings.resumeOnLaunch;
             SaveSettings(g_app.settings);
+            break;
+        case 9:
+            g_app.settings.prefetchAll = !g_app.settings.prefetchAll;
+            SaveSettings(g_app.settings);
+            if (g_app.settings.prefetchAll) {
+                // Turned on mid-session: start now rather than making the
+                // toggle a promise about some future launch.
+                std::wstring cur;
+                if (g_app.selected >= 0 &&
+                    g_app.selected < static_cast<int>(g_app.volumes.size())) {
+                    cur = g_app.volumes[static_cast<size_t>(g_app.selected)]
+                              .path;
+                }
+                QueueLaunchPrefetch(cur);
+            } else {
+                CancelPrefetch(false);
+                g_app.prefetchQueue.clear();
+            }
             break;
         case 5: {
             const std::wstring dir = CacheDirPath();
@@ -2311,6 +2492,7 @@ static void OnLeftClick(int x, int y) {
                         L"Spindle", MB_OK | MB_ICONINFORMATION);
             return;
         }
+        CancelPrefetch(true);   // the hunt reads files; the walk can wait
         auto req = std::make_unique<DupRequest>();
         size_t drives = 0;
         try {
@@ -2397,6 +2579,7 @@ static void OnLeftClick(int x, int y) {
             return;
         }
         if (g_app.dupeRunning) return;   // already hunting
+        CancelPrefetch(true);   // the hunt reads files; the walk can wait
 
         // Choose the candidates here, on the thread that owns the tree, and
         // strip every Node pointer before handing the list over. What the
@@ -2591,14 +2774,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 }
                 StartScanPath(g_app.startPath, match, true);
+                QueueLaunchPrefetch(g_app.startPath);
                 return 0;
             }
 
             // Otherwise open where the user left off: the drive with the
-            // freshest cache comes up mapped immediately and revalidates
-            // behind the map. Only that one - auto-scanning every disk on
-            // launch would spin up hardware nobody asked about, which is
-            // exactly what this program promises not to do.
+            // freshest cache comes up mapped immediately. The other fixed
+            // drives are then walked one at a time in the background, so
+            // within a few minutes of launch every drive answers a click
+            // instantly - see QueueLaunchPrefetch for what is deliberately
+            // never touched, and the menu toggle that turns it all off.
+            std::wstring opened;
             if (g_app.settings.resumeOnLaunch && g_app.settings.keepCaches) {
                 int      best = -1;
                 FILETIME bestTime{};
@@ -2617,8 +2803,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         bestTime = fad.ftLastWriteTime;
                     }
                 }
-                if (best >= 0) StartScan(best);
+                if (best >= 0) {
+                    opened = g_app.volumes[static_cast<size_t>(best)].path;
+                    StartScan(best);
+                }
             }
+            QueueLaunchPrefetch(opened);
             return 0;
         }
 
@@ -2722,6 +2912,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.worker = nullptr;
             }
             g_app.scanning = false;
+            StartPrefetchNext();   // the disk is free again
 
             // A null result means the scan thread aborted rather than
             // finished. Say so instead of showing an empty map.
@@ -2755,6 +2946,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        case WM_PREFETCH_DONE: {
+            // A cancelled walk was already joined - and its generation
+            // bumped - by whoever cancelled it, so a stale note means
+            // nothing is ours to clean up.
+            if (static_cast<uint64_t>(wp) != g_app.prefetchGen.load()) {
+                return 0;
+            }
+            if (g_app.prefetchWorker) {
+                WaitForSingleObject(g_app.prefetchWorker, INFINITE);
+                CloseHandle(g_app.prefetchWorker);
+                g_app.prefetchWorker = nullptr;
+            }
+            g_app.prefetching = false;
+            g_app.prefetchRoot.clear();
+            StartPrefetchNext();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
         case WM_DUPES_DONE: {
             // Adopt first, so a superseded report is freed rather than
             // leaked, then discard it if it is not the one being awaited.
@@ -2769,6 +2979,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.dupeWorker = nullptr;
             }
             g_app.dupeRunning = false;
+            StartPrefetchNext();   // the disk is free again
 
             if (rep) {
                 g_app.dupes = std::move(*rep);
@@ -2900,6 +3111,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_app.scanning) {
                         g_app.progress.cancel.store(true,
                                                     std::memory_order_relaxed);
+                    } else if (g_app.prefetching) {
+                        // Esc means "leave the disk alone", so the whole
+                        // queue goes, not just the drive mid-walk. The next
+                        // launch rebuilds it.
+                        CancelPrefetch(false);
+                        g_app.prefetchQueue.clear();
+                        InvalidateRect(hwnd, nullptr, FALSE);
                     }
                     // Reachable now that the hunt has its own thread; while
                     // it ran on this one the key could never be dispatched.
@@ -2933,6 +3151,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_DESTROY:
             JoinWorker();
+            JoinDupeWorker();
+            CancelPrefetch(false);
             DiscardDeviceResources();
             PostQuitMessage(0);
             return 0;
