@@ -523,6 +523,21 @@ static std::wstring CacheDir() {
     return dir;
 }
 
+// The cache slot is per volume, so only a volume root may read or write
+// it. A folder scan ("Scan with Spindle" on E:\VMware\X) used to save its
+// folder tree into E's slot and the next folder launch loaded it back,
+// whatever folder was actually asked for - with a fresh-enough cache the
+// fast path then never scanned at all, so the window showed the previous
+// folder forever.
+static bool IsVolumeRootPath(const std::wstring& p) {
+    if (p.size() < 2 || p.size() > 3) return false;
+    const wchar_t letter = p[0];
+    const bool alpha = (letter >= L'A' && letter <= L'Z') ||
+                       (letter >= L'a' && letter <= L'z');
+    if (!alpha || p[1] != L':') return false;
+    return p.size() == 2 || p[2] == L'\\';
+}
+
 std::wstring CachePathForVolume(const std::wstring& volumePath) {
     if (volumePath.empty()) return {};
     const std::wstring dir = CacheDir();
@@ -550,6 +565,7 @@ static uint32_t VolumeSerial(const std::wstring& volumePath) {
 
 bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
                    CacheMeta& meta) {
+    if (!IsVolumeRootPath(volumePath)) return false;
     const std::wstring path = CachePathForVolume(volumePath);
     if (path.empty()) return false;
 
@@ -589,10 +605,18 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
     // A cache written for a different volume that now has this letter is
     // worse than no cache: it is confidently wrong.
     if (meta.volumeSerial != VolumeSerial(volumePath)) return false;
+    // A cache rooted somewhere other than the volume root is one an older
+    // build's folder scan wrote into the volume's slot. Refuse and remove
+    // it so the next clean scan replaces it.
+    if (lstrcmpiW(out.root.name.c_str(), volumePath.c_str()) != 0) {
+        DeleteFileW(path.c_str());
+        return false;
+    }
     return true;
 }
 
 bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
+    if (!IsVolumeRootPath(volumePath)) return false;
     const std::wstring path = CachePathForVolume(volumePath);
     if (path.empty()) return false;
 

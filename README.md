@@ -111,7 +111,17 @@ Click a result and Spindle shows the file on its own map: it switches to
 the right drive, walks the tree to the file and outlines its cell, and
 while the Dupes tab is open every file in the report carries a thin
 outline so the duplicates are visible in place. Right-click a result for
-Explorer, or to recycle that copy.
+Explorer, or to recycle that one copy.
+
+Recycling in bulk is a single button: "Recycle every extra copy" keeps
+the first copy of each set and sends the rest to the Recycle Bin, after
+one confirmation that states the file count, the set count and the
+total size, with No as the default. Every extra is verified byte for
+byte against its kept copy immediately before it is recycled, so the
+last copy can never go and a stale result cannot delete the wrong
+thing; a set that no longer matches is skipped whole and said so. The
+run shows its progress, can be stopped by Esc or a click, and ends with
+an exact accounting of what moved and what was skipped.
 The delete only proceeds after Spindle has re-verified, byte for byte,
 that another identical copy still exists, so the last copy can never be
 the one deleted, and a hash match alone is never enough. Deletion goes to

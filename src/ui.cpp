@@ -137,6 +137,7 @@ constexpr UINT WM_SCAN_DONE     = WM_APP + 1;
 constexpr UINT WM_DUPES_DONE    = WM_APP + 2;
 constexpr UINT WM_PREFETCH_DONE = WM_APP + 3;
 constexpr UINT WM_DUPE_FILE     = WM_APP + 4;
+constexpr UINT WM_BULK_DONE     = WM_APP + 5;
 
 // A cache this young is served without a revalidating rescan: the launch
 // prefetch (or a scan moments ago) already walked the drive, and walking it
@@ -154,7 +155,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.8.2";
+constexpr const wchar_t* kAppVersion = L"1.8.3";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -239,6 +240,13 @@ struct App {
     Rect                  dupeAllButton;
     Rect                  dupeStopHit;   // "click here to stop" during a hunt
     std::wstring          dupeCurrentFile;   // what the hunt is reading now
+    // Bulk recycle: one copy of every set kept, every extra verified byte
+    // for byte against its kept copy immediately before it goes to the
+    // bin. Shares the hunt's generation counter and progress, since the
+    // two are mutually exclusive.
+    bool                  bulkRunning = false;
+    HANDLE                bulkWorker = nullptr;
+    Rect                  dupeBulkButton;
     // Pointer position in layout units, kept so panels can highlight the
     // row under the cursor without each one recomputing the DPI scale.
     float                 mouseX = -1.0f;
@@ -670,6 +678,104 @@ static void DupeFileNote(void* ctx, const std::wstring& full) {
     }
 }
 
+// One group per set: the kept copy first, then the extras, each with its
+// size. Owned strings only, so nothing the interface does can touch it.
+struct BulkRequest {
+    HWND     hwnd = nullptr;
+    uint64_t gen  = 0;
+    uint64_t lastNote = 0;
+    std::vector<std::vector<std::pair<std::wstring, uint64_t>>> groups;
+};
+
+struct BulkOutcome {
+    std::vector<std::wstring> recycled;
+    uint64_t bytesFreed   = 0;
+    size_t   skippedFiles = 0;
+    size_t   skippedSets  = 0;
+    bool     cancelled    = false;
+};
+
+static void BulkFileNote(BulkRequest* r, const std::wstring& full) {
+    const uint64_t now = GetTickCount64();
+    if (now - r->lastNote < 200) return;
+    r->lastNote = now;
+    try {
+        auto copy = std::make_unique<std::wstring>(full);
+        if (PostMessageW(r->hwnd, WM_DUPE_FILE,
+                         static_cast<WPARAM>(r->gen),
+                         reinterpret_cast<LPARAM>(copy.get()))) {
+            static_cast<void>(copy.release());  // NOLINT
+        }
+    } catch (...) {
+    }
+}
+
+unsigned __stdcall BulkThread(void* param) {
+    std::unique_ptr<BulkRequest> req(static_cast<BulkRequest*>(param));
+    auto outcome = std::make_unique<BulkOutcome>();
+    try {
+        uint64_t done = 0;
+        for (const auto& g : req->groups) {
+            if (g_app.dupeProgress.cancel.load(std::memory_order_relaxed)) {
+                outcome->cancelled = true;
+                break;
+            }
+            if (g.size() < 2) continue;
+            const std::wstring& keeper = g[0].first;
+            bool setInDoubt = false;
+            for (size_t i = 1; i < g.size(); ++i) {
+                if (g_app.dupeProgress.cancel.load(
+                        std::memory_order_relaxed)) {
+                    outcome->cancelled = true;
+                    break;
+                }
+                if (setInDoubt) {
+                    // A member no longer matching the kept copy means this
+                    // set's identity is stale. Refusing the rest of it is
+                    // the fail-safe direction.
+                    ++outcome->skippedFiles;
+                    continue;
+                }
+                BulkFileNote(req.get(), g[i].first);
+                if (!VerifyFilesIdentical(g[i].first, keeper,
+                                          &g_app.dupeProgress)) {
+                    ++outcome->skippedFiles;
+                    ++outcome->skippedSets;
+                    setInDoubt = true;
+                    continue;
+                }
+                if (RecycleToBin(g[i].first)) {
+                    outcome->recycled.push_back(g[i].first);
+                    outcome->bytesFreed += g[i].second;
+                    ++done;
+                    g_app.dupeProgress.files.store(
+                        done, std::memory_order_relaxed);
+                } else {
+                    ++outcome->skippedFiles;
+                }
+            }
+            if (outcome->cancelled) break;
+        }
+    } catch (...) {
+        outcome->cancelled = true;
+    }
+    if (PostMessageW(req->hwnd, WM_BULK_DONE,
+                     static_cast<WPARAM>(req->gen),
+                     reinterpret_cast<LPARAM>(outcome.get()))) {
+        static_cast<void>(outcome.release());  // NOLINT
+    }
+    return 0;
+}
+
+static void JoinBulkWorker() {
+    if (!g_app.bulkWorker) return;
+    g_app.dupeProgress.cancel.store(true, std::memory_order_relaxed);
+    WaitForSingleObject(g_app.bulkWorker, INFINITE);
+    CloseHandle(g_app.bulkWorker);
+    g_app.bulkWorker = nullptr;
+    g_app.bulkRunning = false;
+}
+
 unsigned __stdcall DupeThread(void* param) {
     std::unique_ptr<DupRequest> req(static_cast<DupRequest*>(param));
     try {
@@ -754,7 +860,7 @@ static bool YieldScanToHunt() {
 // completing, launch.
 static void StartPrefetchNext() {
     if (g_app.prefetchWorker || g_app.prefetchQueue.empty()) return;
-    if (g_app.scanning || g_app.dupeRunning) return;
+    if (g_app.scanning || g_app.dupeRunning || g_app.bulkRunning) return;
     if (!g_app.settings.keepCaches || !g_app.settings.prefetchAll) return;
 
     const std::wstring root = g_app.prefetchQueue.front();
@@ -1133,12 +1239,46 @@ static void DrawSidebar(const Rect& area) {
     g_app.dupeButton = Rect{};
     g_app.dupeAllButton = Rect{};
     g_app.dupeStopHit = Rect{};
+    g_app.dupeBulkButton = Rect{};
     g_app.dupeRowHits.clear();
     g_app.dupeRowPaths.clear();
     g_app.dupeRowRef.clear();
 
     // --- duplicates
     if (g_app.panel == App::Panel::Dupes) {
+        if (g_app.bulkRunning) {
+            DrawText(L"Recycling extras\u2026", g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall},
+                     theme::kSignal, 1.0f, true);
+            y += 20.0f;
+            DrawText(FormatFiles(g_app.dupeProgress.files.load()) +
+                         L" recycled  \u00B7  " +
+                         FormatSize(g_app.dupeProgress.bytes.load()) +
+                         L" verified",
+                     g_app.fmtSmall.get(),
+                     Rect{area.x + layout::kPad, y, rowW,
+                          layout::kLineSmall},
+                     theme::kMute, 1.0f, true);
+            y += 18.0f;
+            if (!g_app.dupeCurrentFile.empty()) {
+                const size_t cut = g_app.dupeCurrentFile.find_last_of(L'\\');
+                const std::wstring leaf =
+                    (cut == std::wstring::npos)
+                        ? g_app.dupeCurrentFile
+                        : g_app.dupeCurrentFile.substr(cut + 1);
+                DrawText(SanitizeForDisplay(leaf), g_app.fmtSmall.get(),
+                         Rect{area.x + layout::kPad, y, rowW,
+                              layout::kLineSmall},
+                         theme::kMute, 0.75f, true);
+                y += 18.0f;
+            }
+            g_app.dupeStopHit = Rect{area.x + layout::kPad, y, rowW, 15.0f};
+            DrawText(L"Esc to stop \u00B7 or click here", g_app.fmtSmall.get(),
+                     g_app.dupeStopHit,
+                     theme::kMute, 0.85f, true);
+            return;
+        }
         if (g_app.dupeRunning) {
             // Live counters, so a long hunt visibly progresses instead of
             // looking like a hang - which is what it was before it moved
@@ -1260,6 +1400,18 @@ static void DrawSidebar(const Rect& area) {
                  Rect{area.x + layout::kPad, y, rowW, layout::kLineSmall},
                  theme::kMute, 0.8f, true);
         y += 18.0f;
+        if (!g_app.dupes.groups.empty()) {
+            g_app.dupeBulkButton =
+                Rect{area.x + layout::kPad, y, rowW, 22.0f};
+            FillRound(g_app.dupeBulkButton, 4.0f, theme::kSlab);
+            DrawText(L"Recycle every extra copy\u2026", g_app.fmtSmall.get(),
+                     Rect{g_app.dupeBulkButton.x,
+                          g_app.dupeBulkButton.y + 3.0f, rowW,
+                          layout::kLineSmall},
+                     theme::kType, 0.95f, false,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+            y += 28.0f;
+        }
 
         g_app.dupeRowHits.clear();
         g_app.dupeRowPaths.clear();
@@ -2716,11 +2868,85 @@ static void OnLeftClick(int x, int y) {
         return;
     }
 
-    // Stop a running hunt by mouse alone. Esc does the same; a cancel that
-    // only a keyboard can reach is not much of a cancel.
-    if (g_app.dupeRunning && g_app.dupeStopHit.w > 0.0f &&
-        g_app.dupeStopHit.contains(fx, fy)) {
+    // Stop a running hunt or bulk recycle by mouse alone. Esc does the
+    // same; a cancel that only a keyboard can reach is not much of a
+    // cancel.
+    if ((g_app.dupeRunning || g_app.bulkRunning) &&
+        g_app.dupeStopHit.w > 0.0f && g_app.dupeStopHit.contains(fx, fy)) {
         g_app.dupeProgress.cancel.store(true, std::memory_order_relaxed);
+        return;
+    }
+
+    // Recycle every extra copy: one copy of each set is kept, and every
+    // extra is verified byte for byte against its kept copy immediately
+    // before it goes to the bin. The whole run is reversible and can be
+    // stopped; a set whose members no longer match is skipped whole.
+    if (g_app.dupeBulkButton.w > 0.0f &&
+        g_app.dupeBulkButton.contains(fx, fy) && !g_app.bulkRunning &&
+        !g_app.dupeRunning) {
+        if (g_app.scanning && !YieldScanToHunt()) return;
+
+        size_t   extras = 0;
+        uint64_t bytes  = 0;
+        for (const DupGroup& grp : g_app.dupes.groups) {
+            if (grp.files.size() < 2) continue;
+            extras += grp.files.size() - 1;
+            bytes  += grp.wasted;
+        }
+        if (extras == 0) return;
+
+        const std::wstring ask =
+            L"Recycle every extra copy?\n\n" + FormatCount(extras) +
+            L" files across " + FormatCount(g_app.dupes.groups.size()) +
+            L" sets, " + FormatSize(bytes) +
+            L".\n\nThe first copy of each set is kept. Every extra is "
+            L"verified byte for byte against the kept copy immediately "
+            L"before it is recycled; a set that no longer matches is "
+            L"skipped.\n\nEverything goes to the Recycle Bin.";
+        if (MessageBoxW(g_app.hwnd, ask.c_str(), L"Spindle",
+                        MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) !=
+            IDYES) {
+            return;
+        }
+
+        CancelPrefetch(true);
+        auto req = std::make_unique<BulkRequest>();
+        req->hwnd = g_app.hwnd;
+        req->gen  = g_app.dupeGen.fetch_add(1) + 1;
+        try {
+            for (const DupGroup& grp : g_app.dupes.groups) {
+                if (grp.files.size() < 2) continue;
+                std::vector<std::pair<std::wstring, uint64_t>> g;
+                g.reserve(grp.files.size());
+                for (const DupFile& f : grp.files) {
+                    g.push_back({f.Full(), grp.size});
+                }
+                req->groups.push_back(std::move(g));
+            }
+        } catch (...) {
+            MessageBoxW(g_app.hwnd, L"Ran out of memory preparing the run.",
+                        L"Spindle", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        g_app.dupeCurrentFile.clear();
+        g_app.dupeProgress.files.store(0);
+        g_app.dupeProgress.bytes.store(0);
+        g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
+
+        const uintptr_t h =
+            _beginthreadex(nullptr, 0, BulkThread, req.get(), 0, nullptr);
+        if (h == 0) {
+            MessageBoxW(g_app.hwnd, L"Could not start: the system refused "
+                                    L"a new thread.",
+                        L"Spindle", MB_OK | MB_ICONERROR);
+            return;
+        }
+        static_cast<void>(req.release());  // NOLINT
+        g_app.bulkWorker  = reinterpret_cast<HANDLE>(h);
+        g_app.bulkRunning = true;
+        SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
         return;
     }
 
@@ -2741,6 +2967,7 @@ static void OnLeftClick(int x, int y) {
     // the duplicate a single-folder hunt can never find.
     if (g_app.dupeAllButton.w > 0.0f &&
         g_app.dupeAllButton.contains(fx, fy) && !g_app.dupeRunning) {
+        if (g_app.bulkRunning) return;
         if (g_app.scanning && !YieldScanToHunt()) return;
         CancelPrefetch(true);   // the hunt reads files; the walk can wait
         auto req = std::make_unique<DupRequest>();
@@ -2819,6 +3046,7 @@ static void OnLeftClick(int x, int y) {
     if (g_app.dupeButton.w > 0.0f && g_app.dupeButton.contains(fx, fy) &&
         !g_app.trail.empty() && g_app.result) {
         // Not while a scan is running: the two would fight for the disk.
+        if (g_app.bulkRunning) return;
         if (g_app.scanning && !YieldScanToHunt()) return;
         if (g_app.dupeRunning) return;   // already hunting
         CancelPrefetch(true);   // the hunt reads files; the walk can wait
@@ -3220,6 +3448,107 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        case WM_BULK_DONE: {
+            std::unique_ptr<BulkOutcome> res(
+                reinterpret_cast<BulkOutcome*>(lp));
+            if (static_cast<uint64_t>(wp) != g_app.dupeGen.load()) return 0;
+            if (g_app.bulkWorker) {
+                WaitForSingleObject(g_app.bulkWorker, INFINITE);
+                CloseHandle(g_app.bulkWorker);
+                g_app.bulkWorker = nullptr;
+            }
+            g_app.bulkRunning = false;
+            g_app.dupeCurrentFile.clear();
+            if (!res) return 0;
+
+            // Prune what actually went from the report, then say what
+            // happened. The groups shrink; a set reduced to one copy is
+            // no longer a set.
+            {
+                std::unordered_set<std::wstring> gone;
+                for (const std::wstring& p2 : res->recycled) {
+                    gone.insert(FoldPath(p2));
+                }
+                for (DupGroup& grp : g_app.dupes.groups) {
+                    grp.files.erase(
+                        std::remove_if(grp.files.begin(), grp.files.end(),
+                                       [&](const DupFile& f) {
+                                           return gone.count(
+                                                      FoldPath(f.Full())) !=
+                                                  0;
+                                       }),
+                        grp.files.end());
+                    grp.wasted = grp.size * (grp.files.size() > 0
+                                                 ? grp.files.size() - 1
+                                                 : 0);
+                }
+                g_app.dupes.groups.erase(
+                    std::remove_if(g_app.dupes.groups.begin(),
+                                   g_app.dupes.groups.end(),
+                                   [](const DupGroup& grp) {
+                                       return grp.files.size() < 2;
+                                   }),
+                    g_app.dupes.groups.end());
+                g_app.dupes.totalWasted = 0;
+                for (const DupGroup& grp : g_app.dupes.groups) {
+                    g_app.dupes.totalWasted += grp.wasted;
+                }
+                RebuildDupePathSet();
+                MarkDupeCells();
+            }
+
+            std::wstring done = L"Recycled " +
+                                FormatFiles(res->recycled.size()) + L", " +
+                                FormatSize(res->bytesFreed) +
+                                L" to the Recycle Bin.";
+            if (res->skippedFiles > 0) {
+                done += L"\n\nSkipped " + FormatFiles(res->skippedFiles);
+                if (res->skippedSets > 0) {
+                    done += L" (" + FormatCount(res->skippedSets) +
+                            L" sets no longer matched and were left "
+                            L"alone)";
+                }
+                done += L".";
+            }
+            if (res->cancelled) done += L"\n\nStopped early.";
+            MessageBoxW(hwnd, done.c_str(), L"Spindle",
+                        MB_OK | MB_ICONINFORMATION);
+
+            // The trees still draw the recycled files; refresh the drive
+            // on screen now and queue the rest for the background walk.
+            std::unordered_set<wchar_t> letters;
+            for (const std::wstring& p2 : res->recycled) {
+                if (p2.size() >= 2 && p2[1] == L':') {
+                    letters.insert(
+                        static_cast<wchar_t>(towupper(p2[0])));
+                }
+            }
+            bool currentAffected = false;
+            for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+                const std::wstring& vp = g_app.volumes[i].path;
+                if (vp.empty() ||
+                    letters.count(static_cast<wchar_t>(
+                        towupper(vp[0]))) == 0) {
+                    continue;
+                }
+                if (static_cast<int>(i) == g_app.selected) {
+                    currentAffected = true;
+                } else if (std::find(g_app.prefetchQueue.begin(),
+                                     g_app.prefetchQueue.end(),
+                                     vp) == g_app.prefetchQueue.end()) {
+                    g_app.prefetchQueue.insert(g_app.prefetchQueue.begin(),
+                                               vp);
+                }
+            }
+            if (currentAffected && g_app.selected >= 0) {
+                StartScan(g_app.selected, false);
+            } else {
+                StartPrefetchNext();
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
         case WM_DUPES_DONE: {
             // Adopt first, so a superseded report is freed rather than
             // leaked, then discard it if it is not the one being awaited.
@@ -3379,7 +3708,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     // Reachable now that the hunt has its own thread; while
                     // it ran on this one the key could never be dispatched.
-                    if (g_app.dupeRunning) {
+                    if (g_app.dupeRunning || g_app.bulkRunning) {
                         g_app.dupeProgress.cancel.store(
                             true, std::memory_order_relaxed);
                     }
@@ -3410,6 +3739,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             JoinWorker();
             JoinDupeWorker();
+            JoinBulkWorker();
             CancelPrefetch(false);
             DiscardDeviceResources();
             PostQuitMessage(0);

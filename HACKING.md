@@ -99,6 +99,15 @@ rescanned, the only symptom was that caching silently stopped working
 everywhere. The test fixtures used an empty root name and could not catch
 it; one now uses a real volume path.
 
+**The cache slot belongs to the volume root alone.** "Scan with Spindle"
+on a folder used to save the folder's tree into the volume's cache slot,
+and the next folder launch loaded it back whatever folder was asked for;
+with a fresh enough cache the fast path then never scanned at all, so
+the window showed the previous folder forever. Save and load both refuse
+non-root paths now, and load also refuses a cache whose stored root does
+not name the requested volume, deleting it so the next clean scan
+replaces it.
+
 **A duplicate is never deleted on the strength of a hash.** Recycling a
 copy from the Dupes panel is gated: it finds a different member of the same
 group, proves the two identical byte for byte with `VerifyFilesIdentical`,
@@ -107,7 +116,11 @@ removed, and a 128-bit collision can never cause a deletion. Reparse points
 are refused by the open, hardlinks are already excluded from groups, and
 deletion goes to the Recycle Bin (reversible) behind a protected-path
 refusal and a No-default confirmation. The failure mode is to refuse, never
-to delete the wrong thing.
+to delete the wrong thing. The bulk "recycle every extra copy" run is
+the same gate applied per file: the first copy of each set is the
+keeper, every extra is verified against it immediately before its
+recycle, a mismatch skips the rest of that set, and the summary reports
+recycled and skipped counts exactly.
 
 **A pair is confirmed by comparison, not by hashing.** Proving two files
 identical requires reading both in full either way; hashing's only
