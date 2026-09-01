@@ -909,7 +909,8 @@ bool RecycleToBin(const std::wstring& path) {
 }
 
 DupReport HashCandidates(std::vector<DupFile> candidates,
-                         const std::wstring& rootPath, Progress* progress) {
+                         const std::wstring& rootPath, Progress* progress,
+                         DupFileNote onFile, void* onFileCtx) {
     DupReport rep;
     std::vector<DupFile> hashed;
     hashed.reserve(candidates.size());
@@ -954,6 +955,7 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                 else ++rep.skippedUnread;
                 continue;
             }
+            if (onFile) onFile(onFileCtx, candidates[idx].Full());
             Digest d;
             const bool ok = HashRegion(h, offset, length, buf, d,
                                        rep.bytesHashed, progress);
@@ -1031,6 +1033,7 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
             // byte, instead of hashed. A mismatch stops at the first
             // differing byte; a match costs the same as hashing both would.
             if (g.size() == 2) {
+                if (onFile) onFile(onFileCtx, candidates[g[0]].Full());
                 const VerifyResult vr =
                     VerifyIdentical(rootPath, candidates[g[0]],
                                     candidates[g[1]], buf, bufB,
@@ -1075,6 +1078,7 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
                     else ++rep.skippedUnread;
                     continue;
                 }
+                if (onFile) onFile(onFileCtx, candidates[idx].Full());
                 Digest d;
                 const bool ok = HashRegion(h, 0, UINT64_MAX, buf, d,
                                            rep.bytesHashed, progress);

@@ -276,8 +276,15 @@ struct Progress;
 // safe to run on a worker thread while the interface stays live. Candidates
 // carry owned paths and no Node pointers, so a rescan replacing the tree
 // underneath cannot invalidate anything here.
+// Optional: called with the full path of each file as its bytes are about
+// to be read, so an interface can say what a long verify is chewing on.
+// Called from the hunt's own thread; the callee owns any hand-off.
+using DupFileNote = void (*)(void* ctx, const std::wstring& full);
+
 DupReport HashCandidates(std::vector<DupFile> candidates,
-                         const std::wstring& rootPath, Progress* progress);
+                         const std::wstring& rootPath, Progress* progress,
+                         DupFileNote onFile = nullptr,
+                         void* onFileCtx = nullptr);
 
 // True only if the two files are byte-for-byte identical. This is the exact
 // check a deletion must pass before it touches anything: two files with the

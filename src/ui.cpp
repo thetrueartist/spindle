@@ -136,6 +136,7 @@ constexpr WORD IDI_APPICON = 1;
 constexpr UINT WM_SCAN_DONE     = WM_APP + 1;
 constexpr UINT WM_DUPES_DONE    = WM_APP + 2;
 constexpr UINT WM_PREFETCH_DONE = WM_APP + 3;
+constexpr UINT WM_DUPE_FILE     = WM_APP + 4;
 
 // A cache this young is served without a revalidating rescan: the launch
 // prefetch (or a scan moments ago) already walked the drive, and walking it
@@ -237,6 +238,7 @@ struct App {
     Rect                  dupeButton;
     Rect                  dupeAllButton;
     Rect                  dupeStopHit;   // "click here to stop" during a hunt
+    std::wstring          dupeCurrentFile;   // what the hunt is reading now
     // Pointer position in layout units, kept so panels can highlight the
     // row under the cursor without each one recomputing the DPI scale.
     float                 mouseX = -1.0f;
@@ -646,14 +648,34 @@ struct DupRequest {
     std::wstring         rootPath;
     HWND                 hwnd = nullptr;
     uint64_t             gen  = 0;
+    uint64_t             lastNote = 0;   // throttle for the reading-now notes
 };
+
+// Runs on the hunt thread. Hands the interface the file about to be read,
+// throttled, as an owned string it adopts. Swallows its own failures: a
+// missed note must never abort a hunt.
+static void DupeFileNote(void* ctx, const std::wstring& full) {
+    DupRequest* r = static_cast<DupRequest*>(ctx);
+    const uint64_t now = GetTickCount64();
+    if (now - r->lastNote < 200) return;
+    r->lastNote = now;
+    try {
+        auto copy = std::make_unique<std::wstring>(full);
+        if (PostMessageW(r->hwnd, WM_DUPE_FILE,
+                         static_cast<WPARAM>(r->gen),
+                         reinterpret_cast<LPARAM>(copy.get()))) {
+            static_cast<void>(copy.release());  // NOLINT
+        }
+    } catch (...) {
+    }
+}
 
 unsigned __stdcall DupeThread(void* param) {
     std::unique_ptr<DupRequest> req(static_cast<DupRequest*>(param));
     try {
         auto rep = std::make_unique<DupReport>(
             HashCandidates(std::move(req->candidates), req->rootPath,
-                           &g_app.dupeProgress));
+                           &g_app.dupeProgress, DupeFileNote, req.get()));
         if (PostMessageW(req->hwnd, WM_DUPES_DONE,
                          static_cast<WPARAM>(req->gen),
                          reinterpret_cast<LPARAM>(rep.get()))) {
@@ -1108,6 +1130,18 @@ static void DrawSidebar(const Rect& area) {
                           layout::kLineSmall},
                      theme::kMute, 1.0f, true);
             y += 20.0f;
+            if (!g_app.dupeCurrentFile.empty()) {
+                const size_t cut = g_app.dupeCurrentFile.find_last_of(L'\\');
+                const std::wstring leaf =
+                    (cut == std::wstring::npos)
+                        ? g_app.dupeCurrentFile
+                        : g_app.dupeCurrentFile.substr(cut + 1);
+                DrawText(SanitizeForDisplay(leaf), g_app.fmtSmall.get(),
+                         Rect{area.x + layout::kPad, y, rowW,
+                              layout::kLineSmall},
+                         theme::kMute, 0.75f, true);
+                y += 18.0f;
+            }
             g_app.dupeStopHit = Rect{area.x + layout::kPad, y, rowW, 15.0f};
             DrawText(L"Esc to stop \u00B7 or click here", g_app.fmtSmall.get(),
                      g_app.dupeStopHit,
@@ -2736,6 +2770,7 @@ static void OnLeftClick(int x, int y) {
 
         g_app.dupes = DupReport{};
         g_app.dupesRun = false;
+        g_app.dupeCurrentFile.clear();
         g_app.dupeProgress.files.store(0);
         g_app.dupeProgress.bytes.store(0);
         g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
@@ -2796,6 +2831,7 @@ static void OnLeftClick(int x, int y) {
 
         g_app.dupes = DupReport{};
         g_app.dupesRun = false;
+        g_app.dupeCurrentFile.clear();
         g_app.dupeProgress.files.store(0);
         g_app.dupeProgress.bytes.store(0);
         g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
@@ -3163,6 +3199,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        case WM_DUPE_FILE: {
+            std::unique_ptr<std::wstring> file(
+                reinterpret_cast<std::wstring*>(lp));
+            if (static_cast<uint64_t>(wp) != g_app.dupeGen.load()) return 0;
+            if (file) g_app.dupeCurrentFile = std::move(*file);
+            return 0;
+        }
+
         case WM_DUPES_DONE: {
             // Adopt first, so a superseded report is freed rather than
             // leaked, then discard it if it is not the one being awaited.
@@ -3177,6 +3221,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.dupeWorker = nullptr;
             }
             g_app.dupeRunning = false;
+            g_app.dupeCurrentFile.clear();
             StartPrefetchNext();   // the disk is free again
 
             if (rep) {
