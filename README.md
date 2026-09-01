@@ -55,6 +55,14 @@ else, and the whole thing can be turned off in the `···` menu. The cache
 is keyed to the volume serial and parsed with the same validation as
 everything else read from disk.
 
+Views come in tabs. Right-click a folder and open it in its own tab;
+right-click a duplicate and its drive opens in one, with the file
+outlined. Each tab remembers its drive, its position in the tree and its
+panel, and switching is instant because the caches already hold every
+drive. The strip only appears once there are two tabs to choose from.
+
+![tabs](docs/tabs.png)
+
 Filenames are treated as untrusted input; see the Security section.
 
 Force removal handles the things that will not delete normally: locked

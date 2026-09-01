@@ -125,6 +125,7 @@ constexpr float kLineHead  = 26.0f;   // 19 px
 constexpr float kSidebar    = 268.0f;
 constexpr float kPad        = 16.0f;
 constexpr float kCrumbH     = 40.0f;
+constexpr float kViewTabsH  = 30.0f;   // tab strip, drawn only with 2+ tabs
 constexpr float kStatusH    = 34.0f;
 constexpr float kDriveCardH = 66.0f;
 constexpr float kLegendRowH = 22.0f;
@@ -155,7 +156,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.8.3";
+constexpr const wchar_t* kAppVersion = L"1.9.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -189,6 +190,16 @@ struct DriveHit {
     int  index = -1;
 };
 
+// One open view: where it is rooted, how deep it was, which panel it had.
+// Strings only, so a tab survives every rescan and tree swap untouched.
+struct ViewTab {
+    std::wstring              root;         // "D:\\" or a folder path
+    int                       volumeIndex = -1;
+    std::vector<std::wstring> comps;        // trail below the root
+    int                       panel = 0;
+    std::wstring              title;
+};
+
 struct App {
     HWND hwnd = nullptr;
 
@@ -216,6 +227,10 @@ struct App {
 
     std::vector<DriveHit> driveHits;
     std::vector<Rect>     crumbHits;
+    std::vector<ViewTab>  viewTabs;
+    int                   activeView = 0;
+    std::vector<Rect>     viewTabHits;
+    std::vector<Rect>     viewTabCloseHits;
     Rect                  menuHit;   // the "···" beside the title
     Settings              settings;
     // A path given on the command line or by a shell verb. Scanned at
@@ -1577,6 +1592,51 @@ static void DrawSidebar(const Rect& area) {
     }
 }
 
+// The tab strip. Hidden entirely with one tab: a strip of one is chrome
+// with no decision in it.
+static void DrawViewTabs(const Rect& area) {
+    g_app.viewTabHits.clear();
+    g_app.viewTabCloseHits.clear();
+    if (g_app.viewTabs.size() < 2) return;
+
+    FillRect(area, theme::kSlab, 0.5f);
+    const float pad  = 6.0f;
+    const size_t n   = g_app.viewTabs.size();
+    const float each = std::min(
+        170.0f, (area.w - pad * 2.0f - 4.0f * static_cast<float>(n - 1)) /
+                    static_cast<float>(n));
+    float x = area.x + pad;
+    for (size_t i = 0; i < n; ++i) {
+        const bool active = (static_cast<int>(i) == g_app.activeView);
+        const Rect tab{x, area.y + 4.0f, each, area.h - 8.0f};
+        FillRound(tab, 4.0f, active ? theme::kSlabHi : theme::kSlab);
+        if (active) {
+            FillRect(Rect{tab.x + 4.0f, tab.bottom() - 2.0f,
+                          tab.w - 8.0f, 2.0f},
+                     theme::kSignal, 0.9f);
+        }
+        // Title on the left, a close mark on the right. The close target
+        // is its own rect so a tab click and a close click cannot blur.
+        const Rect close{tab.right() - 18.0f, tab.y, 18.0f, tab.h};
+        DrawText(SanitizeForDisplay(
+                     g_app.viewTabs[i].title.empty()
+                         ? std::wstring(L"\u2014")
+                         : g_app.viewTabs[i].title),
+                 g_app.fmtSmall.get(),
+                 Rect{tab.x + 8.0f, tab.y + 3.0f, tab.w - 28.0f,
+                      layout::kLineSmall},
+                 active ? theme::kType : theme::kMute, 1.0f, true);
+        DrawText(L"\u00D7", g_app.fmtSmall.get(),
+                 Rect{close.x, close.y + 3.0f, close.w - 4.0f,
+                      layout::kLineSmall},
+                 theme::kMute, active ? 0.9f : 0.6f, false,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_app.viewTabHits.push_back(tab);
+        g_app.viewTabCloseHits.push_back(close);
+        x += each + 4.0f;
+    }
+}
+
 static void DrawBreadcrumb(const Rect& area) {
     g_app.crumbHits.clear();
     if (g_app.trail.empty()) return;
@@ -2105,11 +2165,14 @@ static void Render() {
     const Rect side{0, 0, layout::kSidebar, sz.height};
     const Rect main{layout::kSidebar, 0, sz.width - layout::kSidebar,
                     sz.height};
-    const Rect crumb{main.x, 0, main.w, layout::kCrumbH};
+    const float tabsH =
+        (g_app.viewTabs.size() >= 2) ? layout::kViewTabsH : 0.0f;
+    const Rect tabsR{main.x, 0, main.w, tabsH};
+    const Rect crumb{main.x, tabsH, main.w, layout::kCrumbH};
     const Rect status{main.x, sz.height - layout::kStatusH, main.w,
                       layout::kStatusH};
-    const Rect map{main.x, layout::kCrumbH, main.w,
-                   sz.height - layout::kCrumbH - layout::kStatusH};
+    const Rect map{main.x, tabsH + layout::kCrumbH, main.w,
+                   sz.height - tabsH - layout::kCrumbH - layout::kStatusH};
 
     const bool boundsChanged =
         std::fabs(map.w - g_app.mapBounds.w) > 0.5f ||
@@ -2130,6 +2193,7 @@ static void Render() {
     }
 
     DrawSidebar(side);
+    DrawViewTabs(tabsR);
     DrawBreadcrumb(crumb);
     FillRect(Rect{crumb.x, crumb.bottom() - 1.0f, crumb.w, 1.0f}, theme::kRule);
     DrawTreemap(map);
@@ -2184,6 +2248,126 @@ static void RevealInExplorer(const std::wstring& path) {
     if (parent.find(L'"') != std::wstring::npos) return;
     ShellExecuteW(g_app.hwnd, L"open", parent.c_str(), nullptr, nullptr,
                   SW_SHOWNORMAL);
+}
+
+static std::wstring CurrentRootPath() {
+    return g_app.result ? g_app.result->root.name : std::wstring();
+}
+
+static std::wstring ViewTitleFor(const std::wstring& root) {
+    if (root.size() <= 3 && root.size() >= 2 && root[1] == L':') {
+        return root.substr(0, 2);   // "D:\" reads as "D:"
+    }
+    const size_t cut = root.find_last_of(L'\\');
+    return (cut == std::wstring::npos) ? root : root.substr(cut + 1);
+}
+
+// Record the live view into its tab. Called before anything switches away
+// from it; the active tab otherwise just mirrors whatever is on screen.
+static void SnapshotActiveView() {
+    const std::wstring root = CurrentRootPath();
+    if (root.empty()) return;
+    if (g_app.viewTabs.empty()) {
+        g_app.viewTabs.push_back(ViewTab{});
+        g_app.activeView = 0;
+    }
+    if (g_app.activeView < 0 ||
+        g_app.activeView >= static_cast<int>(g_app.viewTabs.size())) {
+        g_app.activeView = 0;
+    }
+    ViewTab& t = g_app.viewTabs[static_cast<size_t>(g_app.activeView)];
+    t.root        = root;
+    t.volumeIndex = g_app.selected;
+    t.panel       = static_cast<int>(g_app.panel);
+    t.comps.clear();
+    for (size_t i = 1; i < g_app.trail.size(); ++i) {
+        if (g_app.trail[i]) t.comps.push_back(g_app.trail[i]->name);
+    }
+    t.title = t.comps.empty() ? ViewTitleFor(root) : t.comps.back();
+}
+
+// Rebuild the trail from stored component names, stopping at the deepest
+// directory that still exists. A tree older or newer than the tab is not
+// an error; the tab lands as deep as it can.
+static void RestoreTrailComps(const std::vector<std::wstring>& comps) {
+    if (!g_app.result) return;
+    std::vector<const Node*> trail{&g_app.result->root};
+    const Node* cur = trail[0];
+    for (const std::wstring& comp : comps) {
+        const Node* next = nullptr;
+        for (const Node& c : cur->children) {
+            if (c.dir && lstrcmpiW(c.name.c_str(), comp.c_str()) == 0) {
+                next = &c;
+                break;
+            }
+        }
+        if (!next) break;
+        trail.push_back(next);
+        cur = next;
+    }
+    g_app.trail      = std::move(trail);
+    g_app.hoverNode  = nullptr;
+    g_app.hoverPrev  = nullptr;
+    g_app.hoverIndex = -1;
+    RebuildTreemap();
+    g_app.panelDirty = true;
+}
+
+// Make a stored tab the live view: switch roots if it lives elsewhere
+// (instant when the cache is fresh, which the launch prefetch makes the
+// normal case), then walk back to where it was.
+static void ApplyView(const ViewTab& t) {
+    g_app.panel = static_cast<App::Panel>(t.panel);
+    if (!t.root.empty() &&
+        lstrcmpiW(t.root.c_str(), CurrentRootPath().c_str()) != 0) {
+        StartScanPath(t.root, t.volumeIndex, true);
+    }
+    RestoreTrailComps(t.comps);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+static void ActivateView(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(g_app.viewTabs.size()) ||
+        idx == g_app.activeView) {
+        return;
+    }
+    SnapshotActiveView();
+    g_app.activeView = idx;
+    ApplyView(g_app.viewTabs[static_cast<size_t>(idx)]);
+}
+
+// A new tab starts from a description of where it should look, becomes
+// active immediately, and the view it replaced keeps its place.
+static void OpenViewTab(const std::wstring& root, int volumeIndex,
+                        std::vector<std::wstring> comps) {
+    SnapshotActiveView();
+    if (g_app.viewTabs.empty()) return;   // nothing on screen yet
+    ViewTab t;
+    t.root        = root;
+    t.volumeIndex = volumeIndex;
+    t.comps       = std::move(comps);
+    t.panel       = static_cast<int>(g_app.panel);
+    t.title = t.comps.empty() ? ViewTitleFor(root) : t.comps.back();
+    g_app.viewTabs.push_back(std::move(t));
+    g_app.activeView = static_cast<int>(g_app.viewTabs.size()) - 1;
+    ApplyView(g_app.viewTabs.back());
+}
+
+static void CloseViewTab(int idx) {
+    if (g_app.viewTabs.size() <= 1 || idx < 0 ||
+        idx >= static_cast<int>(g_app.viewTabs.size())) {
+        return;
+    }
+    const bool wasActive = (idx == g_app.activeView);
+    g_app.viewTabs.erase(g_app.viewTabs.begin() + idx);
+    if (g_app.activeView > idx) --g_app.activeView;
+    if (g_app.activeView >= static_cast<int>(g_app.viewTabs.size())) {
+        g_app.activeView = static_cast<int>(g_app.viewTabs.size()) - 1;
+    }
+    if (wasActive) {
+        ApplyView(g_app.viewTabs[static_cast<size_t>(g_app.activeView)]);
+    }
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
 // Walk the current tree to `full`, retarget the map at its parent and flash
@@ -2623,6 +2807,7 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, 1, L"Reveal in Explorer");
+    AppendMenuW(menu, MF_STRING, 3, L"Open in a new tab");
     AppendMenuW(menu, MF_STRING, 2, L"Recycle this copy (keep the others)");
     const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                    screenPt.x, screenPt.y, 0, g_app.hwnd,
@@ -2630,6 +2815,24 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
     DestroyMenu(menu);
 
     if (cmd == 1) { RevealInExplorer(path); return; }
+    if (cmd == 3) {
+        // A fresh tab on the file's own drive; the in-map reveal then
+        // switches, navigates and flashes inside it.
+        if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\') {
+            int vol = -1;
+            for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+                const std::wstring& vp = g_app.volumes[i].path;
+                if (!vp.empty() &&
+                    towupper(vp[0]) == towupper(path[0])) {
+                    vol = static_cast<int>(i);
+                    break;
+                }
+            }
+            OpenViewTab(path.substr(0, 3), vol, {});
+        }
+        ShowDupeInMap(path);
+        return;
+    }
     if (cmd != 2) return;
 
     // Locate a different member of the same group to fall back on.
@@ -2731,6 +2934,9 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
 
     AppendMenuW(menu, MF_STRING, 1, L"Show in Explorer");
     AppendMenuW(menu, MF_STRING, 2, L"Copy path");
+    if (nodeDir) {
+        AppendMenuW(menu, MF_STRING, 6, L"Open in a new tab");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     // No keyboard shortcut on purpose: deleting should take deliberate
     // pointing, not a stray keypress. The ellipsis is the Windows convention
@@ -2747,6 +2953,19 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
                                    nullptr);
     DestroyMenu(menu);
 
+    if (cmd == 6 && nodeDir) {
+        // The clicked folder, addressed as components below the current
+        // root: the tab stores strings, so nothing here can dangle.
+        std::vector<std::wstring> comps;
+        for (size_t i = 1; i < g_app.trail.size(); ++i) {
+            if (g_app.trail[i]) comps.push_back(g_app.trail[i]->name);
+        }
+        for (const Node* n2 : CellChain(g_app.cells, cellIndex)) {
+            if (n2) comps.push_back(n2->name);
+        }
+        OpenViewTab(CurrentRootPath(), g_app.selected, std::move(comps));
+        return;
+    }
     if (cmd == 1) {
         RevealInExplorer(path);
     } else if (cmd == 2) {
@@ -3165,6 +3384,19 @@ static void OnLeftClick(int x, int y) {
         g_app.searchFocus = false;
         g_app.searchSelectAll = false;
         return;
+    }
+
+    for (size_t i = 0; i < g_app.viewTabCloseHits.size(); ++i) {
+        if (g_app.viewTabCloseHits[i].contains(fx, fy)) {
+            CloseViewTab(static_cast<int>(i));
+            return;
+        }
+    }
+    for (size_t i = 0; i < g_app.viewTabHits.size(); ++i) {
+        if (g_app.viewTabHits[i].contains(fx, fy)) {
+            ActivateView(static_cast<int>(i));
+            return;
+        }
     }
 
     for (size_t i = 0; i < g_app.crumbHits.size(); ++i) {

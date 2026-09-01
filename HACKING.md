@@ -181,6 +181,16 @@ the shared format object and must be restored after any non-leading draw.
 PNG at small sizes, and `LoadImage` fails silently into the stock Windows
 icon.
 
+## Tabs
+
+A view tab stores strings only: the scan root, the trail as component
+names, the panel index and a title. Activating one re-loads its root
+through the ordinary cache path and walks back down by name, stopping at
+the deepest directory that still exists, so a tab can never dangle into
+a freed tree and survives every rescan by construction. The active tab
+mirrors the live view and is snapshotted the moment anything switches
+away from it.
+
 ## Launch prefetch
 
 At startup the fixed drives that are not on screen are walked one at a
