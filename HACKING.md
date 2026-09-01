@@ -191,6 +191,47 @@ a freed tree and survives every rescan by construction. The active tab
 mirrors the live view and is snapshotted the moment anything switches
 away from it.
 
+## Browse mode (in development on dev-browse)
+
+A details list over the already-loaded tree, because the two things a
+file lister is worst at on Windows (folder sizes, search speed) are the
+two things this program already has. Design decisions, made before the
+code:
+
+- The list is a view of `trail.back()`'s children, nothing more. It
+  reads no disk, so it is instant by construction, and every folder row
+  shows its rolled-up size and file count because the tree already
+  knows them.
+- Columns: Name, Size, Kind, Files. No Modified column in phase one:
+  `Node` deliberately stores no timestamps, and adding one is a cache
+  format bump plus eight bytes per node, which is a separate decision.
+- Sorting is per column, both directions, over an index vector owned by
+  the view. The vector holds `Node*` into the live tree, so it obeys
+  the tree-swap invariant: dropped in `DropTreeReferences`, rebuilt on
+  demand.
+- Rows are virtualised: only the visible span draws, so a 40,000-child
+  directory scrolls like an empty one. Wheel plus a draggable thumb.
+- Double-click a folder: navigate into it, staying in browse. Backspace
+  and the breadcrumb behave exactly as on the map. Double-click a file:
+  hand it to the shell to open, which is the one new power browse mode
+  grants and is called out in the import audit.
+- Right-click a row: the same menu as a map cell, same protected-path
+  refusals, same confirmations, plus open in a new tab.
+- The Map/List choice lives per tab, next to the breadcrumb, and a tab
+  remembers it like it remembers its panel and search.
+- Selection speaks the standard grammar: click, ctrl-click toggle,
+  shift-click range, empty-space clear. The set holds Node pointers and
+  is dropped with every tree swap like every other holder. A
+  right-click inside a bigger selection acts on all of it.
+- Rename is a real EDIT child window over the name cell, not a drawn
+  imitation: the control brings the caret, selection and IME for free.
+  Commit order is disk first (MoveFileW after IsSafeNodeName), then the
+  tree patched in place by walking to the parent by name, then the
+  cache re-saved from the patched tree. A walk that misses patches
+  nothing and the next scan shows the truth; the first cut proved the
+  value of that fail-safe when the parent lost its trailing separator
+  and the disk renamed while the view lagged.
+
 ## Launch prefetch
 
 At startup the fixed drives that are not on screen are walked one at a
