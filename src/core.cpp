@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <limits>
 #include <type_traits>
@@ -1034,10 +1035,19 @@ constexpr uint64_t kHashPrime2 = 0xC2B2AE3D27D4EB4Full;
 // carry no alignment guarantee, and a misaligned 64-bit load is undefined
 // behaviour the sanitisers rightly complain about.
 uint64_t Load64(const uint8_t* p) {
-    uint64_t v = 0;
-    for (int k = 7; k >= 0; --k) {
-        v = (v << 8) | static_cast<uint64_t>(p[static_cast<size_t>(k)]);
-    }
+    // The read buffer has no alignment guarantee, so a plain 64-bit
+    // dereference would be undefined behaviour. memcpy is the portable,
+    // UB-free unaligned load - the compiler lowers it to a single `mov` on
+    // every target Spindle builds for, where the byte-by-byte version it
+    // replaced was eight dependent shift-ors and the real cost of hashing.
+    // On a little-endian machine the two produce the identical value; the
+    // swap keeps that true on the (unused, but let us not lie) big-endian
+    // case, so the digest is unchanged everywhere and every test still holds.
+    uint64_t v;
+    std::memcpy(&v, p, sizeof(v));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    v = __builtin_bswap64(v);
+#endif
     return v;
 }
 
