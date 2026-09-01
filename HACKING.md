@@ -247,6 +247,38 @@ counter so cancelling it can never touch the foreground scan's flags, and
 `CancelPrefetch` bumps the generation before joining so the
 already-posted completion message is recognised as stale.
 
+## Auto-update (dormant until keyed)
+
+Modelled on Audio-Switcher's updater, which got the trust model right:
+a release is only an update once a manifest signed by the maintainer's
+OFFLINE key says so. The private key never touches the repo or CI, so a
+compromised repository, action, or GitHub account cannot ship a
+trojaned update; the updater fails closed on anything unsigned,
+malformed, mismatched or unreachable.
+
+Mechanics: at launch (and from the menu), a worker fetches the latest
+release metadata from the GitHub API over WinHTTP, finds manifest.json
+and manifest.sig among the assets, verifies the signature (ECDSA P-256
+via CNG), compares the tag, and only then offers the update: a menu
+entry naming the version, never anything silent. Accepting downloads
+the exe asset, hashes it (SHA-256 via CNG), requires the hash the
+signed manifest promised, then swaps by rename: the running exe moves
+aside as spindle.old.exe, the verified download takes its name, and
+the user restarts when they choose. No process is created, the old
+version survives until the next launch cleans it, and every failure
+leaves the current install untouched.
+
+The JSON off the API is untrusted input, so the field extractor lives
+in core.cpp with hard bounds and host tests, like every other parser
+of hostile bytes.
+
+Signing lives in the exe itself: --gen-update-key writes a keypair
+(keep the private half offline), --sign-release hashes a build and
+writes manifest.json plus manifest.sig for attaching to the release.
+The embedded public key constant ships EMPTY, which disables the whole
+feature: no key, no network, no menu entry. Enabling it is the owner's
+act: generate the pair, embed the public half, rebuild.
+
 ## Security posture
 
 The threat model is that every byte off a disk (names, sizes, on-disk
