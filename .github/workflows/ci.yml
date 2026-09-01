@@ -72,10 +72,10 @@ jobs:
           Start-Process -FilePath .\spindle.exe -ArgumentList "--gen-update-key" -Wait -NoNewWindow
           if (-not (Test-Path update-key.txt)) { throw "no keypair written" }
           $lines = Get-Content update-key.txt
-          $pub  = ($lines | Where-Object { $_ -match "^public" })  -replace ".*: ", ""
-          $priv = ($lines | Where-Object { $_ -match "^private" }) -replace ".*: ", ""
-          if ($pub.Length -lt 80 -or $priv.Length -lt 100) { throw "keypair looks wrong" }
-          Set-Content -NoNewline priv.key $priv
+          $pub  = [string](($lines | Where-Object { $_ -match "public" }  | Select-Object -First 1) -replace ".*: ", "")
+          $priv = [string](($lines | Where-Object { $_ -match "private" } | Select-Object -First 1) -replace ".*: ", "")
+          if ($pub.Length -lt 80 -or $priv.Length -lt 100) { throw "keypair looks wrong: pub=$($pub.Length) priv=$($priv.Length)" }
+          [IO.File]::WriteAllText((Join-Path $PWD "priv.key"), $priv)
 
           Start-Process -FilePath .\spindle.exe -ArgumentList @("--sign-release", "spindle.exe", "priv.key", "v0.0.0-ci") -Wait -NoNewWindow
           if (-not (Test-Path manifest.json)) { throw "signing wrote no manifest: $(Get-Content sign-error.txt -ErrorAction SilentlyContinue)" }
@@ -93,7 +93,7 @@ jobs:
           Write-Host "tamper: REJECTED (good)"
 
           Start-Process -FilePath .\spindle.exe -ArgumentList "--gen-update-key" -Wait -NoNewWindow
-          $pub2 = ((Get-Content update-key.txt) | Where-Object { $_ -match "^public" }) -replace ".*: ", ""
+          $pub2 = [string](((Get-Content update-key.txt) | Where-Object { $_ -match "public" } | Select-Object -First 1) -replace ".*: ", "")
           $p = Start-Process -FilePath .\spindle.exe -ArgumentList @("--verify-update-manifest", "manifest.json", "manifest.sig", $pub2) -Wait -NoNewWindow -PassThru
           if ($p.ExitCode -eq 0) { throw "the wrong key verified - fail-closed is broken" }
           Write-Host "wrong key: REJECTED (good)"
