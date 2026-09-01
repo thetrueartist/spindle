@@ -198,6 +198,7 @@ struct ViewTab {
     std::vector<std::wstring> comps;        // trail below the root
     int                       panel = 0;
     std::wstring              query;        // the Find box, per tab
+    bool                      browse = false;   // list view instead of map
     std::wstring              title;
 };
 
@@ -232,6 +233,24 @@ struct App {
     int                   activeView = 0;
     std::vector<Rect>     viewTabHits;
     std::vector<Rect>     viewTabCloseHits;
+
+    // Browse mode: a details list over the viewed directory's children.
+    // browseOrder holds Node pointers into the live tree, so it is
+    // dropped with every tree swap and rebuilt on demand.
+    bool                     browse = false;
+    int                      browseSort = 1;    // 0 name, 1 size, 2 kind, 3 files
+    bool                     browseAsc = false;
+    float                    browseScroll = 0.0f;
+    std::vector<const Node*> browseOrder;
+    const Node*              browseSel = nullptr;
+    std::vector<Rect>        browseRowHits;     // visible rows only
+    std::vector<const Node*> browseRowNodes;    // parallel to hits
+    Rect                     browseHeadHits[4];
+    Rect                     browseBar;         // scrollbar thumb
+    Rect                     mapToggleHit;
+    Rect                     listToggleHit;
+    bool                     browseDragging = false;
+    float                    browseDragOff = 0.0f;
     Rect                  menuHit;   // the "···" beside the title
     Settings              settings;
     // A path given on the command line or by a shell verb. Scanned at
@@ -557,6 +576,11 @@ static void DropTreeReferences() {
     g_app.rowHits.clear();
     g_app.flashNode = nullptr;   // points into the tree being dropped
     g_app.cellDupe.clear();
+    g_app.browseOrder.clear();
+    g_app.browseRowHits.clear();
+    g_app.browseRowNodes.clear();
+    g_app.browseSel = nullptr;
+    g_app.browseScroll = 0.0f;
     // Duplicate results deliberately survive: every Node pointer is
     // stripped before the hunt starts, so the report is owned strings only,
     // and losing an expensive answer just because the user looked at
@@ -1600,6 +1624,156 @@ static void DrawSidebar(const Rect& area) {
     }
 }
 
+namespace browse {
+constexpr float kHeadH = 26.0f;
+constexpr float kRowH  = 22.0f;
+}
+
+static void EnsureBrowseOrder() {
+    if (!g_app.browseOrder.empty() || g_app.trail.empty()) return;
+    const Node* cur = g_app.trail.back();
+    if (!cur) return;
+    g_app.browseOrder.reserve(cur->children.size());
+    for (const Node& c : cur->children) g_app.browseOrder.push_back(&c);
+    const int  key = g_app.browseSort;
+    const bool asc = g_app.browseAsc;
+    std::stable_sort(
+        g_app.browseOrder.begin(), g_app.browseOrder.end(),
+        [key, asc](const Node* a, const Node* b) {
+            int c = 0;
+            switch (key) {
+                case 0: c = lstrcmpiW(a->name.c_str(), b->name.c_str());
+                        break;
+                case 2: c = lstrcmpiW(CatName(a->cat), CatName(b->cat));
+                        if (c == 0) c = (a->size < b->size)   ? 1
+                                        : (a->size > b->size) ? -1 : 0;
+                        break;
+                case 3: c = (a->files < b->files)   ? -1
+                            : (a->files > b->files) ? 1 : 0;
+                        break;
+                default: c = (a->size < b->size)   ? -1
+                             : (a->size > b->size) ? 1 : 0;
+                         break;
+            }
+            if (key != 0 && key != 2 && c == 0) {
+                c = lstrcmpiW(a->name.c_str(), b->name.c_str());
+            }
+            return asc ? (c < 0) : (c > 0);
+        });
+}
+
+// The details list: a view over the current directory's children, which
+// the tree already knows everything about, so no disk is read and every
+// folder row has a size. Only the visible span draws.
+static void DrawBrowse(const Rect& area) {
+    g_app.browseRowHits.clear();
+    g_app.browseRowNodes.clear();
+    g_app.browseBar = Rect{};
+    EnsureBrowseOrder();
+
+    FillRect(area, theme::kInk);
+    const float pad   = layout::kPad;
+    const float nameW = area.w * 0.46f;
+    const float sizeW = 110.0f;
+    const float kindW = 120.0f;
+    const float fileW = 90.0f;
+
+    // header
+    const Rect head{area.x, area.y, area.w, browse::kHeadH};
+    FillRect(head, theme::kSlab, 0.8f);
+    const wchar_t* labels[4] = {L"Name", L"Size", L"Kind", L"Files"};
+    const float colX[4] = {area.x + pad,
+                           area.x + nameW,
+                           area.x + nameW + sizeW + 24.0f,
+                           area.x + nameW + sizeW + kindW + 24.0f};
+    const float colW[4] = {nameW - pad, sizeW, kindW, fileW};
+    for (int c = 0; c < 4; ++c) {
+        std::wstring t = labels[c];
+        if (c == g_app.browseSort) t += g_app.browseAsc ? L"  \u2191"
+                                                        : L"  \u2193";
+        DrawText(t, g_app.fmtSmall.get(),
+                 Rect{colX[c], head.y + 5.0f, colW[c], layout::kLineSmall},
+                 theme::kMute, 1.0f, true,
+                 (c == 1 || c == 3) ? DWRITE_TEXT_ALIGNMENT_TRAILING
+                                    : DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_app.browseHeadHits[c] =
+            Rect{colX[c], head.y, colW[c], browse::kHeadH};
+    }
+    FillRect(Rect{head.x, head.bottom() - 1.0f, head.w, 1.0f}, theme::kRule);
+
+    const float listY = head.bottom();
+    const float listH = area.bottom() - listY;
+    const size_t n    = g_app.browseOrder.size();
+    const float total = static_cast<float>(n) * browse::kRowH;
+    const float maxScroll = std::max(0.0f, total - listH);
+    if (g_app.browseScroll > maxScroll) g_app.browseScroll = maxScroll;
+    if (g_app.browseScroll < 0.0f) g_app.browseScroll = 0.0f;
+
+    if (n == 0) {
+        DrawText(L"Nothing in this folder.", g_app.fmtSmall.get(),
+                 Rect{area.x + pad, listY + 14.0f, area.w - pad * 2,
+                      layout::kLineSmall},
+                 theme::kMute);
+        return;
+    }
+
+    const size_t first =
+        static_cast<size_t>(g_app.browseScroll / browse::kRowH);
+    const size_t visible =
+        static_cast<size_t>(listH / browse::kRowH) + 2;
+    for (size_t i = first; i < n && i < first + visible; ++i) {
+        const Node* nd = g_app.browseOrder[i];
+        const float y = listY + static_cast<float>(i) * browse::kRowH -
+                        g_app.browseScroll;
+        if (y + browse::kRowH < listY || y > area.bottom()) continue;
+        const Rect row{area.x, y, area.w - 12.0f, browse::kRowH};
+
+        const bool hot = row.contains(g_app.mouseX, g_app.mouseY);
+        if (nd == g_app.browseSel) {
+            FillRect(row, theme::kSlabHi, 0.9f);
+        } else if (hot) {
+            FillRect(row, theme::kSlabHi, 0.45f);
+        }
+        // the kind, said with colour like everywhere else
+        FillRect(Rect{row.x + 2.0f, y + 3.0f, 3.0f, browse::kRowH - 6.0f},
+                 theme::kCat[static_cast<int>(nd->cat)], nd->dir ? 0.35f
+                                                                : 0.9f);
+        std::wstring name = SanitizeForDisplay(nd->name);
+        if (nd->dir) name += L"\\";
+        DrawText(name, g_app.fmtSmall.get(),
+                 Rect{colX[0], y + 3.0f, colW[0], layout::kLineSmall},
+                 nd->dir ? theme::kType : theme::kMute, 1.0f, true);
+        DrawText(FormatSize(nd->size), g_app.fmtSmall.get(),
+                 Rect{colX[1], y + 3.0f, colW[1], layout::kLineSmall},
+                 theme::kType, 0.95f, true, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        DrawText(nd->dir ? L"folder" : CatName(nd->cat),
+                 g_app.fmtSmall.get(),
+                 Rect{colX[2], y + 3.0f, colW[2], layout::kLineSmall},
+                 theme::kMute, 0.9f, true);
+        if (nd->dir) {
+            DrawText(FormatCount(nd->files), g_app.fmtSmall.get(),
+                     Rect{colX[3], y + 3.0f, colW[3], layout::kLineSmall},
+                     theme::kMute, 0.9f, true,
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        g_app.browseRowHits.push_back(row);
+        g_app.browseRowNodes.push_back(nd);
+    }
+
+    // scrollbar
+    if (total > listH) {
+        const float trackH = listH - 4.0f;
+        const float thumbH =
+            std::max(24.0f, trackH * (listH / total));
+        const float t = (maxScroll > 0.0f) ? g_app.browseScroll / maxScroll
+                                           : 0.0f;
+        const float thumbY = listY + 2.0f + (trackH - thumbH) * t;
+        g_app.browseBar =
+            Rect{area.right() - 8.0f, thumbY, 6.0f, thumbH};
+        FillRound(g_app.browseBar, 3.0f, theme::kSlabHi, 0.9f);
+    }
+}
+
 // The tab strip. Hidden entirely with one tab: a strip of one is chrome
 // with no decision in it.
 static void DrawViewTabs(const Rect& area) {
@@ -1647,6 +1821,28 @@ static void DrawViewTabs(const Rect& area) {
 
 static void DrawBreadcrumb(const Rect& area) {
     g_app.crumbHits.clear();
+    // Map | List, right-aligned. Per tab, like the panel and the search.
+    {
+        const float w = 46.0f;
+        g_app.mapToggleHit =
+            Rect{area.right() - w * 2.0f - 14.0f, area.y + 7.0f, w, 24.0f};
+        g_app.listToggleHit =
+            Rect{area.right() - w - 10.0f, area.y + 7.0f, w, 24.0f};
+        FillRound(g_app.mapToggleHit, 4.0f,
+                  g_app.browse ? theme::kSlab : theme::kSlabHi);
+        FillRound(g_app.listToggleHit, 4.0f,
+                  g_app.browse ? theme::kSlabHi : theme::kSlab);
+        DrawText(L"Map", g_app.fmtSmall.get(),
+                 Rect{g_app.mapToggleHit.x, g_app.mapToggleHit.y + 4.0f, w,
+                      layout::kLineSmall},
+                 g_app.browse ? theme::kMute : theme::kType, 1.0f, false,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawText(L"List", g_app.fmtSmall.get(),
+                 Rect{g_app.listToggleHit.x, g_app.listToggleHit.y + 4.0f,
+                      w, layout::kLineSmall},
+                 g_app.browse ? theme::kType : theme::kMute, 1.0f, false,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
     if (g_app.trail.empty()) return;
 
     const float avail = area.w - layout::kPad * 2.0f;
@@ -2203,6 +2399,13 @@ static void Render() {
     DrawSidebar(side);
     DrawViewTabs(tabsR);
     DrawBreadcrumb(crumb);
+    if (g_app.browse) {
+        FillRect(Rect{crumb.x, crumb.bottom() - 1.0f, crumb.w, 1.0f},
+                 theme::kRule);
+        DrawBrowse(map);
+        DrawStatus(status);
+        return;   // ~DrawScope ends the draw, as on every other route out
+    }
     FillRect(Rect{crumb.x, crumb.bottom() - 1.0f, crumb.w, 1.0f}, theme::kRule);
     DrawTreemap(map);
     DrawStatus(status);
@@ -2291,7 +2494,8 @@ static void SnapshotActiveView() {
     for (size_t i = 1; i < g_app.trail.size(); ++i) {
         if (g_app.trail[i]) t.comps.push_back(g_app.trail[i]->name);
     }
-    t.query = g_app.query;
+    t.query  = g_app.query;
+    t.browse = g_app.browse;
     if (t.panel == static_cast<int>(App::Panel::Search) &&
         !t.query.empty()) {
         t.title = t.query;   // a search tab is named for its question
@@ -2331,8 +2535,9 @@ static void RestoreTrailComps(const std::vector<std::wstring>& comps) {
 // (instant when the cache is fresh, which the launch prefetch makes the
 // normal case), then walk back to where it was.
 static void ApplyView(const ViewTab& t) {
-    g_app.panel = static_cast<App::Panel>(t.panel);
-    g_app.query = t.query;
+    g_app.panel  = static_cast<App::Panel>(t.panel);
+    g_app.query  = t.query;
+    g_app.browse = t.browse;
     g_app.searchFocus = false;
     g_app.searchSelectAll = false;
     if (!t.root.empty() &&
@@ -2365,8 +2570,9 @@ static void OpenViewTab(const std::wstring& root, int volumeIndex,
     t.root        = root;
     t.volumeIndex = volumeIndex;
     t.comps       = std::move(comps);
-    t.panel = (panel >= 0) ? panel : static_cast<int>(g_app.panel);
-    t.query = query;
+    t.panel  = (panel >= 0) ? panel : static_cast<int>(g_app.panel);
+    t.query  = query;
+    t.browse = g_app.browse;   // a tab born from a list stays a list
     if (t.panel == static_cast<int>(App::Panel::Search) &&
         !t.query.empty()) {
         t.title = t.query;
@@ -3045,24 +3251,14 @@ static void ShowRowMenu(int rowIndex, POINT screenPt) {
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
-static void ShowCellMenu(int cellIndex, POINT screenPt) {
-    if (cellIndex < 0 ||
-        static_cast<size_t>(cellIndex) >= g_app.cells.size()) {
-        return;
-    }
-    const Node* node = g_app.cells[static_cast<size_t>(cellIndex)].node;
-    if (!node) return;
-    const std::wstring path = CellPath(cellIndex);
-
-    // Snapshot everything the dialogs below need. TrackPopupMenu and
-    // MessageBoxW each run a modal message loop that dispatches posted
-    // messages, and WM_SCAN_DONE is posted - so a rescan landing while the
-    // menu is open frees the tree this node lives in. Reading a size out of
-    // that freed memory to fill a delete confirmation is the worst place in
-    // the program to be wrong.
-    const uint64_t nodeSize  = node->size;
-    const uint32_t nodeFiles = node->files;
-    const bool     nodeDir   = node->dir;
+// The shared right-click for anything with a path: the map's cells and
+// browse mode's rows both come here. It takes facts, not Node pointers,
+// because TrackPopupMenu and MessageBoxW each run a modal loop that can
+// dispatch a WM_SCAN_DONE and free the tree mid-menu.
+static void ShowNodeMenu(const std::wstring& path, uint64_t nodeSize,
+                         uint32_t nodeFiles, bool nodeDir,
+                         std::vector<std::wstring> newTabComps,
+                         POINT screenPt) {
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -3089,16 +3285,8 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
     DestroyMenu(menu);
 
     if (cmd == 6 && nodeDir) {
-        // The clicked folder, addressed as components below the current
-        // root: the tab stores strings, so nothing here can dangle.
-        std::vector<std::wstring> comps;
-        for (size_t i = 1; i < g_app.trail.size(); ++i) {
-            if (g_app.trail[i]) comps.push_back(g_app.trail[i]->name);
-        }
-        for (const Node* n2 : CellChain(g_app.cells, cellIndex)) {
-            if (n2) comps.push_back(n2->name);
-        }
-        OpenViewTab(CurrentRootPath(), g_app.selected, std::move(comps));
+        OpenViewTab(CurrentRootPath(), g_app.selected,
+                    std::move(newTabComps));
         return;
     }
     if (cmd == 1) {
@@ -3166,6 +3354,24 @@ static void ShowCellMenu(int cellIndex, POINT screenPt) {
     } else if (cmd == 5) {
         DoForceRemove(path, nodeSize, nodeFiles, nodeDir);
     }
+}
+
+static void ShowCellMenu(int cellIndex, POINT screenPt) {
+    if (cellIndex < 0 ||
+        static_cast<size_t>(cellIndex) >= g_app.cells.size()) {
+        return;
+    }
+    const Node* node = g_app.cells[static_cast<size_t>(cellIndex)].node;
+    if (!node) return;
+    std::vector<std::wstring> comps;
+    for (size_t i = 1; i < g_app.trail.size(); ++i) {
+        if (g_app.trail[i]) comps.push_back(g_app.trail[i]->name);
+    }
+    for (const Node* n2 : CellChain(g_app.cells, cellIndex)) {
+        if (n2) comps.push_back(n2->name);
+    }
+    ShowNodeMenu(CellPath(cellIndex), node->size, node->files, node->dir,
+                 std::move(comps), screenPt);
 }
 
 // -------------------------------------------------------------- window proc
@@ -3532,6 +3738,45 @@ static void OnLeftClick(int x, int y) {
             ActivateView(static_cast<int>(i));
             return;
         }
+    }
+
+    if (g_app.mapToggleHit.contains(fx, fy) ||
+        g_app.listToggleHit.contains(fx, fy)) {
+        g_app.browse = g_app.listToggleHit.contains(fx, fy);
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if (g_app.browse) {
+        if (g_app.browseBar.w > 0.0f &&
+            g_app.browseBar.contains(fx, fy)) {
+            g_app.browseDragging = true;
+            g_app.browseDragOff  = fy - g_app.browseBar.y;
+            return;
+        }
+        for (int c = 0; c < 4; ++c) {
+            if (g_app.browseHeadHits[c].contains(fx, fy)) {
+                if (g_app.browseSort == c) {
+                    g_app.browseAsc = !g_app.browseAsc;
+                } else {
+                    g_app.browseSort = c;
+                    g_app.browseAsc  = (c == 0 || c == 2);
+                }
+                g_app.browseOrder.clear();   // re-sorted on next draw
+                g_app.browseScroll = 0.0f;   // a new order starts at its top
+                InvalidateRect(g_app.hwnd, nullptr, FALSE);
+                return;
+            }
+        }
+        for (size_t i = 0; i < g_app.browseRowHits.size() &&
+                           i < g_app.browseRowNodes.size(); ++i) {
+            if (g_app.browseRowHits[i].contains(fx, fy)) {
+                g_app.browseSel = g_app.browseRowNodes[i];
+                InvalidateRect(g_app.hwnd, nullptr, FALSE);
+                return;
+            }
+        }
+        if (fx >= layout::kSidebar) return;   // empty list space
     }
 
     for (size_t i = 0; i < g_app.crumbHits.size(); ++i) {
@@ -3943,9 +4188,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
-        case WM_MOUSEMOVE:
+        case WM_MOUSEMOVE: {
+            if (g_app.browse) {
+                const float inv2 =
+                    (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
+                g_app.mouseX = static_cast<float>(GET_X_LPARAM(lp)) * inv2;
+                g_app.mouseY = static_cast<float>(GET_Y_LPARAM(lp)) * inv2;
+                if (g_app.browseDragging) {
+                    // The thumb follows the pointer; scroll follows the
+                    // thumb. Solved for scroll from the same mapping the
+                    // draw uses.
+                    const float listY =
+                        g_app.mapBounds.y + browse::kHeadH;
+                    const float listH  = g_app.mapBounds.bottom() - listY;
+                    const float total  =
+                        static_cast<float>(g_app.browseOrder.size()) *
+                        browse::kRowH;
+                    const float maxScroll = std::max(0.0f, total - listH);
+                    const float trackH = listH - 4.0f;
+                    const float thumbH = std::max(
+                        24.0f, trackH * (total > 0.0f ? listH / total
+                                                      : 1.0f));
+                    const float span = trackH - thumbH;
+                    if (span > 0.5f && maxScroll > 0.0f) {
+                        const float t =
+                            (g_app.mouseY - g_app.browseDragOff - listY -
+                             2.0f) /
+                            span;
+                        g_app.browseScroll =
+                            std::max(0.0f, std::min(1.0f, t)) * maxScroll;
+                    }
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             OnMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             return 0;
+        }
 
         case WM_MOUSELEAVE:
             g_app.hoverNode = nullptr;
@@ -3956,6 +4235,59 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetFocus(hwnd);
             OnLeftClick(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             return 0;
+
+        case WM_LBUTTONDBLCLK: {
+            if (!g_app.browse) break;
+            const float inv2 =
+                (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
+            const float dx = static_cast<float>(GET_X_LPARAM(lp)) * inv2;
+            const float dy = static_cast<float>(GET_Y_LPARAM(lp)) * inv2;
+            for (size_t i = 0; i < g_app.browseRowHits.size() &&
+                               i < g_app.browseRowNodes.size(); ++i) {
+                if (!g_app.browseRowHits[i].contains(dx, dy)) continue;
+                const Node* nd = g_app.browseRowNodes[i];
+                if (!nd) break;
+                if (nd->dir) {
+                    // Descend, staying in the list. Same trail the map
+                    // navigation uses, so Backspace walks back out.
+                    g_app.trail.push_back(nd);
+                    g_app.browseOrder.clear();
+                    g_app.browseSel    = nullptr;
+                    g_app.browseScroll = 0.0f;
+                    RebuildTreemap();
+                    g_app.panelDirty = true;
+                } else {
+                    // Hand the file to its own application, which is what
+                    // a double-click means in a file list. The shell does
+                    // the association lookup; nothing here guesses.
+                    std::wstring full = TrailPath(g_app.trail);
+                    AppendComponent(full, nd->name);
+                    ShellExecuteW(g_app.hwnd, L"open", full.c_str(),
+                                  nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            break;
+        }
+
+        case WM_MOUSEWHEEL: {
+            if (!g_app.browse) break;
+            const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            g_app.browseScroll -=
+                static_cast<float>(delta) / WHEEL_DELTA * browse::kRowH *
+                3.0f;
+            if (g_app.browseScroll < 0.0f) g_app.browseScroll = 0.0f;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_LBUTTONUP:
+            if (g_app.browseDragging) {
+                g_app.browseDragging = false;
+                return 0;
+            }
+            break;
 
         case WM_RBUTTONDOWN: {
             const float inv =
@@ -3969,6 +4301,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
                     ClientToScreen(hwnd, &rp);
                     ShowDupeMenu(static_cast<int>(i), rp);
+                    return 0;
+                }
+            }
+            if (g_app.browse) {
+                for (size_t i = 0; i < g_app.browseRowHits.size() &&
+                                   i < g_app.browseRowNodes.size(); ++i) {
+                    if (!g_app.browseRowHits[i].contains(fx, fy)) continue;
+                    const Node* nd = g_app.browseRowNodes[i];
+                    if (!nd) break;
+                    std::wstring full = TrailPath(g_app.trail);
+                    AppendComponent(full, nd->name);
+                    std::vector<std::wstring> comps;
+                    for (size_t k = 1; k < g_app.trail.size(); ++k) {
+                        if (g_app.trail[k]) {
+                            comps.push_back(g_app.trail[k]->name);
+                        }
+                    }
+                    comps.push_back(nd->name);
+                    POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    ClientToScreen(hwnd, &rp);
+                    ShowNodeMenu(full, nd->size, nd->files, nd->dir,
+                                 std::move(comps), rp);
                     return 0;
                 }
             }
@@ -4373,7 +4727,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
 
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
