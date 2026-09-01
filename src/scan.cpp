@@ -652,6 +652,13 @@ constexpr uint64_t kProbeBytes = 16u << 10;
 // probing head and tail would read most of it twice.
 constexpr uint64_t kSmallFile = 64u << 10;
 
+// Above this, three interior probes run after the head and tail probes.
+// Same-size disk images routinely share both ends (identical boot sectors,
+// identical footers) and differ in the middle; 48 KB of probing there is
+// the difference between rejecting a pair for kilobytes and reading tens
+// of gigabytes to find the first differing byte.
+constexpr uint64_t kDeepProbeFile = 8u << 20;
+
 enum class OpenWhy { Ok, Cloud, Unreadable };
 
 // Open one candidate with every content-safety check applied to the handle
@@ -739,6 +746,12 @@ static bool HashRegion(HANDLE h, uint64_t offset, uint64_t length,
         if (got == 0) break;                  // end of file
         hasher.Update(buf.data(), got);
         bytesRead += got;
+        // Publish per chunk, not per file: a digest of one 60 GB image is
+        // minutes of reading, and a counter that only moves between files
+        // reads as a hang.
+        if (progress) {
+            progress->bytes.store(bytesRead, std::memory_order_relaxed);
+        }
         if (remaining != UINT64_MAX) remaining -= got;
     }
     out = hasher.Finish();
@@ -780,10 +793,9 @@ static std::vector<std::vector<size_t>> Regroup(
 enum class VerifyResult { Equal, Different, Unreadable };
 
 // Reads two files in lockstep and compares them byte for byte, stopping the
-// instant they differ. This is the exact confirmation the digest cannot
-// give: a 128-bit hash answers "almost certainly the same", which is fine
-// for honest data but not against a drive of malware samples where two
-// different files could be crafted to collide. It is also no more I/O than
+// instant they differ. This is the exact confirmation a digest cannot give:
+// a 128-bit hash answers "almost certainly the same", and two different
+// files could in principle be crafted to collide. It is no more I/O than
 // hashing both - each file is read once - and strictly less when they turn
 // out to differ, because the read stops at the first mismatched byte.
 static VerifyResult VerifyIdentical(const std::wstring& rootPath,
@@ -821,6 +833,9 @@ static VerifyResult VerifyIdentical(const std::wstring& rootPath,
         if (gotA != gotB) { res = VerifyResult::Different; break; }
         if (gotA == 0) break;                 // both at end, everything matched
         bytesRead += gotA;
+        if (progress) {
+            progress->bytes.store(bytesRead, std::memory_order_relaxed);
+        }
         if (std::memcmp(bufA.data(), bufB.data(), gotA) != 0) {
             res = VerifyResult::Different;     // stop at the first difference
             break;
@@ -841,7 +856,7 @@ bool VerifyFilesIdentical(const std::wstring& a, const std::wstring& b,
     const HANDLE hb = OpenForRead(b, whyB);
     if (hb == INVALID_HANDLE_VALUE) { CloseHandle(ha); return false; }
 
-    std::vector<uint8_t> bufA(1u << 20), bufB(1u << 20);
+    std::vector<uint8_t> bufA(8u << 20), bufB(8u << 20);
     bool equal = true;
     for (;;) {
         if (progress && progress->cancel.load(std::memory_order_relaxed)) {
@@ -858,6 +873,9 @@ bool VerifyFilesIdentical(const std::wstring& a, const std::wstring& b,
         }
         if (gotA != gotB) { equal = false; break; }
         if (gotA == 0) break;
+        if (progress) {
+            progress->bytes.fetch_add(gotA, std::memory_order_relaxed);
+        }
         if (std::memcmp(bufA.data(), bufB.data(), gotA) != 0) {
             equal = false;
             break;
@@ -898,8 +916,11 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
 
     // One reusable buffer. 1 MB keeps the read count low on a spinning disk
     // without the allocation itself being a spike.
-    std::vector<uint8_t> buf(1u << 20);
-    std::vector<uint8_t> bufB(1u << 20);   // second lane for lockstep verify
+    // 8 MB per lane: the full-read tier alternates between two files, and
+    // on a spinning disk every alternation is a seek, so larger chunks cut
+    // the seek count eightfold for 16 MB of working memory.
+    std::vector<uint8_t> buf(8u << 20);
+    std::vector<uint8_t> bufB(8u << 20);   // second lane for lockstep verify
 
     // Groups of exactly two are confirmed by an exact byte comparison rather
     // than by hashing both - same reads, but no collision can slip through
@@ -972,17 +993,26 @@ DupReport HashCandidates(std::vector<DupFile> candidates,
 
         std::vector<std::vector<size_t>> live{std::move(group)};
 
-        // Tier 1 and 2: head, then tail. Most files that merely share a
-        // size differ within the first few kilobytes, and the ones that do
-        // not are usually a format with a fixed header - disk images,
-        // media containers - which the tail then separates. A file only
-        // reaches the full read if it survives both.
+        // Probe tiers: head, then tail, then - for large files - three
+        // interior points. Most files that merely share a size differ
+        // within the first few kilobytes; the ones that do not are usually
+        // a format with a fixed header and footer - disk images, media
+        // containers - which the tail and interior probes then separate.
+        // A file only reaches the full read if it survives every probe.
         if (size > kSmallFile) {
-            for (int tier = 0; tier < 2 && !rep.cancelled; ++tier) {
-                const uint64_t off = (tier == 0) ? 0 : size - kProbeBytes;
+            uint64_t offs[5];
+            int      tiers = 0;
+            offs[tiers++] = 0;
+            offs[tiers++] = size - kProbeBytes;
+            if (size >= kDeepProbeFile) {
+                offs[tiers++] = size / 2;
+                offs[tiers++] = size / 4;
+                offs[tiers++] = size - size / 4;
+            }
+            for (int tier = 0; tier < tiers && !rep.cancelled; ++tier) {
                 std::vector<std::vector<size_t>> next;
                 for (const auto& g : live) {
-                    auto split = probeTier(g, off, kProbeBytes);
+                    auto split = probeTier(g, offs[tier], kProbeBytes);
                     for (auto& sub : split) next.push_back(std::move(sub));
                     if (rep.cancelled) break;
                 }

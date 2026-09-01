@@ -123,10 +123,15 @@ verification before touching a file.
 makes two files possible duplicates, not actual ones, and the original
 finder spent a whole file discovering otherwise; two 40 GB images
 differing in their first block cost 80 GB of reading. Comparison is
-tiered: exact size (free), a 16 KB head, a 16 KB tail, and only what
-survives all three is read in full. The tail tier exists because disk
-images and media containers share fixed headers, so a head probe alone
-does not separate them. Only a complete digest may call two files equal.
+tiered: exact size (free), a 16 KB head, a 16 KB tail, and for files past
+8 MB (`kDeepProbeFile`) three interior probes at the quarter points, with
+the middle first. Only what survives every probe is read in full. The
+tail and interior tiers exist because disk images and media containers
+share fixed headers and footers, so a head probe alone does not separate
+them; two same-size VM images that differ only in the middle used to cost
+a full read each. Only a complete digest may call two files equal, and
+every reader publishes progress bytes per chunk, because a counter that
+only moves between files reads as a hang during a 60 GB verify.
 Measured on 20 same-size files differing at byte 0: 3.24 s to 0.28 s cold,
 7.09 s to 0.14 s warm.
 

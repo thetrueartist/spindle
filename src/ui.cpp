@@ -32,6 +32,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <unordered_set>
+#include <cwctype>
 #include <process.h>
 
 using namespace spindle;
@@ -151,7 +153,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.8.0";
+constexpr const wchar_t* kAppVersion = L"1.8.1";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -245,6 +247,14 @@ struct App {
     // Which group and member each drawn row is, so a recycle can find a
     // verified twin within the same group and never delete the last copy.
     std::vector<std::pair<int, int>> dupeRowRef;
+    // In-map reveal: clicking a duplicate navigates the map to the file
+    // and flashes its cell, and every duplicate on screen gets a marker
+    // while the Dupes tab is up. The set holds case-folded full paths.
+    const Node*                      flashNode = nullptr;
+    Anim                             dupeFlash;
+    std::wstring                     pendingReveal;
+    std::unordered_set<std::wstring> dupePaths;
+    std::vector<uint8_t>             cellDupe;   // parallel to `cells`
     // Separate from the scanner's, so the two never write each other's
     // counters or cancel one another.
     Progress              dupeProgress;
@@ -350,6 +360,40 @@ static std::wstring CellPath(int cellIndex) {
         AppendComponent(p, n->name);
     }
     return p;
+}
+
+// Case-fold for path identity. Both sides of every comparison come out of
+// this program (the report on one hand, CellPath on the other), so simple
+// towlower is enough; this is display navigation, not a security check.
+static std::wstring FoldPath(std::wstring p) {
+    for (wchar_t& c : p) c = static_cast<wchar_t>(towlower(c));
+    return p;
+}
+
+// Rebuild the case-folded set of every path in the duplicate report.
+static void RebuildDupePathSet() {
+    g_app.dupePaths.clear();
+    for (const DupGroup& grp : g_app.dupes.groups) {
+        for (const DupFile& f : grp.files) {
+            g_app.dupePaths.insert(FoldPath(f.Full()));
+        }
+    }
+}
+
+// Mark the cells whose file is in the duplicate report, so the map can
+// outline them while the Dupes tab is up. Runs per treemap rebuild, which
+// is navigation-rate, not frame-rate.
+static void MarkDupeCells() {
+    g_app.cellDupe.assign(g_app.cells.size(), 0);
+    if (g_app.dupePaths.empty()) return;
+    for (size_t i = 0; i < g_app.cells.size(); ++i) {
+        const Cell& c = g_app.cells[i];
+        if (!c.node || c.node->dir) continue;
+        if (g_app.dupePaths.count(
+                FoldPath(CellPath(static_cast<int>(i)))) != 0) {
+            g_app.cellDupe[i] = 1;
+        }
+    }
 }
 
 static void SetBrush(uint32_t rgb, float alpha = 1.0f) {
@@ -484,6 +528,8 @@ static void DropTreeReferences() {
     g_app.extStats.clear();
     g_app.fileList.clear();
     g_app.rowHits.clear();
+    g_app.flashNode = nullptr;   // points into the tree being dropped
+    g_app.cellDupe.clear();
     // Duplicate results deliberately survive: every Node pointer is
     // stripped before the hunt starts, so the report is owned strings only,
     // and losing an expensive answer just because the user looked at
@@ -532,6 +578,9 @@ struct ScanRequest {
 // to the user.
 unsigned __stdcall ScanThread(void* param) {
     std::unique_ptr<ScanRequest> req(static_cast<ScanRequest*>(param));
+    // A request without an explicit Progress reports through the
+    // foreground one rather than dereferencing null.
+    if (req->progress == nullptr) req->progress = &g_app.progress;
     try {
         SYSTEM_INFO si{};
         GetNativeSystemInfo(&si);
@@ -730,6 +779,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
 
     // Order matters: everything that points into the old tree is dropped
     // before the tree itself is freed.
+    g_app.pendingReveal.clear();
     g_app.selected  = volumeIndex;
     DropTreeReferences();
     g_app.result.reset();
@@ -777,6 +827,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     req->hwnd      = g_app.hwnd;
     req->gen       = g_app.scanGen.fetch_add(1) + 1;
     req->keepCache = g_app.settings.keepCaches;
+    req->progress  = &g_app.progress;
 
     const uintptr_t h =
         _beginthreadex(nullptr, 0, ScanThread, req.get(), 0, nullptr);
@@ -832,6 +883,7 @@ static void RebuildTreemap() {
     const float minArea = std::max(6.0f, area / 42000.0f);
 
     BuildTreemap(*cur, g_app.mapBounds, 5, minArea, g_app.cells);
+    MarkDupeCells();
 }
 
 // Rebuilds whichever side panel is showing, for the directory currently in
@@ -1085,6 +1137,29 @@ static void DrawSidebar(const Rect& area) {
             return;
         }
 
+        // Results are up, but the hunt must stay repeatable: files change,
+        // drives change, and a report with no way to refresh it is a dead
+        // end. Two compact buttons share the row the tall ones had.
+        {
+            const float half = (rowW - 6.0f) / 2.0f;
+            g_app.dupeButton = Rect{area.x + layout::kPad, y, half, 22.0f};
+            g_app.dupeAllButton =
+                Rect{area.x + layout::kPad + half + 6.0f, y, half, 22.0f};
+            FillRound(g_app.dupeButton, 4.0f, theme::kSlabHi);
+            FillRound(g_app.dupeAllButton, 4.0f, theme::kSlab);
+            DrawText(L"Hunt again", g_app.fmtSmall.get(),
+                     Rect{g_app.dupeButton.x, g_app.dupeButton.y + 3.0f,
+                          half, layout::kLineSmall},
+                     theme::kType, 1.0f, false,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+            DrawText(L"All drives", g_app.fmtSmall.get(),
+                     Rect{g_app.dupeAllButton.x, g_app.dupeAllButton.y + 3.0f,
+                          half, layout::kLineSmall},
+                     theme::kType, 1.0f, false,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+            y += 28.0f;
+        }
+
         std::wstring head = FormatSize(g_app.dupes.totalWasted) +
                             L" recoverable in " +
                             FormatCount(g_app.dupes.groups.size()) +
@@ -1109,7 +1184,8 @@ static void DrawSidebar(const Rect& area) {
                      theme::kMute, 0.9f, true);
             y += 18.0f;
         }
-        DrawText(L"click a file to show it in Explorer",
+        DrawText(L"click a file to see it on the map \u00B7 "
+                 L"right-click: Explorer, recycle",
                  g_app.fmtSmall.get(),
                  Rect{area.x + layout::kPad, y, rowW, layout::kLineSmall},
                  theme::kMute, 0.8f, true);
@@ -1519,6 +1595,19 @@ static void DrawTreemap(const Rect& area) {
 
         const bool hot = !zooming && c.node == g_app.hoverNode;
         DrawCell(c, r, hot, scaleY, alpha, hot ? hoverT : 0.0f);
+
+        // Duplicate markers, only while the Dupes tab is up: a thin amber
+        // outline on every file the report names, and a brighter fading
+        // one on the file a click just revealed.
+        const size_t ci = static_cast<size_t>(&c - g_app.cells.data());
+        if (g_app.panel == App::Panel::Dupes && ci < g_app.cellDupe.size() &&
+            g_app.cellDupe[ci] != 0) {
+            StrokeRect(r, theme::kSignal, 0.55f * alpha, 1.0f);
+        }
+        if (c.node == g_app.flashNode && g_app.dupeFlash.Running()) {
+            const float t = 1.0f - g_app.dupeFlash.Raw();
+            StrokeRect(r, theme::kSignal, 0.35f + 0.65f * t, 2.0f);
+        }
     }
 }
 
@@ -1874,6 +1963,91 @@ static void RevealInExplorer(const std::wstring& path) {
     if (parent.find(L'"') != std::wstring::npos) return;
     ShellExecuteW(g_app.hwnd, L"open", parent.c_str(), nullptr, nullptr,
                   SW_SHOWNORMAL);
+}
+
+// Walk the current tree to `full`, retarget the map at its parent and flash
+// the file's cell. Returns false when the tree on screen does not contain
+// the path (wrong drive, or the tree is older than the report).
+static bool NavigateToPath(const std::wstring& full) {
+    if (!g_app.result) return false;
+    const Node* root = &g_app.result->root;
+    const std::wstring& rootName = root->name;
+    if (rootName.empty() || full.size() <= rootName.size()) return false;
+    if (CompareStringOrdinal(full.c_str(),
+                             static_cast<int>(rootName.size()),
+                             rootName.c_str(),
+                             static_cast<int>(rootName.size()),
+                             TRUE) != CSTR_EQUAL) {
+        return false;
+    }
+
+    size_t pos = rootName.size();
+    if (pos < full.size() && full[pos] == L'\\') ++pos;
+
+    std::vector<const Node*> trail{root};
+    const Node* cur      = root;
+    const Node* fileNode = nullptr;
+    while (pos < full.size()) {
+        const size_t sep = full.find(L'\\', pos);
+        const std::wstring comp =
+            (sep == std::wstring::npos) ? full.substr(pos)
+                                        : full.substr(pos, sep - pos);
+        pos = (sep == std::wstring::npos) ? full.size() : sep + 1;
+        if (comp.empty()) continue;
+
+        const Node* child = nullptr;
+        for (const Node& c : cur->children) {
+            if (lstrcmpiW(c.name.c_str(), comp.c_str()) == 0) {
+                child = &c;
+                break;
+            }
+        }
+        if (!child) return false;
+        if (child->dir) {
+            trail.push_back(child);
+            cur = child;
+        } else {
+            fileNode = child;
+            break;
+        }
+    }
+    if (!fileNode) return false;
+
+    g_app.trail      = std::move(trail);
+    g_app.hoverNode  = nullptr;
+    g_app.hoverPrev  = nullptr;
+    g_app.hoverIndex = -1;
+    RebuildTreemap();
+    g_app.panelDirty = true;
+    g_app.flashNode  = fileNode;
+    g_app.dupeFlash.Begin(g_app.motion ? 1600 : 800);
+    SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    return true;
+}
+
+// Show a duplicate where it lives in this program: on the map. Switches
+// drive when the file is on another volume (instant when its cache is
+// fresh, which the launch prefetch makes the normal case). Explorer is the
+// fallback for a path the trees cannot serve, and stays available from the
+// right-click menu regardless.
+static void ShowDupeInMap(const std::wstring& full) {
+    if (NavigateToPath(full)) return;
+
+    if (full.size() >= 3 && full[1] == L':' && full[2] == L'\\') {
+        for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+            const std::wstring& vp = g_app.volumes[i].path;
+            if (!vp.empty() &&
+                towupper(vp[0]) == towupper(full[0])) {
+                StartScan(static_cast<int>(i));
+                if (NavigateToPath(full)) return;
+                // The tree is on its way; finish when it lands.
+                g_app.pendingReveal = full;
+                return;
+            }
+        }
+    }
+    RevealInExplorer(full);
 }
 
 // Paste into the search box: first line only, printable characters only, the
@@ -2303,6 +2477,8 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
         g_app.dupes.groups.erase(
             g_app.dupes.groups.begin() + ref.first);
     }
+    RebuildDupePathSet();
+    MarkDupeCells();
     g_app.dupes.totalWasted = 0;
     for (const DupGroup& grp : g_app.dupes.groups) {
         g_app.dupes.totalWasted += grp.wasted;
@@ -2471,13 +2647,14 @@ static void OnLeftClick(int x, int y) {
         return;
     }
 
-    // A duplicate row opens the file where it actually lives. Each row
-    // carries its own full path, so this works for a pooled hunt spanning
-    // drives as well as one folder.
+    // A duplicate row shows the file where it lives on the map, switching
+    // drive if it has to. Each row carries its own full path, so this
+    // works for a pooled hunt spanning drives as well as one folder.
+    // Explorer and recycling stay on the right-click menu.
     for (size_t i = 0; i < g_app.dupeRowHits.size() &&
                        i < g_app.dupeRowPaths.size(); ++i) {
         if (g_app.dupeRowHits[i].contains(fx, fy)) {
-            RevealInExplorer(g_app.dupeRowPaths[i]);
+            ShowDupeInMap(g_app.dupeRowPaths[i]);
             return;
         }
     }
@@ -2888,6 +3065,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp != kTimerId) break;
             if (g_app.scanning || g_app.dupeRunning || g_app.zoom.Running() ||
                 g_app.reveal.Running() || g_app.hoverFade.Running() ||
+                g_app.dupeFlash.Running() ||
                 g_app.tabSlide.Running()) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else {
@@ -2941,6 +3119,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.zoom.Begin(0);
                 g_app.reveal.Begin(g_app.motion ? kRevealMs : 0);
                 SetTimer(hwnd, kTimerId, kFrameMs, nullptr);
+                if (!g_app.pendingReveal.empty()) {
+                    const std::wstring full = g_app.pendingReveal;
+                    g_app.pendingReveal.clear();
+                    NavigateToPath(full);   // quietly gives up on a miss
+                }
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -2984,6 +3167,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (rep) {
                 g_app.dupes = std::move(*rep);
                 g_app.dupesRun = true;
+                RebuildDupePathSet();
+                MarkDupeCells();
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;

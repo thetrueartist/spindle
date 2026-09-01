@@ -85,10 +85,12 @@ Dupes panel. The search runs in tiers so that very little is read in full:
 
 1. Same size. Files of different lengths cannot be identical, so this
    free test eliminates almost everything.
-2. First 16 KB, then last 16 KB. Most same-size files differ within the
-   first few kilobytes. The ones that do not are usually formats with a
-   fixed header, like disk images and media containers, and the tail
-   check separates those.
+2. First 16 KB, then last 16 KB, and for files past 8 MB another 16 KB
+   at the quarter, middle and three-quarter marks. Most same-size files
+   differ within the first few kilobytes. Disk images are the awkward
+   case: two different fixed-size VM images can share the boot sector at
+   the head and the footer at the tail, and the interior probes reject
+   those for kilobytes where reading them out would cost gigabytes.
 3. Full content, only for what survives. A group of exactly two, the
    common case, is confirmed by comparing the files byte for byte, which
    is exact and stops at the first difference. Groups of three or more
@@ -105,7 +107,11 @@ a placeholder after the scan rather than fetching it. Hardlinks are
 excluded because they are already the same bytes and deleting one frees
 nothing.
 
-Click a result to open it in Explorer. Right-click to recycle that copy.
+Click a result and Spindle shows the file on its own map: it switches to
+the right drive, walks the tree to the file and outlines its cell, and
+while the Dupes tab is open every file in the report carries a thin
+outline so the duplicates are visible in place. Right-click a result for
+Explorer, or to recycle that copy.
 The delete only proceeds after Spindle has re-verified, byte for byte,
 that another identical copy still exists, so the last copy can never be
 the one deleted, and a hash match alone is never enough. Deletion goes to
