@@ -179,7 +179,16 @@ struct Entry {
 struct NamePool {
     std::vector<wchar_t> data;
 
+    // Returns kNoName when the pool has grown past what a 32-bit offset
+    // can address. Truncating instead would hand back a reference to the
+    // wrong part of the buffer, and a name is what paths are built from.
+    static constexpr uint32_t kNoName = 0xFFFFFFFFu;
+
     uint32_t Add(const std::wstring& s, uint16_t& lenOut) {
+        if (data.size() >= kNoName) {
+            lenOut = 0;
+            return kNoName;
+        }
         const uint32_t off = static_cast<uint32_t>(data.size());
         const size_t n = std::min<size_t>(s.size(), 0xFFFF);
         data.insert(data.end(), s.begin(), s.begin() + static_cast<long>(n));
@@ -188,6 +197,7 @@ struct NamePool {
     }
 
     std::wstring Get(uint32_t off, uint16_t len) const {
+        if (off == kNoName) return std::wstring();
         if (len == 0 || off > data.size() || data.size() - off < len) {
             return std::wstring();
         }

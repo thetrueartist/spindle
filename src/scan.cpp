@@ -613,7 +613,15 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
     // A cache rooted somewhere other than the volume root is one an older
     // build's folder scan wrote into the volume's slot. Refuse and remove
     // it so the next clean scan replaces it.
-    if (lstrcmpiW(out.root.name.c_str(), volumePath.c_str()) != 0) {
+    // Compared over the whole stored string, not up to its first NUL: an
+    // embedded NUL would otherwise end the comparison early and get a
+    // longer name approved on the strength of its prefix.
+    if (out.root.name.size() != volumePath.size() ||
+        CompareStringOrdinal(out.root.name.c_str(),
+                             static_cast<int>(out.root.name.size()),
+                             volumePath.c_str(),
+                             static_cast<int>(volumePath.size()),
+                             TRUE) != CSTR_EQUAL) {
         DeleteFileW(path.c_str());
         return false;
     }
