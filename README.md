@@ -472,3 +472,7 @@ Sizes are logical file length, so compressed and sparse files read larger
 than their footprint on disk. Hardlinked and cloud-only bytes are the two
 cases large enough to matter and both are measured and reported;
 compression is not.
+
+## License
+
+MIT. See LICENSE.
