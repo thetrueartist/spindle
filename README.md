@@ -70,7 +70,110 @@ refused outright — not by the dialog, but in the removal code itself, so
 there is no path to them. It never terminates a system process, and never
 touches the registry.
 
+## Duplicates
+
+![the Dupes panel, pooled across drives](docs/duplicates.png)
+
+Finding duplicates means reading file *contents* — the one thing the scanner
+otherwise never does — so it is a deliberate button in the **Dupes** panel,
+not something that happens on its own. It is also bounded hard, in tiers, so
+almost nothing is read in full:
+
+1. **Same size.** Two files of different lengths cannot be identical, so this
+   is free and eliminates almost everything.
+2. **First 16 KB, then last 16 KB.** Most files that merely share a size
+   differ within the first few kilobytes; the ones that do not are usually a
+   format with a fixed header — disk images, media containers — which the
+   tail then separates.
+3. **The rest.** Only what survives all three is read in full. A group of
+   exactly two — the common case — is confirmed by comparing the two byte for
+   byte rather than hashing both: exact where a 128-bit digest is only
+   near-certain, and stopped at the first differing byte. Three or more group
+   by digest, which is O(n) reads where comparing every pair would be O(n²).
+
+Measured on twenty 100 MB files that share a size and differ at the first
+byte — the case the naive "hash everything" loses worst — it reads 320 KB
+where reading each in full would read 2 GB.
+
+**Cloud files are never downloaded to be compared.** A OneDrive placeholder
+is recognised and skipped, and the read handle is opened so that a file which
+became a placeholder since the scan refuses rather than fetches. **Hardlinks
+are excluded** — they are already the same bytes, and "deduplicating" one
+frees nothing.
+
+Click a result to open it in Explorer. Right-click it to recycle that copy —
+but only after Spindle has proved, byte for byte, that another identical copy
+remains, so the last copy can never be the one deleted, and never on the
+strength of a hash. It goes to the Recycle Bin, reversibly, and asks first.
+
+**Across every scanned drive.** The second button pools candidates from every
+drive's remembered scan, so a file that exists once on `C:` and once on `D:`
+— the duplicate a single-folder search can never see — is found. Each row
+carries its own drive, so the list stays unambiguous.
+
+## What's really reclaimable
+
+Sizes are logical file length, which overstates what deleting actually frees.
+Two cases matter enough that the status bar names them:
+
+**Hardlinked bytes exist once**, however many names point at them — WinSxS is
+built this way, and a tool that reports its apparent size as recoverable is
+lying by tens of gigabytes. On the MFT path, where the link count is free, a
+hardlinked file is marked and its bytes are totalled separately.
+
+**Cloud-only bytes are not on the disk at all.** A OneDrive placeholder has a
+size on paper and occupies little or nothing locally, so it is counted apart
+rather than folded into a figure that claims local space you are not using.
+
+## Comparing scans
+
+The cache holds the last finished scan of each drive, so "what ate my disk
+this week" needs nothing new on disk. **Compare with the cached scan** (in the
+`···` menu) diffs the two: what grew, shrank, appeared and vanished, largest
+movement first, with a one-megabyte floor so the answer is a place to look
+rather than a wall of rows. A folder that appeared is reported once at its
+root, not as ten thousand files inside it.
+
+## Command line
+
+A command line makes Task Scheduler the scheduler — a better answer than a
+service that has to be kept alive — and is how a UNC path gets scanned at all,
+since only lettered volumes are enumerated in the window.
+
+```
+spindle.exe [path]                 open the window on a volume, folder or
+                                     \\server\share
+spindle.exe --csv <file> <path>    scan, write CSV, exit — no window
+spindle.exe --duplicates [bytes] <path>   include a duplicate report
+spindle.exe --version | --help
+```
+
+With `--csv` nothing is shown and the exit code is 0 on success, 1 on failure,
+so a scheduled task can act on it. Anything beginning with a dash is treated
+as a mistyped option, never a path, so a typo can never start a scan by
+accident.
+
+Spindle can also add a **Scan with Spindle** entry to a folder's right-click
+menu (in the `···` menu). It is off by default and the only thing in the
+program that writes to the registry — per-user under `HKCU`, no elevation, and
+unticking removes exactly the keys ticking it created.
+
 ## Building
+
+Cross-compiles for **x86-64** and, with llvm-mingw, **ARM64** (`make
+ARCH=aarch64`).
+
+## Building
+
+Requires MinGW-w64. Cross-compiles for **x86-64** from Linux (also MSYS2), and
+for **ARM64** with llvm-mingw via `make ARCH=aarch64`.
+
+```
+make            # build/spindle.exe
+make test       # 900+ assertions under ASan, UBSan and ThreadSanitizer
+make stress     # the scanner's concurrency structure over a real tree
+make analyze    # cppcheck + clang-tidy
+```
 
 Requires MinGW-w64. Cross-compiles from Linux; also builds under MSYS2.
 
