@@ -156,7 +156,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.9.2";
+constexpr const wchar_t* kAppVersion = L"1.9.3";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -2855,6 +2855,11 @@ static void ShowAppMenu(POINT screenPt) {
                 L"Show in Explorer's folder menu");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 8, L"Compare with the cached scan...");
+    AppendMenuW(menu,
+                MF_STRING | (g_app.dupesRun && !g_app.dupes.groups.empty()
+                                 ? 0u
+                                 : MF_GRAYED),
+                10, L"Export duplicates to CSV...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 5, L"Open cache folder");
     AppendMenuW(menu, MF_STRING, 6, L"Clear scan caches");
@@ -2920,6 +2925,27 @@ static void ShowAppMenu(POINT screenPt) {
                 ShellExecuteW(g_app.hwnd, L"open", L"explorer.exe",
                               (L"\"" + dir + L"\"").c_str(), nullptr,
                               SW_SHOWNORMAL);
+            }
+            break;
+        }
+        case 10: {
+            if (!g_app.dupesRun || g_app.dupes.groups.empty()) break;
+            wchar_t file[MAX_PATH] = L"spindle-duplicates.csv";
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner   = g_app.hwnd;
+            ofn.lpstrFilter = L"CSV file\0*.csv\0All files\0*.*\0";
+            ofn.lpstrFile   = file;
+            ofn.nMaxFile    = MAX_PATH;
+            ofn.lpstrDefExt = L"csv";
+            ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
+                              OFN_NOCHANGEDIR;
+            if (!GetSaveFileNameW(&ofn)) break;
+            if (!ExportDuplicatesCsv(g_app.dupes, file)) {
+                MessageBoxW(g_app.hwnd,
+                            L"Could not write that file. Check the folder "
+                            L"is writable and try again.",
+                            L"Spindle", MB_OK | MB_ICONWARNING);
             }
             break;
         }
