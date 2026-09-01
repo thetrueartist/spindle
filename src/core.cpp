@@ -1843,9 +1843,14 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 const std::string v = line.substr(eq + 1);
                 uint64_t n = 0;
                 bool ok = !v.empty() && v.size() <= 20;
-                for (char c : v) {
-                    if (c < '0' || c > '9') { ok = false; break; }
-                    n = n * 10 + static_cast<uint64_t>(c - '0');
+                for (char digit : v) {
+                    if (digit < '0' || digit > '9') { ok = false; break; }
+                    const uint64_t d = static_cast<uint64_t>(digit - '0');
+                    // Twenty digits is not a bound: UINT64_MAX has
+                    // twenty. A wrapped serial would read as "accept
+                    // anything", which is the opposite of its job.
+                    if (n > (UINT64_MAX - d) / 10) { ok = false; break; }
+                    n = n * 10 + d;
                 }
                 if (ok) s.updateSerial = n;
             }
@@ -1937,10 +1942,17 @@ bool ParseSize(const std::wstring& text, uint64_t& out) {
     }
     if (i < text.size() && (text[i] == L'.' || text[i] == L',')) {
         ++i;
+        // Six fractional digits, then the rest are consumed and ignored.
+        // The product frac * mult must fit, and mult reaches 2^40 for
+        // terabytes, so six digits is the honest ceiling; it still
+        // resolves about a megabyte in a terabyte. Saturating instead
+        // would not have worked: the divide by fracScale afterwards
+        // turns a saturated product back into approximately nothing.
         while (i < text.size() && text[i] >= L'0' && text[i] <= L'9') {
-            if (fracScale > UINT64_MAX / 10) break;
-            frac = frac * 10 + static_cast<uint64_t>(text[i] - L'0');
-            fracScale *= 10;
+            if (fracScale <= 100000ull) {
+                frac = frac * 10 + static_cast<uint64_t>(text[i] - L'0');
+                fracScale *= 10;
+            }
             sawDigit = true;
             ++i;
         }
@@ -1968,7 +1980,7 @@ bool ParseSize(const std::wstring& text, uint64_t& out) {
     if (value > UINT64_MAX / mult) return false;
     out = value * mult;
     if (fracScale > 1) {
-        out = SatAdd(out, (frac * mult) / fracScale);
+        out = SatAdd(out, SatMul(frac, mult) / fracScale);
     }
     return true;
 }

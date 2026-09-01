@@ -123,7 +123,13 @@ struct CacheMeta {
 // and the ordinary scan runs instead.
 inline constexpr size_t   kMaxCacheBytes   = size_t{1} << 30;
 inline constexpr size_t   kMaxCacheNameLen = 4096;          // UTF-16 units
-inline constexpr uint64_t kMaxCacheNodes   = uint64_t{1} << 26;
+// Bounded by memory, not by how large a file someone can write. The
+// reader reserves children up front, so a count derived from the file
+// size alone let a one gigabyte cache demand nearly four gigabytes of
+// address space in a single call, on a thread with nothing to catch the
+// failure. Four million nodes is roughly 288 MB of Node, and larger than
+// any volume this has been pointed at.
+inline constexpr uint64_t kMaxCacheNodes   = uint64_t{1} << 22;
 
 // Maximum directory nesting any tree may reach, whatever produced it. The
 // directory walker already stops here; the cache reader and the MFT builder

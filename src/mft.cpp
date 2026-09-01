@@ -347,9 +347,20 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
             if (run.sparse) {
                 // Unallocated stretch of the MFT: skip the record numbers
                 // it covers rather than misaligning everything after it.
-                rec += run.clusters * bi.bytesPerCluster / bi.bytesPerRecord;
+                rec += SatMul(run.clusters, bi.bytesPerCluster) /
+                       bi.bytesPerRecord;
                 if (rec >= recordCount) break;
                 continue;
+            }
+            // Both fields come off the disk and are bounded only by
+            // their width, so the products wrap without this. A wrapped
+            // plan reads the right volume at the wrong offsets and files
+            // records under the wrong numbers: a silently wrong tree.
+            if (bi.bytesPerCluster != 0 &&
+                (run.clusters > UINT64_MAX / bi.bytesPerCluster ||
+                 static_cast<uint64_t>(run.lcn) >
+                     UINT64_MAX / bi.bytesPerCluster)) {
+                continue;   // implausible run: skip it, keep the rest
             }
             uint64_t remaining = run.clusters * bi.bytesPerCluster;
             uint64_t off = static_cast<uint64_t>(run.lcn) * bi.bytesPerCluster;
@@ -426,11 +437,13 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
                 ntfs::ParseRecord(r, bi.bytesPerRecord);
             if (!info.valid || !info.inUse || !info.hasName) continue;
             if (info.isExtension) continue;
+            // Compared at full width, so a 48-bit reference past the
+            // table is rejected instead of wrapping onto a valid index.
             if (info.parent >= recordCount) continue;   // dangling parent
 
             Entry& e = entries[idx];
             e.used   = true;
-            e.parent = info.parent;
+            e.parent = static_cast<uint32_t>(info.parent);   // range-checked
             e.isDir  = info.isDir;
             e.size   = info.isDir ? 0 : info.size;
             e.nameOff = pool.Add(info.name, e.nameLen);
@@ -460,6 +473,14 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     }
 
     if (files == 0 && dirs == 0) return false;   // nothing usable; fall back
+
+    // Everything from here to the end of the tree build is inside one
+    // try: these are the five largest allocations in the function, and
+    // this returns false on failure so the caller falls back to the
+    // directory walk. Without it a crafted volume turned "unavailable
+    // fast path" into a dead process, and the headless export had no
+    // catch above it at all.
+    try {
 
     // ---- pass two: count children so every vector is sized exactly -------
 
@@ -569,6 +590,15 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     out.stats.hardlinkFiles = hardlinkFiles;
     out.stats.hardlinkBytes = hardlinkBytes;
     out.stats.bytes     = 0;   // filled in by the caller's roll-up
+
+    } catch (...) {
+        // The contract is that a failure here changes nothing and the
+        // caller falls back to the directory walk. The tree may be
+        // half-built by this point, so it goes too.
+        out.root.children.clear();
+        out.stats = ScanStats{};
+        return false;
+    }
     return true;
 }
 

@@ -37,7 +37,11 @@ namespace {
 
 // Guard against a pathological or hostile directory structure driving the
 // worker queue without bound. 512 is far past anything a real volume reaches.
-constexpr int kMaxDepth = 512;
+// One less than kMaxTreeDepth, because this counts the parent while the
+// readers count the level being created: matching the numbers naively
+// let the walk build a tree one level deeper than any reader would
+// accept, so its cache was written and then refused on every launch.
+constexpr int kMaxDepth = static_cast<int>(kMaxTreeDepth) - 1;
 
 // Prefix a path so the Win32 API skips MAX_PATH normalisation entirely.
 // Paths handed here are always canonical: they are either a caller-supplied

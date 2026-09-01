@@ -351,8 +351,8 @@ RecordInfo ParseRecord(const uint8_t* record, size_t len) {
                         }
 
                         bestNamespace = rank;
-                        info.parent = static_cast<uint32_t>(
-                            r.U64(base) & 0x0000FFFFFFFFFFFFull);
+                        info.parent =
+                            r.U64(base) & 0x0000FFFFFFFFFFFFull;
 
                         info.name.clear();
                         info.name.reserve(nameChars);

@@ -73,7 +73,12 @@ struct RecordInfo {
     bool     hasName   = false;
     bool     isExtension = false;  // continuation of another record
     uint64_t size      = 0;      // unnamed $DATA logical size
-    uint32_t parent    = 0;      // parent directory's MFT index
+    // All 48 bits of the $FILE_NAME parent reference. Narrowing this to
+    // 32 before the caller's range check let an index far past the table
+    // truncate onto a valid one, most usefully onto the root, which
+    // grafts a file to the volume root so every path shown for it, and
+    // every action taken on it, names somewhere it does not live.
+    uint64_t parent    = 0;      // parent directory's MFT index
     // Number of directory entries pointing at this record. Above one the
     // file exists in several places at once and deleting any single one of
     // them frees nothing -- which is the whole of the WinSxS illusion.

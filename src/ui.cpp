@@ -1065,7 +1065,17 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
         CacheMeta meta;
         // A UNC path has no drive letter to key a cache to, so this simply
         // misses and the ordinary scan runs.
-        if (LoadScanCache(root, *cached, meta)) {
+        // In a try: the cache file is unprivileged-writable and this
+        // runs on the interface thread, where an escaping bad_alloc is
+        // not an error message but a dead process. A cache that cannot
+        // be read is simply no cache.
+        bool loaded = false;
+        try {
+            loaded = LoadScanCache(root, *cached, meta);
+        } catch (...) {
+            loaded = false;
+        }
+        if (loaded) {
             g_app.result = std::move(cached);
             g_app.trail.push_back(&g_app.result->root);
             RebuildTreemap();
@@ -3075,7 +3085,13 @@ static void ShowDiffAgainstCache() {
 
     ScanResult previous;
     CacheMeta meta;
-    if (!LoadScanCache(volume, previous, meta)) {
+    bool havePrevious = false;
+    try {
+        havePrevious = LoadScanCache(volume, previous, meta);
+    } catch (...) {
+        havePrevious = false;
+    }
+    if (!havePrevious) {
         MessageBoxW(g_app.hwnd,
                     L"There is no cached scan of this drive to compare "
                     L"against yet. Scan it once more and the comparison "

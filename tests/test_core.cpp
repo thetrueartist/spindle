@@ -2105,6 +2105,30 @@ static void TestSettings() {
         CHECK(!ParseCommandLine({L"--verify-update-manifest"}).valid,
               "verify refuses short argument lists");
     }
+
+    {
+        // A settings file is untrusted input: twenty digits is not a
+        // bound, since UINT64_MAX has twenty, and a wrapped anti-replay
+        // serial would read as "accept anything".
+        const char* huge = "update_serial=18446744073709551616\n";
+        Settings r = ParseSettings(
+            reinterpret_cast<const uint8_t*>(huge), strlen(huge));
+        CHECK(r.updateSerial == 0,
+              "an overflowing update serial is refused, not wrapped");
+        const char* ok = "update_serial=1756742400\n";
+        r = ParseSettings(reinterpret_cast<const uint8_t*>(ok), strlen(ok));
+        CHECK(r.updateSerial == 1756742400ull,
+              "a plausible update serial round-trips");
+
+        // The fractional part of a size bound multiplies too, reached
+        // through the query parser since that is the public door to it.
+        const Query wrapped = ParseQuery(L">0.9999999999999999999tb");
+        CHECK(wrapped.minSize > (900ull << 30),
+              "a long fraction saturates instead of wrapping to nothing");
+        const Query plain = ParseQuery(L">1gb");
+        CHECK(plain.minSize == (1ull << 30),
+              "ordinary sizes still parse exactly");
+    }
 }
 
 int main() {
