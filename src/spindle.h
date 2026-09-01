@@ -665,6 +665,11 @@ bool ExportCsv(const Node& root, const std::wstring& rootPath,
 // host test build supplies its own so the CSV writer stays testable.
 bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text);
 
+// The duplicate report as CSV rows (set, copies, sizes, path), and the
+// writer that puts it in a file. The text builder is pure and host-tested.
+std::wstring DuplicatesCsvText(const DupReport& rep);
+bool ExportDuplicatesCsv(const DupReport& rep, const std::wstring& outPath);
+
 // Human-readable byte count, e.g. "1.44 GB".
 std::wstring FormatSize(uint64_t bytes);
 

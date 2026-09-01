@@ -755,6 +755,37 @@ bool ExportCsv(const Node& root, const std::wstring& rootPath,
     return WriteTextFileUtf8(outPath, text);
 }
 
+// The duplicate report as CSV: one row per file, numbered by set, so a
+// spreadsheet can group, sort and filter what the panel showed. Pure text
+// building, host-tested; the writer below is the same one the tree export
+// trusts.
+std::wstring DuplicatesCsvText(const DupReport& rep) {
+    std::wstring text;
+    text.reserve(1u << 16);
+    text += L"set,copies,bytes_each,bytes_recoverable,path\r\n";
+    size_t setNo = 0;
+    for (const DupGroup& g : rep.groups) {
+        ++setNo;
+        for (const DupFile& f : g.files) {
+            text += std::to_wstring(setNo);
+            text += L',';
+            text += std::to_wstring(g.files.size());
+            text += L',';
+            text += std::to_wstring(g.size);
+            text += L',';
+            text += std::to_wstring(g.wasted);
+            text += L',';
+            CsvField(text, f.Full());
+            text += L"\r\n";
+        }
+    }
+    return text;
+}
+
+bool ExportDuplicatesCsv(const DupReport& rep, const std::wstring& outPath) {
+    return WriteTextFileUtf8(outPath, DuplicatesCsvText(rep));
+}
+
 // -------------------------------------------------------------- scan cache
 //
 // Layout, little-endian throughout:

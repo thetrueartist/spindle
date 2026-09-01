@@ -2017,6 +2017,36 @@ static void TestSettings() {
     const std::vector<uint8_t> big(kMaxSettingsBytes + 1, 'x');
     r = ParseSettings(big.data(), big.size());
     CHECK(r.keepCaches, "oversize input keeps defaults");
+
+    {
+        DupReport rep;
+        DupGroup g;
+        g.size   = 10;
+        g.wasted = 10;
+        DupFile a;
+        a.root = L"D:\\";
+        a.path = L"x\\a.bin";
+        a.size = 10;
+        DupFile b = a;
+        // A rootless entry whose path starts with a formula character is
+        // the case that must be defused; a full path starts with a drive
+        // letter and is safe as written.
+        b.root = L"";
+        b.path = L"=cmd.bin";
+        g.files.push_back(a);
+        g.files.push_back(b);
+        rep.groups.push_back(g);
+        const std::wstring csv = DuplicatesCsvText(rep);
+        CHECK(csv.find(L"set,copies,bytes_each,bytes_recoverable,path") !=
+                  std::wstring::npos,
+              "dupes csv has its header");
+        CHECK(csv.find(L"1,2,10,10,") != std::wstring::npos,
+              "dupes csv numbers the set and counts copies");
+        CHECK(csv.find(L"D:\\x\\a.bin") != std::wstring::npos,
+              "dupes csv carries full paths");
+        CHECK(csv.find(L"'=cmd") != std::wstring::npos,
+              "formula-shaped path is prefixed, not exported raw");
+    }
 }
 
 int main() {
