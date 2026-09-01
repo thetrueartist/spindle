@@ -97,6 +97,16 @@ rescanned, the only symptom was that caching silently stopped working
 everywhere. The test fixtures used an empty root name and so could not
 catch it; one now uses a real volume path.
 
+**A duplicate is never deleted on the strength of a hash.** Recycling a
+copy from the Dupes panel is gated: it finds a *different* member of the
+same group, proves the two byte-for-byte with VerifyFilesIdentical, and
+only then offers to recycle - so the last copy can never be the one
+removed, and a 128-bit collision can never cause a deletion. Reparse
+points are refused by the open, hardlinks are already excluded from
+groups, deletion is the Recycle Bin (reversible) with a protected-path
+refusal and a No-default confirmation. The failure mode is to refuse,
+never to delete the wrong thing.
+
 **A pair is confirmed by comparison, not by hashing.** To prove two files
 identical you must read both in full either way; hashing's only advantage
 is that it turns an all-pairs comparison of a large group from O(n^2) into

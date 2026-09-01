@@ -145,7 +145,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.6.0";
+constexpr const wchar_t* kAppVersion = L"1.7.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -236,6 +236,9 @@ struct App {
     // click can open the thing the user is looking at.
     std::vector<Rect>         dupeRowHits;
     std::vector<std::wstring> dupeRowPaths;
+    // Which group and member each drawn row is, so a recycle can find a
+    // verified twin within the same group and never delete the last copy.
+    std::vector<std::pair<int, int>> dupeRowRef;
     // Separate from the scanner's, so the two never write each other's
     // counters or cancel one another.
     Progress              dupeProgress;
@@ -872,6 +875,7 @@ static void DrawSidebar(const Rect& area) {
     g_app.dupeAllButton = Rect{};
     g_app.dupeRowHits.clear();
     g_app.dupeRowPaths.clear();
+    g_app.dupeRowRef.clear();
 
     // --- duplicates
     if (g_app.panel == App::Panel::Dupes) {
@@ -963,8 +967,10 @@ static void DrawSidebar(const Rect& area) {
 
         g_app.dupeRowHits.clear();
         g_app.dupeRowPaths.clear();
+        g_app.dupeRowRef.clear();
 
-        for (const DupGroup& g : g_app.dupes.groups) {
+        for (size_t gi = 0; gi < g_app.dupes.groups.size(); ++gi) {
+            const DupGroup& g = g_app.dupes.groups[gi];
             if (y + 20.0f > area.bottom() - layout::kPad) break;
             DrawText(FormatSize(g.size) + L"  x" +
                          FormatCount(g.files.size()) + L"  (" +
@@ -983,6 +989,8 @@ static void DrawSidebar(const Rect& area) {
                                rowW + 4.0f, 15.0f};
                 g_app.dupeRowHits.push_back(row);
                 g_app.dupeRowPaths.push_back(full);
+                g_app.dupeRowRef.push_back(
+                    {static_cast<int>(gi), static_cast<int>(i)});
                 if (row.contains(g_app.mouseX, g_app.mouseY)) {
                     FillRound(row, 3.0f, theme::kSlabHi);
                 }
@@ -2020,6 +2028,107 @@ static void DoForceRemove(const std::wstring& path, uint64_t nodeSize,
     if (r.filesDeleted > 0) StartScan(g_app.selected, false);
 }
 
+// Right-clicking a duplicate row. Recycling a copy is gated on proving,
+// byte for byte, that an identical copy remains - so the last copy can
+// never be the one deleted, and a file is never removed on the strength of
+// a hash alone. Reversible: it goes to the Recycle Bin.
+static void ShowDupeMenu(int rowIndex, POINT screenPt) {
+    if (rowIndex < 0 ||
+        rowIndex >= static_cast<int>(g_app.dupeRowPaths.size()) ||
+        rowIndex >= static_cast<int>(g_app.dupeRowRef.size())) {
+        return;
+    }
+    if (g_app.dupeRunning) return;   // the report is being rebuilt
+
+    const std::wstring path = g_app.dupeRowPaths[static_cast<size_t>(rowIndex)];
+    const std::pair<int, int> ref =
+        g_app.dupeRowRef[static_cast<size_t>(rowIndex)];
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, L"Reveal in Explorer");
+    AppendMenuW(menu, MF_STRING, 2, L"Recycle this copy (keep the others)");
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                   screenPt.x, screenPt.y, 0, g_app.hwnd,
+                                   nullptr);
+    DestroyMenu(menu);
+
+    if (cmd == 1) { RevealInExplorer(path); return; }
+    if (cmd != 2) return;
+
+    // Locate a different member of the same group to fall back on.
+    if (ref.first < 0 ||
+        ref.first >= static_cast<int>(g_app.dupes.groups.size())) {
+        return;
+    }
+    DupGroup& g = g_app.dupes.groups[static_cast<size_t>(ref.first)];
+    std::wstring twin;
+    for (size_t j = 0; j < g.files.size(); ++j) {
+        const std::wstring cand = g.files[j].Full();
+        if (cand != path) { twin = cand; break; }
+    }
+    if (twin.empty()) {
+        MessageBoxW(g_app.hwnd,
+                    L"There is no other copy to fall back on, so this will "
+                    L"not be recycled.",
+                    L"Spindle", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Prove it byte for byte before anything is touched. This reads both
+    // files in full; for a very large pair it blocks briefly, with the wait
+    // cursor to say so.
+    g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
+    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const bool identical =
+        VerifyFilesIdentical(path, twin, &g_app.dupeProgress);
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    if (!identical) {
+        MessageBoxW(g_app.hwnd,
+                    L"Could not confirm an identical copy still exists - the "
+                    L"file may have changed since the search - so nothing "
+                    L"was deleted.",
+                    L"Spindle", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    const std::wstring prompt =
+        L"Recycle this copy?\n\n" + SanitizeForDisplay(path) +
+        L"\n\nA verified identical copy remains:\n" +
+        SanitizeForDisplay(twin);
+    if (MessageBoxW(g_app.hwnd, prompt.c_str(), L"Spindle",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+
+    if (!RecycleToBin(path)) {
+        MessageBoxW(g_app.hwnd,
+                    L"Could not move that file to the Recycle Bin.",
+                    L"Spindle", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Drop the recycled file from the report so the panel reflects it. Below
+    // two members a group is no longer a duplicate and goes entirely.
+    for (size_t j = 0; j < g.files.size(); ++j) {
+        if (g.files[j].Full() == path) {
+            g.files.erase(g.files.begin() + static_cast<long>(j));
+            break;
+        }
+    }
+    if (g.files.size() >= 2) {
+        g.wasted = g.size * (g.files.size() - 1);
+    } else {
+        g_app.dupes.groups.erase(
+            g_app.dupes.groups.begin() + ref.first);
+    }
+    g_app.dupes.totalWasted = 0;
+    for (const DupGroup& grp : g_app.dupes.groups) {
+        g_app.dupes.totalWasted += grp.wasted;
+    }
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
 static void ShowCellMenu(int cellIndex, POINT screenPt) {
     if (cellIndex < 0 ||
         static_cast<size_t>(cellIndex) >= g_app.cells.size()) {
@@ -2688,6 +2797,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
             const float fx = static_cast<float>(GET_X_LPARAM(lp)) * inv;
             const float fy = static_cast<float>(GET_Y_LPARAM(lp)) * inv;
+            // A duplicate row in the sidebar takes the right-click first;
+            // it offers reveal and recycle rather than the treemap actions.
+            for (size_t i = 0; i < g_app.dupeRowHits.size(); ++i) {
+                if (g_app.dupeRowHits[i].contains(fx, fy)) {
+                    POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    ClientToScreen(hwnd, &rp);
+                    ShowDupeMenu(static_cast<int>(i), rp);
+                    return 0;
+                }
+            }
             // Hit tests use final positions, so suppress the menu mid-zoom
             // where the cell under the cursor is not the one being drawn there.
             if (g_app.zoom.Running()) return 0;

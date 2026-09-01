@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <process.h>
 #include <shlobj.h>    // SHGetFolderPathW, for the cache directory
+#include <shellapi.h> // SHFileOperationW, for the Recycle Bin
 #include <aclapi.h>    // SetNamedSecurityInfoW, for taking ownership
 #include <sddl.h>
 #include <restartmanager.h>   // RmStartSession: who has this file open
@@ -654,20 +655,11 @@ enum class OpenWhy { Ok, Cloud, Unreadable };
 
 // Open one candidate with every content-safety check applied to the handle
 // rather than to what the scan recorded.
-static HANDLE OpenCandidate(const std::wstring& rootPath,
-                            const DupFile& f, OpenWhy& why) {
-    // Names are validated where they enter (IsSafeNodeName), so the
-    // components cannot carry a separator, colon or NUL - and the join
-    // still goes through the extended-length form, which stops Win32
-    // reinterpreting anything that did get through.
-    std::wstring full;
-    if (!f.root.empty()) {
-        full = f.Full();          // a pooled hunt: the file knows its volume
-    } else {
-        full = rootPath;
-        if (!full.empty() && full.back() != L'\\') full += L'\\';
-        full += f.path;
-    }
+// Open a file for reading with every content-safety check on the handle
+// itself: refuse a cloud placeholder rather than fetch it, and refuse a
+// reparse point or directory rather than follow it. Shared by the duplicate
+// hunt and the verification a deletion runs first.
+static HANDLE OpenForRead(const std::wstring& full, OpenWhy& why) {
     const std::wstring extended = ExtendedPath(full);
 
     // FILE_FLAG_OPEN_NO_RECALL: if a file became a cloud placeholder since
@@ -706,6 +698,22 @@ static HANDLE OpenCandidate(const std::wstring& rootPath,
     }
     why = OpenWhy::Ok;
     return h;
+}
+
+static HANDLE OpenCandidate(const std::wstring& rootPath,
+                            const DupFile& f, OpenWhy& why) {
+    // Names are validated where they enter (IsSafeNodeName), so the
+    // components cannot carry a separator, colon or NUL - and the join
+    // still goes through the extended-length form via OpenForRead.
+    std::wstring full;
+    if (!f.root.empty()) {
+        full = f.Full();          // a pooled hunt: the file knows its volume
+    } else {
+        full = rootPath;
+        if (!full.empty() && full.back() != L'\\') full += L'\\';
+        full += f.path;
+    }
+    return OpenForRead(full, why);
 }
 
 // Digest `length` bytes starting at `offset`. `length` of UINT64_MAX means
@@ -820,6 +828,65 @@ static VerifyResult VerifyIdentical(const std::wstring& rootPath,
     CloseHandle(ha);
     CloseHandle(hb);
     return res;
+}
+
+bool VerifyFilesIdentical(const std::wstring& a, const std::wstring& b,
+                          Progress* progress) {
+    if (a.empty() || b.empty()) return false;
+    OpenWhy whyA = OpenWhy::Unreadable;
+    const HANDLE ha = OpenForRead(a, whyA);
+    if (ha == INVALID_HANDLE_VALUE) return false;
+    OpenWhy whyB = OpenWhy::Unreadable;
+    const HANDLE hb = OpenForRead(b, whyB);
+    if (hb == INVALID_HANDLE_VALUE) { CloseHandle(ha); return false; }
+
+    std::vector<uint8_t> bufA(1u << 20), bufB(1u << 20);
+    bool equal = true;
+    for (;;) {
+        if (progress && progress->cancel.load(std::memory_order_relaxed)) {
+            equal = false;   // could not finish confirming: refuse to delete
+            break;
+        }
+        DWORD gotA = 0, gotB = 0;
+        if (!ReadFile(ha, bufA.data(), static_cast<DWORD>(bufA.size()),
+                      &gotA, nullptr) ||
+            !ReadFile(hb, bufB.data(), static_cast<DWORD>(bufB.size()),
+                      &gotB, nullptr)) {
+            equal = false;
+            break;
+        }
+        if (gotA != gotB) { equal = false; break; }
+        if (gotA == 0) break;
+        if (std::memcmp(bufA.data(), bufB.data(), gotA) != 0) {
+            equal = false;
+            break;
+        }
+    }
+    CloseHandle(ha);
+    CloseHandle(hb);
+    return equal;
+}
+
+bool RecycleToBin(const std::wstring& path) {
+    // The same refusal the treemap delete uses: never a volume root, never
+    // part of Windows. IsProtectedSystemPath also rejects the awkward
+    // spellings Win32 would resolve elsewhere.
+    if (path.empty() || IsProtectedSystemPath(path)) return false;
+
+    // SHFileOperationW wants a double-NUL-terminated list; build it by hand
+    // rather than trust the string's own terminator.
+    std::vector<wchar_t> from(path.begin(), path.end());
+    from.push_back(L'\0');
+    from.push_back(L'\0');
+
+    SHFILEOPSTRUCTW op{};
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = from.data();
+    // ALLOWUNDO = Recycle Bin (reversible); we run our own confirmation, but
+    // keep the shell's warning for anything too large to recycle.
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING |
+                FOF_NOERRORUI | FOF_SILENT;
+    return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
 }
 
 DupReport HashCandidates(std::vector<DupFile> candidates,

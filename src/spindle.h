@@ -279,6 +279,19 @@ struct Progress;
 DupReport HashCandidates(std::vector<DupFile> candidates,
                          const std::wstring& rootPath, Progress* progress);
 
+// True only if the two files are byte-for-byte identical. This is the exact
+// check a deletion must pass before it touches anything: two files with the
+// same 128-bit digest are near-certainly the same, but "near-certain" is not
+// good enough to delete one believing the other is a copy. Opens both with
+// the same safety as the hunt (no cloud fetch, no reparse follow); a file it
+// cannot read is reported as not-identical, so the deletion is refused.
+bool VerifyFilesIdentical(const std::wstring& a, const std::wstring& b,
+                          Progress* progress);
+
+// Move one file to the Recycle Bin. Reversible, refuses a protected system
+// path or a drive root, and never touches more than the single file named.
+bool RecycleToBin(const std::wstring& path);
+
 // Run a full duplicate hunt under `root`, whose files live under
 // `rootPath`. Blocks until finished, so it belongs on a worker thread or in
 // the headless command-line path. Windows-only: it opens and reads files.
