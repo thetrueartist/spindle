@@ -786,6 +786,66 @@ bool ExportDuplicatesCsv(const DupReport& rep, const std::wstring& outPath) {
     return WriteTextFileUtf8(outPath, DuplicatesCsvText(rep));
 }
 
+// ------------------------------------------------------------ json fields
+//
+// The GitHub release API answers with JSON, which is bytes off the
+// network: hostile until proven boring. This is not a JSON parser; it is
+// a bounded extractor for string fields at any depth, tolerant of
+// everything except what it is looking for being malformed. Backslash
+// escapes are honoured for \" and passed through otherwise; anything
+// unterminated, oversized or absent is simply not found.
+
+bool JsonFindString(const std::string& json, const std::string& key,
+                    size_t from, std::string& out, size_t* foundAt) {
+    if (json.size() > (16u << 20) || key.empty() || from >= json.size()) {
+        return false;
+    }
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle, from);
+    while (pos != std::string::npos) {
+        size_t p = pos + needle.size();
+        while (p < json.size() &&
+               (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' ||
+                json[p] == '\n')) {
+            ++p;
+        }
+        if (p >= json.size() || json[p] != ':') {
+            pos = json.find(needle, pos + 1);
+            continue;
+        }
+        ++p;
+        while (p < json.size() &&
+               (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' ||
+                json[p] == '\n')) {
+            ++p;
+        }
+        if (p >= json.size() || json[p] != '\"') {
+            pos = json.find(needle, pos + 1);
+            continue;
+        }
+        ++p;
+        std::string value;
+        while (p < json.size() && json[p] != '\"') {
+            if (value.size() > 4096) return false;   // nothing we want is this long
+            char c = json[p];
+            if (c == '\\' && p + 1 < json.size()) {
+                const char n = json[p + 1];
+                if (n == '\"' || n == '\\' || n == '/') {
+                    c = n;
+                    ++p;
+                } 
+            }
+            value.push_back(c);
+            ++p;
+        }
+        if (p >= json.size()) return false;   // unterminated
+        out = std::move(value);
+        if (foundAt) *foundAt = pos;
+        return true;
+    }
+    return false;
+}
+
 // -------------------------------------------------------------- scan cache
 //
 // Layout, little-endian throughout:
@@ -1272,6 +1332,36 @@ CommandLine ParseCommandLine(const std::vector<std::wstring>& args) {
                 cl.mode = CommandLine::Mode::Version;
                 return cl;
             }
+            if (flag == L"gen-update-key") {
+                cl.mode = CommandLine::Mode::GenUpdateKey;
+                return cl;
+            }
+            if (flag == L"sign-release") {
+                if (i + 3 >= args.size()) {
+                    cl.valid = false;
+                    cl.error = L"--sign-release needs <exe> <keyfile> "
+                               L"<tag>";
+                    return cl;
+                }
+                cl.mode    = CommandLine::Mode::SignRelease;
+                cl.signExe = args[i + 1];
+                cl.signKey = args[i + 2];
+                cl.signTag = args[i + 3];
+                return cl;
+            }
+            if (flag == L"verify-update-manifest") {
+                if (i + 3 >= args.size()) {
+                    cl.valid = false;
+                    cl.error = L"--verify-update-manifest needs "
+                               L"<manifest> <sig> <pubkey-b64>";
+                    return cl;
+                }
+                cl.mode           = CommandLine::Mode::VerifyManifest;
+                cl.verifyManifest = args[i + 1];
+                cl.verifySig      = args[i + 2];
+                cl.verifyPub      = args[i + 3];
+                return cl;
+            }
             if (flag == L"csv") {
                 if (i + 1 >= args.size() || args[i + 1].empty()) {
                     cl.valid = false;
@@ -1730,6 +1820,8 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 s.resumeOnLaunch = value;
             } else if (key == "prefetch_all") {
                 s.prefetchAll = value;
+            } else if (key == "check_updates") {
+                s.checkUpdates = value;
             }
         }
         line.clear();
@@ -1742,7 +1834,8 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
     const std::string text =
         std::string("keep_caches=") + (s.keepCaches ? "1" : "0") +
         "\nresume_on_launch=" + (s.resumeOnLaunch ? "1" : "0") +
-        "\nprefetch_all=" + (s.prefetchAll ? "1" : "0") + "\n";
+        "\nprefetch_all=" + (s.prefetchAll ? "1" : "0") +
+        "\ncheck_updates=" + (s.checkUpdates ? "1" : "0") + "\n";
     out.assign(text.begin(), text.end());
 }
 

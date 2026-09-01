@@ -325,12 +325,20 @@ DupReport FindDuplicates(const Node& root, const std::wstring& rootPath,
 // UNC path get in.
 
 struct CommandLine {
-    enum class Mode { Gui, Help, Version, Export };
+    enum class Mode { Gui, Help, Version, Export, GenUpdateKey,
+                      SignRelease, VerifyManifest };
     Mode         mode = Mode::Gui;
     std::wstring path;      // volume, folder or UNC path; empty means ask
     std::wstring csvOut;    // --csv destination, for Mode::Export
     uint64_t     minDup = 0;   // --duplicates threshold, 0 = not requested
     bool         wantDuplicates = false;
+    // Release signing and verification (see the auto-update notes).
+    std::wstring signExe;   // --sign-release: the built exe
+    std::wstring signKey;   // file holding the offline private key
+    std::wstring signTag;   // the release tag the manifest promises
+    std::wstring verifyManifest;   // --verify-update-manifest inputs
+    std::wstring verifySig;
+    std::wstring verifyPub;
     bool         valid = true;
     std::wstring error;
 };
@@ -454,6 +462,7 @@ struct Settings {
     bool keepCaches     = true;   // write and load .spincache files
     bool resumeOnLaunch = true;   // open the freshest cached drive at start
     bool prefetchAll    = true;   // read the other fixed drives at launch
+    bool checkUpdates   = true;   // ask GitHub for a newer release at launch
 };
 
 inline constexpr size_t kMaxSettingsBytes = 4096;
@@ -669,6 +678,28 @@ bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text);
 // writer that puts it in a file. The text builder is pure and host-tested.
 std::wstring DuplicatesCsvText(const DupReport& rep);
 bool ExportDuplicatesCsv(const DupReport& rep, const std::wstring& outPath);
+
+// Bounded extractor for a string field in untrusted JSON (the GitHub
+// release API). Finds "key": "value" from `from`, unescaping only what a
+// URL or tag needs. Returns false rather than guessing. foundAt (optional)
+// receives where the key was, so a caller can walk repeated keys.
+bool JsonFindString(const std::string& json, const std::string& key,
+                    size_t from, std::string& out,
+                    size_t* foundAt = nullptr);
+
+// Auto-update (src/update.cpp, Windows only). Dormant until the embedded
+// public key is set; every failure is the fail-closed path. See HACKING.
+bool UpdateFeatureEnabled();
+bool CheckForUpdate(const wchar_t* currentVersion, std::wstring& tagOut);
+std::wstring ApplyUpdate(const wchar_t* currentVersion);
+void CleanupOldUpdate();
+bool GenerateUpdateKeypair(std::wstring& outText);
+bool SignReleaseFile(const std::wstring& exePath,
+                     const std::wstring& privKeyB64,
+                     const std::wstring& tag, std::wstring& err);
+bool VerifyManifestFile(const std::wstring& manifestPath,
+                        const std::wstring& sigPath,
+                        const std::wstring& pubB64);
 
 // Human-readable byte count, e.g. "1.44 GB".
 std::wstring FormatSize(uint64_t bytes);

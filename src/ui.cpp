@@ -139,6 +139,7 @@ constexpr UINT WM_DUPES_DONE    = WM_APP + 2;
 constexpr UINT WM_PREFETCH_DONE = WM_APP + 3;
 constexpr UINT WM_DUPE_FILE     = WM_APP + 4;
 constexpr UINT WM_BULK_DONE     = WM_APP + 5;
+constexpr UINT WM_UPDATE_FOUND  = WM_APP + 6;
 
 // A cache this young is served without a revalidating rescan: the launch
 // prefetch (or a scan moments ago) already walked the drive, and walking it
@@ -156,7 +157,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.0.0";
+constexpr const wchar_t* kAppVersion = L"2.1.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -248,6 +249,10 @@ struct App {
     // Inline rename: a real EDIT child over the name cell, because a real
     // control brings the caret, selection and IME for free. Strings only,
     // so a tree swap mid-edit cancels cleanly and can never dangle.
+    // A verified newer release, found by the launch check. Empty until
+    // the signed manifest said so.
+    std::wstring             updateTag;
+    HANDLE                   updateWorker = nullptr;
     HWND                     renameEdit = nullptr;
     std::wstring             renameParent;
     std::wstring             renameOld;
@@ -831,6 +836,27 @@ static void JoinBulkWorker() {
     CloseHandle(g_app.bulkWorker);
     g_app.bulkWorker = nullptr;
     g_app.bulkRunning = false;
+}
+
+// The launch update check: network and crypto both happen here, off the
+// interface thread, and only a fully verified newer tag is ever posted.
+unsigned __stdcall UpdateCheckThread(void* param) {
+    HWND hwnd = static_cast<HWND>(param);
+    try {
+        std::wstring tag;
+        if (CheckForUpdate(kAppVersion, tag) && !tag.empty()) {
+            auto copy = std::make_unique<std::wstring>(tag);
+            if (PostMessageW(hwnd, WM_UPDATE_FOUND, 0,
+                             reinterpret_cast<LPARAM>(copy.get()))) {
+                static_cast<void>(copy.release());  // NOLINT
+            }
+        } else {
+            PostMessageW(hwnd, WM_UPDATE_FOUND, 0, 0);
+        }
+    } catch (...) {
+        PostMessageW(hwnd, WM_UPDATE_FOUND, 0, 0);
+    }
+    return 0;
 }
 
 unsigned __stdcall DupeThread(void* param) {
@@ -3035,6 +3061,17 @@ static void ShowAppMenu(POINT screenPt) {
     AppendMenuW(menu,
                 MF_STRING | (g_app.settings.prefetchAll ? MF_CHECKED : 0u),
                 9, L"Read every drive at launch");
+    if (UpdateFeatureEnabled()) {
+        AppendMenuW(menu,
+                    MF_STRING |
+                        (g_app.settings.checkUpdates ? MF_CHECKED : 0u),
+                    11, L"Check for updates at launch");
+        if (!g_app.updateTag.empty()) {
+            std::wstring offer = L"Update to " + g_app.updateTag +
+                                 L" (verified)...";
+            AppendMenuW(menu, MF_STRING, 12, offer.c_str());
+        }
+    }
     AppendMenuW(menu,
                 MF_STRING | (ShellVerbRegistered() ? MF_CHECKED : 0u), 7,
                 L"Show in Explorer's folder menu");
@@ -3110,6 +3147,38 @@ static void ShowAppMenu(POINT screenPt) {
                 ShellExecuteW(g_app.hwnd, L"open", L"explorer.exe",
                               (L"\"" + dir + L"\"").c_str(), nullptr,
                               SW_SHOWNORMAL);
+            }
+            break;
+        }
+        case 11:
+            g_app.settings.checkUpdates = !g_app.settings.checkUpdates;
+            SaveSettings(g_app.settings);
+            break;
+        case 12: {
+            if (g_app.updateTag.empty()) break;
+            const std::wstring ask =
+                L"Download and stage " + g_app.updateTag +
+                L"?\n\nThe download is verified against its signed "
+                L"manifest before anything changes, and you restart "
+                L"Spindle when you choose.";
+            if (MessageBoxW(g_app.hwnd, ask.c_str(), L"Spindle",
+                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) !=
+                IDYES) {
+                break;
+            }
+            SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            const std::wstring said = ApplyUpdate(kAppVersion);
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            if (said.empty()) {
+                g_app.updateTag.clear();
+                MessageBoxW(g_app.hwnd,
+                            L"Staged. Restart Spindle to finish; the "
+                            L"previous version stays beside it as "
+                            L"spindle.exe.old until then.",
+                            L"Spindle", MB_OK | MB_ICONINFORMATION);
+            } else {
+                MessageBoxW(g_app.hwnd, said.c_str(), L"Spindle",
+                            MB_OK | MB_ICONWARNING);
             }
             break;
         }
@@ -4151,6 +4220,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.volumes  = EnumerateVolumes();
             g_app.settings = LoadSettings();
 
+            // Finish any staged update, then (only when the feature is
+            // keyed and wanted) ask about a newer one, quietly.
+            CleanupOldUpdate();
+            if (UpdateFeatureEnabled() && g_app.settings.checkUpdates) {
+                const uintptr_t uh = _beginthreadex(
+                    nullptr, 0, UpdateCheckThread, hwnd, 0, nullptr);
+                if (uh != 0) {
+                    g_app.updateWorker = reinterpret_cast<HANDLE>(uh);
+                }
+            }
+
             // An explicit target beats everything: it is what the user
             // typed, or the folder they right-clicked.
             if (!g_app.startPath.empty()) {
@@ -4356,6 +4436,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.prefetchRoot.clear();
             StartPrefetchNext();
             InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_UPDATE_FOUND: {
+            std::unique_ptr<std::wstring> tag(
+                reinterpret_cast<std::wstring*>(lp));
+            if (g_app.updateWorker) {
+                WaitForSingleObject(g_app.updateWorker, INFINITE);
+                CloseHandle(g_app.updateWorker);
+                g_app.updateWorker = nullptr;
+            }
+            if (tag) g_app.updateTag = std::move(*tag);
             return 0;
         }
 
@@ -5090,6 +5182,63 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     }
     if (cl.mode == CommandLine::Mode::Export) {
         return RunHeadlessExport(cl);
+    }
+    if (cl.mode == CommandLine::Mode::GenUpdateKey) {
+        std::wstring text;
+        if (!GenerateUpdateKeypair(text)) {
+            ConsoleLine(L"spindle: key generation failed");
+            return 1;
+        }
+        // To a file as well as the console: a GUI-subsystem process
+        // cannot rely on stdout existing, and the whole point is that
+        // the person moves the private line somewhere offline.
+        WriteTextFileUtf8(L"update-key.txt", text);
+        ConsoleLine(text);
+        ConsoleLine(L"spindle: written to update-key.txt - move the "
+                    L"private line offline and delete the file");
+        return 0;
+    }
+    if (cl.mode == CommandLine::Mode::SignRelease) {
+        // The key file holds the private half, base64, one line.
+        std::wstring key;
+        {
+            const HANDLE h = CreateFileW(
+                cl.signKey.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                ConsoleLine(L"spindle: could not read the key file");
+                return 1;
+            }
+            char buf[4096] = {};
+            DWORD got = 0;
+            ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr);
+            CloseHandle(h);
+            for (DWORD i = 0; i < got; ++i) {
+                const char c = buf[i];
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '+' || c == '/' ||
+                    c == '=') {
+                    key.push_back(static_cast<wchar_t>(c));
+                }
+            }
+        }
+        std::wstring err;
+        if (!SignReleaseFile(cl.signExe, key, cl.signTag, err)) {
+            ConsoleLine(L"spindle: signing failed: " + err);
+            // A GUI-subsystem process cannot count on a console, and a
+            // silent signing failure would be maddening.
+            WriteTextFileUtf8(L"sign-error.txt", err);
+            return 1;
+        }
+        ConsoleLine(L"spindle: wrote manifest.json and manifest.sig");
+        return 0;
+    }
+    if (cl.mode == CommandLine::Mode::VerifyManifest) {
+        const bool ok = VerifyManifestFile(cl.verifyManifest,
+                                           cl.verifySig, cl.verifyPub);
+        ConsoleLine(ok ? L"spindle: manifest signature VERIFIED"
+                       : L"spindle: manifest signature REJECTED");
+        return ok ? 0 : 1;
     }
     g_app.startPath = cl.path;
 
