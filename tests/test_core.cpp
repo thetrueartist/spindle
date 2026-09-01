@@ -1890,7 +1890,7 @@ static void TestForceRemovalGuards() {
           "deep inside Program Files allowed");
     CHECK(!IsProtectedSystemPath(L"C:\\ProgramData\\DeadApp"),
           "leftover ProgramData allowed");
-    CHECK(!IsProtectedSystemPath(L"C:\\Users\\xander"),
+    CHECK(!IsProtectedSystemPath(L"C:\\Users\\sam"),
           "a whole profile is allowed (it is the user's own)");
     CHECK(IsProtectedSystemPath(L"D:\\System Volume Information"),
           "SVI refused on any volume");
@@ -1899,7 +1899,7 @@ static void TestForceRemovalGuards() {
 
     // The whole point is that ordinary user data is still removable, and
     // that a prefix match is not a path match.
-    CHECK(!IsProtectedSystemPath(L"C:\\Users\\xander\\Downloads\\big.iso"),
+    CHECK(!IsProtectedSystemPath(L"C:\\Users\\sam\\Downloads\\big.iso"),
           "a file in a profile is allowed");
     CHECK(!IsProtectedSystemPath(L"D:\\Games\\Helldivers 2"),
           "ordinary folder allowed");

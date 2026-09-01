@@ -154,7 +154,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.8.1";
+constexpr const wchar_t* kAppVersion = L"1.8.2";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -345,7 +345,7 @@ static void AppendComponent(std::wstring& p, const std::wstring& name) {
     p += name;
 }
 
-// Full path of the currently viewed directory, e.g. "C:\Users\thetr".
+// Full path of the currently viewed directory, e.g. "C:\Users\sam".
 static std::wstring TrailPath(const std::vector<const Node*>& trail) {
     std::wstring p;
     for (const Node* n : trail) AppendComponent(p, n->name);
@@ -720,6 +720,35 @@ static void CancelPrefetch(bool requeue) {
     g_app.prefetchRoot.clear();
 }
 
+// A hunt was requested while a scan runs. If the map is a complete cached
+// tree and the scan is only revalidating it, the hunt wins: cancel the
+// rescan, put the drive at the head of the background queue so freshness
+// comes back later, and let the hunt use the tree on screen. Only a first
+// scan with no tree behind it is worth blocking on, since there is
+// nothing to hunt over yet. Returns true when the hunt may proceed.
+static bool YieldScanToHunt() {
+    if (!g_app.scanning) return true;
+    if (!g_app.showingCache || !g_app.result) {
+        MessageBoxW(g_app.hwnd,
+                    L"The first scan of this drive is still running - "
+                    L"there is nothing to search until it finishes.",
+                    L"Spindle", MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+    JoinWorker();
+    g_app.scanGen.fetch_add(1);   // orphan the cancelled scan's message
+    if (g_app.selected >= 0 &&
+        g_app.selected < static_cast<int>(g_app.volumes.size())) {
+        const std::wstring& root =
+            g_app.volumes[static_cast<size_t>(g_app.selected)].path;
+        auto& q = g_app.prefetchQueue;
+        if (std::find(q.begin(), q.end(), root) == q.end()) {
+            q.insert(q.begin(), root);
+        }
+    }
+    return true;
+}
+
 // Walk the next queued drive, if nothing that wants the disk is running.
 // Called wherever the disk goes quiet: a scan or hunt finishing, a prefetch
 // completing, launch.
@@ -791,12 +820,11 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
                           bool useCache) {
     if (root.empty()) return;
     JoinWorker();
-    // And stop any duplicate hunt: it is reading paths under the old root,
-    // and its generation is only bumped when a hunt starts - so left alone
-    // it would finish and post drive A's duplicates into a panel now
-    // showing drive B.
-    JoinDupeWorker();
-    g_app.dupeGen.fetch_add(1);
+    // A running duplicate hunt deliberately survives this: it holds owned
+    // paths only, every row it produces carries its own volume, and the
+    // panel can show its progress and its results from any drive. Killing
+    // it here used to throw away minutes of reading because someone
+    // glanced at another disk.
 
     // The prefetch yields the disk to anything the user actually asked for.
     // Its interrupted drive goes back to the head of the queue - unless it
@@ -2713,11 +2741,7 @@ static void OnLeftClick(int x, int y) {
     // the duplicate a single-folder hunt can never find.
     if (g_app.dupeAllButton.w > 0.0f &&
         g_app.dupeAllButton.contains(fx, fy) && !g_app.dupeRunning) {
-        if (g_app.scanning) {
-            MessageBoxW(g_app.hwnd, L"Wait for the scan to finish first.",
-                        L"Spindle", MB_OK | MB_ICONINFORMATION);
-            return;
-        }
+        if (g_app.scanning && !YieldScanToHunt()) return;
         CancelPrefetch(true);   // the hunt reads files; the walk can wait
         auto req = std::make_unique<DupRequest>();
         size_t drives = 0;
@@ -2768,8 +2792,6 @@ static void OnLeftClick(int x, int y) {
         req->hwnd     = g_app.hwnd;
         req->gen      = g_app.dupeGen.fetch_add(1) + 1;
 
-        g_app.dupes = DupReport{};
-        g_app.dupesRun = false;
         g_app.dupeCurrentFile.clear();
         g_app.dupeProgress.files.store(0);
         g_app.dupeProgress.bytes.store(0);
@@ -2797,14 +2819,7 @@ static void OnLeftClick(int x, int y) {
     if (g_app.dupeButton.w > 0.0f && g_app.dupeButton.contains(fx, fy) &&
         !g_app.trail.empty() && g_app.result) {
         // Not while a scan is running: the two would fight for the disk.
-        if (g_app.scanning) {
-            MessageBoxW(g_app.hwnd,
-                        L"Wait for the scan to finish first - reading every "
-                        L"candidate file while the scan is still running "
-                        L"would fight it for the disk.",
-                        L"Spindle", MB_OK | MB_ICONINFORMATION);
-            return;
-        }
+        if (g_app.scanning && !YieldScanToHunt()) return;
         if (g_app.dupeRunning) return;   // already hunting
         CancelPrefetch(true);   // the hunt reads files; the walk can wait
 
@@ -2829,8 +2844,6 @@ static void OnLeftClick(int x, int y) {
         req->hwnd     = g_app.hwnd;
         req->gen      = g_app.dupeGen.fetch_add(1) + 1;
 
-        g_app.dupes = DupReport{};
-        g_app.dupesRun = false;
         g_app.dupeCurrentFile.clear();
         g_app.dupeProgress.files.store(0);
         g_app.dupeProgress.bytes.store(0);
