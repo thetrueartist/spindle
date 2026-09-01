@@ -163,8 +163,8 @@ small sizes, and `LoadImage` fails silently into the stock Windows icon.
 
 ## Security posture
 
-The threat model is that this is pointed at drives full of malware samples,
-and reads raw disk structures while elevated.
+The threat model is that every byte off a disk — names, sizes, on-disk
+structures — is untrusted input, read while elevated.
 
 - `ntfs.cpp` treats every byte as hostile. Every field goes through a cursor
   that cannot read past its buffer; no length, offset or count from disk is
