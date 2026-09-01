@@ -55,11 +55,13 @@ else, and the whole thing can be turned off in the `···` menu. The cache
 is keyed to the volume serial and parsed with the same validation as
 everything else read from disk.
 
-Views come in tabs. Right-click a folder and open it in its own tab;
-right-click a duplicate and its drive opens in one, with the file
-outlined. Each tab remembers its drive, its position in the tree and its
-panel, and switching is instant because the caches already hold every
-drive. The strip only appears once there are two tabs to choose from.
+Views come in tabs. Right-click anything and open it in its own tab: a
+folder on the map, a row in Largest or Find, a duplicate (its drive
+opens with the file outlined), or a Kinds row, which opens a tab running
+that extension's search. Each tab remembers its drive, its position in
+the tree, its panel and its search, and switching is instant because
+the caches already hold every drive. The strip only appears once there
+are two tabs to choose from.
 
 ![tabs](docs/tabs.png)
 

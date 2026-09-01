@@ -156,7 +156,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"1.9.0";
+constexpr const wchar_t* kAppVersion = L"1.9.1";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -197,6 +197,7 @@ struct ViewTab {
     int                       volumeIndex = -1;
     std::vector<std::wstring> comps;        // trail below the root
     int                       panel = 0;
+    std::wstring              query;        // the Find box, per tab
     std::wstring              title;
 };
 
@@ -2283,7 +2284,13 @@ static void SnapshotActiveView() {
     for (size_t i = 1; i < g_app.trail.size(); ++i) {
         if (g_app.trail[i]) t.comps.push_back(g_app.trail[i]->name);
     }
-    t.title = t.comps.empty() ? ViewTitleFor(root) : t.comps.back();
+    t.query = g_app.query;
+    if (t.panel == static_cast<int>(App::Panel::Search) &&
+        !t.query.empty()) {
+        t.title = t.query;   // a search tab is named for its question
+    } else {
+        t.title = t.comps.empty() ? ViewTitleFor(root) : t.comps.back();
+    }
 }
 
 // Rebuild the trail from stored component names, stopping at the deepest
@@ -2318,6 +2325,9 @@ static void RestoreTrailComps(const std::vector<std::wstring>& comps) {
 // normal case), then walk back to where it was.
 static void ApplyView(const ViewTab& t) {
     g_app.panel = static_cast<App::Panel>(t.panel);
+    g_app.query = t.query;
+    g_app.searchFocus = false;
+    g_app.searchSelectAll = false;
     if (!t.root.empty() &&
         lstrcmpiW(t.root.c_str(), CurrentRootPath().c_str()) != 0) {
         StartScanPath(t.root, t.volumeIndex, true);
@@ -2339,15 +2349,23 @@ static void ActivateView(int idx) {
 // A new tab starts from a description of where it should look, becomes
 // active immediately, and the view it replaced keeps its place.
 static void OpenViewTab(const std::wstring& root, int volumeIndex,
-                        std::vector<std::wstring> comps) {
+                        std::vector<std::wstring> comps,
+                        int panel = -1,
+                        const std::wstring& query = std::wstring()) {
     SnapshotActiveView();
     if (g_app.viewTabs.empty()) return;   // nothing on screen yet
     ViewTab t;
     t.root        = root;
     t.volumeIndex = volumeIndex;
     t.comps       = std::move(comps);
-    t.panel       = static_cast<int>(g_app.panel);
-    t.title = t.comps.empty() ? ViewTitleFor(root) : t.comps.back();
+    t.panel = (panel >= 0) ? panel : static_cast<int>(g_app.panel);
+    t.query = query;
+    if (t.panel == static_cast<int>(App::Panel::Search) &&
+        !t.query.empty()) {
+        t.title = t.query;
+    } else {
+        t.title = t.comps.empty() ? ViewTitleFor(root) : t.comps.back();
+    }
     g_app.viewTabs.push_back(std::move(t));
     g_app.activeView = static_cast<int>(g_app.viewTabs.size()) - 1;
     ApplyView(g_app.viewTabs.back());
@@ -2906,6 +2924,116 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
     g_app.dupes.totalWasted = 0;
     for (const DupGroup& grp : g_app.dupes.groups) {
         g_app.dupes.totalWasted += grp.wasted;
+    }
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+// Right-click on a sidebar row: Kinds rows offer their search in a new
+// tab; Largest and Find rows offer the file in a new tab, on the map, in
+// Explorer, or on the clipboard. Everything a left-click can do stays a
+// left-click; this is the "and also" menu.
+static void ShowRowMenu(int rowIndex, POINT screenPt) {
+    if (rowIndex < 0) return;
+    const size_t i = static_cast<size_t>(rowIndex);
+
+    if (g_app.panel == App::Panel::Kinds) {
+        if (i >= g_app.extStats.size()) return;
+        const ExtStat e = g_app.extStats[i];
+        if (e.ext == L"\u2026") return;   // the folded remainder row
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return;
+        AppendMenuW(menu, MF_STRING, 1, L"Search in a new tab");
+        AppendMenuW(menu, MF_STRING, 2, L"Search here");
+        const int cmd =
+            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                           screenPt.x, screenPt.y, 0, g_app.hwnd, nullptr);
+        DestroyMenu(menu);
+        if (cmd == 0) return;
+        const std::wstring q = e.ext.empty() ? std::wstring(L"is:file")
+                                             : (L"ext:" + e.ext);
+        if (cmd == 1) {
+            std::vector<std::wstring> comps;
+            for (size_t k = 1; k < g_app.trail.size(); ++k) {
+                if (g_app.trail[k]) comps.push_back(g_app.trail[k]->name);
+            }
+            OpenViewTab(CurrentRootPath(), g_app.selected,
+                        std::move(comps),
+                        static_cast<int>(App::Panel::Search), q);
+        } else {
+            g_app.query      = q;
+            g_app.panel      = App::Panel::Search;
+            g_app.panelDirty = true;
+        }
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if (g_app.panel != App::Panel::Largest &&
+        g_app.panel != App::Panel::Search) {
+        return;
+    }
+    if (i >= g_app.fileList.size()) return;
+
+    // Snapshot before any modal loop runs: the row's node can die with the
+    // next adopted tree.
+    const bool isDir = g_app.fileList[i].node && g_app.fileList[i].node->dir;
+    std::wstring full = TrailPath(g_app.trail);
+    AppendComponent(full, g_app.fileList[i].path);
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, L"Open in a new tab");
+    AppendMenuW(menu, MF_STRING, 2, L"Show on the map");
+    AppendMenuW(menu, MF_STRING, 3, L"Show in Explorer");
+    AppendMenuW(menu, MF_STRING, 4, L"Copy path");
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                   screenPt.x, screenPt.y, 0, g_app.hwnd,
+                                   nullptr);
+    DestroyMenu(menu);
+    if (cmd == 0) return;
+
+    // The target addressed as components below the scan root: the current
+    // trail, then the row's own relative path. A file keeps its last
+    // component off the trail and gets flashed instead.
+    std::vector<std::wstring> comps;
+    for (size_t k = 1; k < g_app.trail.size(); ++k) {
+        if (g_app.trail[k]) comps.push_back(g_app.trail[k]->name);
+    }
+    {
+        const std::wstring& rel = g_app.fileList[i].path;
+        size_t pos = 0;
+        while (pos < rel.size()) {
+            const size_t sep = rel.find(L'\\', pos);
+            const std::wstring comp =
+                (sep == std::wstring::npos) ? rel.substr(pos)
+                                            : rel.substr(pos, sep - pos);
+            pos = (sep == std::wstring::npos) ? rel.size() : sep + 1;
+            if (!comp.empty()) comps.push_back(comp);
+        }
+    }
+    if (!isDir && !comps.empty()) comps.pop_back();   // stop at the parent
+
+    switch (cmd) {
+        case 1:
+            OpenViewTab(CurrentRootPath(), g_app.selected, comps,
+                        static_cast<int>(App::Panel::Kinds));
+            if (!isDir) NavigateToPath(full);   // flash it in the new tab
+            break;
+        case 2:
+            if (isDir) {
+                RestoreTrailComps(comps);
+            } else {
+                NavigateToPath(full);
+            }
+            break;
+        case 3:
+            RevealInExplorer(full);
+            break;
+        case 4:
+            CopyPathToClipboard(full);
+            break;
+        default:
+            break;
     }
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
@@ -3834,6 +3962,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
                     ClientToScreen(hwnd, &rp);
                     ShowDupeMenu(static_cast<int>(i), rp);
+                    return 0;
+                }
+            }
+            // Then the other sidebar rows: Kinds, Largest and Find each
+            // get their own menu, tabs included.
+            for (size_t i = 0; i < g_app.rowHits.size(); ++i) {
+                if (g_app.rowHits[i].contains(fx, fy)) {
+                    POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    ClientToScreen(hwnd, &rp);
+                    ShowRowMenu(static_cast<int>(i), rp);
                     return 0;
                 }
             }
