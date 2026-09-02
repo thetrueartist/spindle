@@ -6043,7 +6043,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     }
 
     HWND hwnd = CreateWindowExW(
-        0, wc.lpszClassName, L"Spindle", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+        // WS_CLIPCHILDREN so the Direct2D repaint does not paint over the
+        // transient EDIT controls (rename, address bar). Without it the
+        // parent overwrites the child every frame: the control still holds
+        // focus and takes keys, but its text is hidden under the treemap,
+        // so typing looks dead. Wine hid the bug by compositing children.
+        0, wc.lpszClassName, L"Spindle",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
         CW_USEDEFAULT, 1280, 800, nullptr, nullptr, inst, nullptr);
     if (!hwnd) {
         CoUninitialize();
