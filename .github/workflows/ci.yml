@@ -103,3 +103,15 @@ jobs:
           $p = Start-Process -FilePath .\spindle.exe -ArgumentList @("--verify-update-manifest", "manifest.json", "manifest.sig", $pub2) -Wait -NoNewWindow -PassThru
           if ($p.ExitCode -eq 0) { throw "the wrong key verified - fail-closed is broken" }
           Write-Host "wrong key: REJECTED (good)"
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse assistant references, personal paths and secrets
+        env:
+          # An optional private denylist, kept as a repository secret so the
+          # pattern of personal terms never lives in the tree. Absent on
+          # forks, where the generic rules still apply.
+          SPINDLE_HYGIENE_DENY: ${{ secrets.HYGIENE_DENY }}
+        run: tools/hygiene.sh

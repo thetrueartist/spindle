@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Hold commit messages to the same rules as the tree: no assistant
+# references, no typographic dashes, no personal paths or secrets.
+exec "$(git rev-parse --show-toplevel)/tools/hygiene.sh" --message "$1"

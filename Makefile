@@ -74,6 +74,13 @@ $(OUT): $(SRC) src/spindle.h $(RES)
 # Core logic and the work queue are platform-independent, so both run under
 # the host sanitizers. The queue is the scanner's concurrency core, so it
 # gets a ThreadSanitizer pass of its own on top of ASan.
+hooks:
+	git config core.hooksPath .githooks
+	@echo "hooks enabled: hygiene runs on every commit"
+
+hygiene:
+	tools/hygiene.sh
+
 test:
 	@mkdir -p build
 	$(CXX_HOST) -std=c++17 -O1 -g $(WARN) \

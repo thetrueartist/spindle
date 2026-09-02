@@ -322,7 +322,11 @@ bool VerifyFilesIdentical(const std::wstring& a, const std::wstring& b,
 
 // Move one file to the Recycle Bin. Reversible, refuses a protected system
 // path or a drive root, and never touches more than the single file named.
-bool RecycleToBin(const std::wstring& path);
+// quiet: no shell progress window. Interactive callers pass their window
+// and false, so the shell shows its own progress for a large folder, with
+// its own Cancel; the result then reports the abort as a refusal.
+bool RecycleToBin(const std::wstring& path, void* owner = nullptr,
+                  bool quiet = true);
 
 // Run a full duplicate hunt under `root`, whose files live under
 // `rootPath`. Blocks until finished, so it belongs on a worker thread or in

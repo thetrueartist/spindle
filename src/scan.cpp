@@ -969,7 +969,7 @@ bool VerifyFilesIdentical(const std::wstring& a, const std::wstring& b,
     return equal;
 }
 
-bool RecycleToBin(const std::wstring& path) {
+bool RecycleToBin(const std::wstring& path, void* owner, bool quiet) {
     // The same refusal the treemap delete uses: never a volume root, never
     // part of Windows. IsProtectedSystemPath also rejects the awkward
     // spellings Win32 would resolve elsewhere.
@@ -982,12 +982,15 @@ bool RecycleToBin(const std::wstring& path) {
     from.push_back(L'\0');
 
     SHFILEOPSTRUCTW op{};
+    op.hwnd   = static_cast<HWND>(owner);
     op.wFunc  = FO_DELETE;
     op.pFrom  = from.data();
     // ALLOWUNDO = Recycle Bin (reversible); we run our own confirmation, but
-    // keep the shell's warning for anything too large to recycle.
+    // keep the shell's warning for anything too large to recycle. A large
+    // folder is enumerated by the shell before it moves, which takes real
+    // time, so the interactive path leaves the shell's progress showing.
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING |
-                FOF_NOERRORUI | FOF_SILENT;
+                FOF_NOERRORUI | (quiet ? FOF_SILENT : 0);
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
 }
 

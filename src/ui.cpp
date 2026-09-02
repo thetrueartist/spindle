@@ -140,6 +140,8 @@ constexpr UINT WM_PREFETCH_DONE = WM_APP + 3;
 constexpr UINT WM_DUPE_FILE     = WM_APP + 4;
 constexpr UINT WM_BULK_DONE     = WM_APP + 5;
 constexpr UINT WM_UPDATE_FOUND  = WM_APP + 6;
+constexpr UINT WM_RECYCLE_DONE  = WM_APP + 7;
+constexpr UINT WM_RECYCLE_FILE  = WM_APP + 8;
 
 // A cache this young is served without a revalidating rescan: the launch
 // prefetch (or a scan moments ago) already walked the drive, and walking it
@@ -301,6 +303,19 @@ struct App {
     // bin. Shares the hunt's generation counter and progress, since the
     // two are mutually exclusive.
     bool                  bulkRunning = false;
+    // Recycling runs on its own thread so a large folder, which the shell
+    // enumerates before it moves, never freezes the window.
+    bool                  recycleRunning = false;
+    HANDLE                recycleWorker  = nullptr;
+    uint64_t              recycleGen     = 0;
+    Progress              recycleProgress;
+    std::wstring          recycleCurrent;   // the item being moved
+    size_t                recycleTotal   = 0;
+    uint64_t              recycleBytes   = 0;
+    // A line for the status bar that outlives the moment, for results
+    // that deserve to be seen without a dialog to dismiss.
+    std::wstring          statusNote;
+    uint64_t              statusNoteUntil = 0;
     HANDLE                bulkWorker = nullptr;
     Rect                  dupeBulkButton;
     // Pointer position in layout units, kept so panels can highlight the
@@ -860,6 +875,107 @@ static void JoinBulkWorker() {
     g_app.bulkRunning = false;
 }
 
+// ---- recycling, off the interface thread ---------------------------------
+// The shell enumerates a folder before it moves it to the Recycle Bin, and
+// for tens of gigabytes that is long enough to read as a hang. The items
+// go one at a time on a worker; the status bar says which one and how far,
+// Esc stops after the current item, and the shell's own progress stays
+// visible for the item in flight. Paths are owned strings, so a rescan
+// swapping the tree underneath cannot touch anything here.
+
+struct RecycleRequest {
+    HWND     hwnd = nullptr;
+    uint64_t gen  = 0;
+    std::vector<std::wstring> paths;
+};
+
+struct RecycleOutcome {
+    size_t done      = 0;
+    size_t total     = 0;
+    bool   cancelled = false;
+};
+
+unsigned __stdcall RecycleThread(void* param) {
+    std::unique_ptr<RecycleRequest> req(static_cast<RecycleRequest*>(param));
+    auto outcome = std::make_unique<RecycleOutcome>();
+    outcome->total = req->paths.size();
+    try {
+        for (const std::wstring& p : req->paths) {
+            if (g_app.recycleProgress.cancel.load(std::memory_order_relaxed)) {
+                outcome->cancelled = true;
+                break;
+            }
+            try {
+                auto copy = std::make_unique<std::wstring>(p);
+                if (PostMessageW(req->hwnd, WM_RECYCLE_FILE,
+                                 static_cast<WPARAM>(req->gen),
+                                 reinterpret_cast<LPARAM>(copy.get()))) {
+                    static_cast<void>(copy.release());  // NOLINT
+                }
+            } catch (...) {
+            }
+            if (RecycleToBin(p, req->hwnd, false)) {
+                ++outcome->done;
+                g_app.recycleProgress.files.store(outcome->done,
+                                                  std::memory_order_relaxed);
+            }
+        }
+    } catch (...) {
+        outcome->cancelled = true;
+    }
+    if (PostMessageW(req->hwnd, WM_RECYCLE_DONE,
+                     static_cast<WPARAM>(req->gen),
+                     reinterpret_cast<LPARAM>(outcome.get()))) {
+        static_cast<void>(outcome.release());  // NOLINT
+    }
+    return 0;
+}
+
+static void JoinRecycleWorker() {
+    if (!g_app.recycleWorker) return;
+    g_app.recycleProgress.cancel.store(true, std::memory_order_relaxed);
+    WaitForSingleObject(g_app.recycleWorker, INFINITE);
+    CloseHandle(g_app.recycleWorker);
+    g_app.recycleWorker = nullptr;
+    g_app.recycleRunning = false;
+}
+
+// Confirmation is the caller's business; this only runs what was agreed.
+static void StartRecycle(std::vector<std::wstring> paths, uint64_t bytes) {
+    if (paths.empty() || g_app.recycleRunning) return;
+    auto req = std::make_unique<RecycleRequest>();
+    req->hwnd  = g_app.hwnd;
+    req->gen   = ++g_app.recycleGen;
+    req->paths = std::move(paths);
+
+    g_app.recycleTotal = req->paths.size();
+    g_app.recycleBytes = bytes;
+    g_app.recycleCurrent.clear();
+    g_app.recycleProgress.files.store(0);
+    g_app.recycleProgress.cancel.store(false, std::memory_order_relaxed);
+
+    const uintptr_t h =
+        _beginthreadex(nullptr, 0, RecycleThread, req.get(), 0, nullptr);
+    if (h == 0) {
+        MessageBoxW(g_app.hwnd,
+                    L"Could not start: the system refused a new thread.",
+                    L"Spindle", MB_OK | MB_ICONERROR);
+        return;
+    }
+    static_cast<void>(req.release());  // NOLINT
+    g_app.recycleWorker  = reinterpret_cast<HANDLE>(h);
+    g_app.recycleRunning = true;
+    SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+static void ShowStatusNote(const std::wstring& text, uint64_t ms) {
+    g_app.statusNote      = text;
+    g_app.statusNoteUntil = GetTickCount64() + ms;
+    SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
 // The launch update check: network and crypto both happen here, off the
 // interface thread, and only a fully verified newer tag is ever posted.
 unsigned __stdcall UpdateCheckThread(void* param) {
@@ -973,7 +1089,10 @@ static bool YieldScanToHunt() {
 // completing, launch.
 static void StartPrefetchNext() {
     if (g_app.prefetchWorker || g_app.prefetchQueue.empty()) return;
-    if (g_app.scanning || g_app.dupeRunning || g_app.bulkRunning) return;
+    if (g_app.scanning || g_app.dupeRunning || g_app.bulkRunning ||
+        g_app.recycleRunning) {
+        return;
+    }
     if (!g_app.settings.keepCaches || !g_app.settings.prefetchAll) return;
 
     const std::wstring root = g_app.prefetchQueue.front();
@@ -2431,6 +2550,42 @@ static void DrawStatus(const Rect& area) {
     FillRect(Rect{area.x, area.y, area.w, 1.0f}, theme::kRule);
 
     const float pad = layout::kPad;
+
+    if (g_app.recycleRunning) {
+        const uint64_t done = g_app.recycleProgress.files.load();
+        std::wstring line = L"Recycling " +
+                            FormatCount(std::min<uint64_t>(
+                                done + 1, g_app.recycleTotal)) +
+                            L" of " + FormatCount(g_app.recycleTotal);
+        if (!g_app.recycleCurrent.empty()) {
+            const size_t cut = g_app.recycleCurrent.find_last_of(L'\\');
+            line += L"  ·  " +
+                    SanitizeForDisplay(cut == std::wstring::npos
+                                           ? g_app.recycleCurrent
+                                           : g_app.recycleCurrent.substr(
+                                                 cut + 1));
+        }
+        line += L"…   Esc stops after this item";
+        DrawText(line, g_app.fmtSmall.get(),
+                 Rect{area.x + pad, area.y + 8.0f,
+                      area.w - pad * 2 - 220.0f, layout::kLineSmall},
+                 theme::kSignal, 1.0f, true);
+        DrawText(FormatSize(g_app.recycleBytes), g_app.fmtSmall.get(),
+                 Rect{area.right() - 214.0f, area.y + 8.0f, 200.0f,
+                      layout::kLineSmall},
+                 theme::kMute, 1.0f, true);
+        return;
+    }
+    if (!g_app.statusNote.empty()) {
+        if (GetTickCount64() < g_app.statusNoteUntil) {
+            DrawText(g_app.statusNote, g_app.fmtSmall.get(),
+                     Rect{area.x + pad, area.y + 8.0f, area.w - pad * 2,
+                          layout::kLineSmall},
+                     theme::kSignal, 1.0f, true);
+            return;
+        }
+        g_app.statusNote.clear();
+    }
 
     if (g_app.browse && g_app.browseSelSet.size() > 1) {
         uint64_t selBytes = 0;
@@ -3978,24 +4133,10 @@ static void ShowNodeMenu(const std::wstring& path, uint64_t nodeSize,
             }
         }
 
-        // SHFileOperationW takes a double-NUL-terminated list. Building it by
-        // hand rather than relying on the string's own terminator, because a
-        // missing second NUL makes the shell read past the buffer.
-        std::vector<wchar_t> from(path.begin(), path.end());
-        from.push_back(L'\0');
-        from.push_back(L'\0');
-
-        SHFILEOPSTRUCTW op{};
-        op.hwnd   = g_app.hwnd;
-        op.wFunc  = FO_DELETE;
-        op.pFrom  = from.data();
-        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING;
-
-        if (SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted) {
-            // Sizes are now stale; rescan - and not from the cache, which
-            // still contains the files that were just recycled.
-            StartScan(g_app.selected, false);
-        }
+        // Off the interface thread: a large folder is enumerated by the
+        // shell before it moves, and the window stays live meanwhile. The
+        // rescan follows the completion, not this call.
+        StartRecycle(std::vector<std::wstring>{path}, nodeSize);
     } else if (cmd == 4) {
         DoExport();
     } else if (cmd == 5) {
@@ -4687,6 +4828,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_app.scanning || g_app.dupeRunning || g_app.zoom.Running() ||
                 g_app.reveal.Running() || g_app.hoverFade.Running() ||
                 g_app.dupeFlash.Running() || g_app.bulkRunning ||
+                g_app.recycleRunning ||
+                (!g_app.statusNote.empty() &&
+                 GetTickCount64() < g_app.statusNoteUntil + 100) ||
                 g_app.prefetching ||
                 g_app.tabSlide.Running()) {
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -4793,6 +4937,62 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 reinterpret_cast<std::wstring*>(lp));
             if (static_cast<uint64_t>(wp) != g_app.dupeGen.load()) return 0;
             if (file) g_app.dupeCurrentFile = std::move(*file);
+            return 0;
+        }
+
+        case WM_RECYCLE_FILE: {
+            std::unique_ptr<std::wstring> name(
+                reinterpret_cast<std::wstring*>(lp));
+            if (static_cast<uint64_t>(wp) != g_app.recycleGen || !name) {
+                return 0;
+            }
+            g_app.recycleCurrent = *name;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_RECYCLE_DONE: {
+            std::unique_ptr<RecycleOutcome> res(
+                reinterpret_cast<RecycleOutcome*>(lp));
+            if (static_cast<uint64_t>(wp) != g_app.recycleGen) return 0;
+            if (g_app.recycleWorker) {
+                WaitForSingleObject(g_app.recycleWorker, INFINITE);
+                CloseHandle(g_app.recycleWorker);
+                g_app.recycleWorker = nullptr;
+            }
+            g_app.recycleRunning = false;
+            g_app.recycleCurrent.clear();
+            if (!res) return 0;
+
+            // Everything went: say so in the status bar and move on. A
+            // shortfall gets a dialog, because it needs reading.
+            if (res->done == res->total && !res->cancelled) {
+                ShowStatusNote(L"Recycled " + FormatCount(res->done) +
+                                   (res->done == 1 ? L" item" : L" items") +
+                                   L"  ·  " +
+                                   FormatSize(g_app.recycleBytes),
+                               6000);
+            } else {
+                std::wstring said = L"Recycled " + FormatCount(res->done) +
+                                    L" of " + FormatCount(res->total) +
+                                    L" items.";
+                if (res->cancelled) {
+                    said += L"\n\nStopped at your request.";
+                } else {
+                    said += L"\n\nThe rest could not be moved. A file "
+                            L"held open, a folder the shell refused, or "
+                            L"a cancel in the shell's own progress window "
+                            L"are the usual reasons.";
+                }
+                MessageBoxW(hwnd, said.c_str(), L"Spindle",
+                            MB_OK | MB_ICONINFORMATION);
+            }
+            // Sizes are stale now; rescan, and not from the cache, which
+            // still holds what was just recycled.
+            if (res->done > 0 && g_app.selected >= 0) {
+                StartScan(g_app.selected, false);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
 
@@ -5110,20 +5310,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                             MB_YESNO | MB_DEFBUTTON2 |
                                                 MB_ICONWARNING) ==
                                 IDYES) {
-                                size_t done = 0;
-                                for (const std::wstring& p2 : paths) {
-                                    if (RecycleToBin(p2)) ++done;
-                                }
-                                std::wstring said =
-                                    L"Recycled " + FormatCount(done) +
-                                    L" of " + FormatCount(paths.size()) +
-                                    L" items.";
-                                MessageBoxW(g_app.hwnd, said.c_str(),
-                                            L"Spindle",
-                                            MB_OK | MB_ICONINFORMATION);
-                                if (done > 0 && g_app.selected >= 0) {
-                                    StartScan(g_app.selected, false);
-                                }
+                                StartRecycle(paths, bytes);
                             }
                         }
                         return 0;
@@ -5265,6 +5452,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         g_app.dupeProgress.cancel.store(
                             true, std::memory_order_relaxed);
                     }
+                    if (g_app.recycleRunning) {
+                        g_app.recycleProgress.cancel.store(
+                            true, std::memory_order_relaxed);
+                    }
                     break;
                 case VK_F5:
                     if (g_app.selected >= 0) StartScan(g_app.selected);
@@ -5293,6 +5484,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             JoinWorker();
             JoinDupeWorker();
             JoinBulkWorker();
+            JoinRecycleWorker();
             CancelPrefetch(false);
             DiscardDeviceResources();
             PostQuitMessage(0);

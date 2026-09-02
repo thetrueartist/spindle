@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Refuse to commit anything the hygiene checker rejects. Enable once with:
+#   git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/tools/hygiene.sh" --staged

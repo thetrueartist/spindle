@@ -68,7 +68,9 @@ sums what is selected, and a right-click on the selection copies every
 path or recycles the lot behind one confirmation. The breadcrumb doubles
 as an address bar: click the folder you are in, or press Ctrl+L, and type
 or paste a path; Enter goes there on any drive, and a path that names a
-file outlines that file's cell.
+file outlines that file's cell. Recycling runs in the background: the
+status bar says which item is moving and how far along the run is, Esc
+stops it after the current item, and the window stays usable throughout.
 
 ![browse mode](docs/browse.png)
 
@@ -480,3 +482,7 @@ compression is not.
 ## License
 
 MIT. See LICENSE.
+
+Spindle is free and stays free. If it found you a few hundred gigabytes
+and you feel like saying thanks, there is a coffee link on the
+repository's Sponsor button.
