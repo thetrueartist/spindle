@@ -142,14 +142,20 @@ inline constexpr size_t   kMaxTreeDepth    = 512;
 
 void SerializeScan(const ScanResult& in, const CacheMeta& meta,
                    std::vector<uint8_t>& out);
+// cancel, when given, is polled during the parse so a caller on a worker
+// can abandon a large cache load promptly (a drive switched away from
+// before its cache finished loading). A cancelled parse returns false and
+// leaves out unusable, exactly like a malformed file.
 bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
-                     CacheMeta& meta);
+                     CacheMeta& meta,
+                     const std::atomic<bool>* cancel = nullptr);
 
 // Cache file location and I/O. Windows-only, implemented in scan.cpp; the
 // serialised bytes above are what travels through them.
 std::wstring CachePathForVolume(const std::wstring& volumePath);
 bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
-                   CacheMeta& meta);
+                   CacheMeta& meta,
+                   const std::atomic<bool>* cancel = nullptr);
 bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res);
 std::wstring CacheDirPath();
 void ClearScanCaches();

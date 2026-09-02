@@ -142,6 +142,7 @@ constexpr UINT WM_BULK_DONE     = WM_APP + 5;
 constexpr UINT WM_UPDATE_FOUND  = WM_APP + 6;
 constexpr UINT WM_RECYCLE_DONE  = WM_APP + 7;
 constexpr UINT WM_RECYCLE_FILE  = WM_APP + 8;
+constexpr UINT WM_CACHE_READY   = WM_APP + 9;
 
 // A cache this young is served without a revalidating rescan: the launch
 // prefetch (or a scan moments ago) already walked the drive, and walking it
@@ -306,6 +307,7 @@ struct App {
     // Recycling runs on its own thread so a large folder, which the shell
     // enumerates before it moves, never freezes the window.
     bool                  recycleRunning = false;
+    int                   recycleDrive   = -1;
     HANDLE                recycleWorker  = nullptr;
     uint64_t              recycleGen     = 0;
     Progress              recycleProgress;
@@ -687,6 +689,18 @@ struct ScanRequest {
     // A prefetch exists to leave a cache file behind: the tree is freed on
     // this thread and only a completion note is posted.
     bool         prefetch = false;
+    // Try the on-disk cache first, on this thread, and post it to show
+    // immediately. Off the interface thread precisely so parsing a large
+    // cache never freezes the window at launch or on a drive switch.
+    bool         tryCache = false;
+};
+
+// Posted by the scan worker when a cached tree is ready to show, ahead of
+// (or instead of) the full walk. Adopted on the interface thread.
+struct CacheReady {
+    ScanResult* result  = nullptr;
+    uint64_t    savedMs = 0;
+    bool        fresh   = false;   // recent enough to skip the revalidation
 };
 
 // Scan thread entry. Wrapped end to end: an exception escaping here would
@@ -698,6 +712,42 @@ unsigned __stdcall ScanThread(void* param) {
     // foreground one rather than dereferencing null.
     if (req->progress == nullptr) req->progress = &g_app.progress;
     try {
+        // The cache, first and on this thread. A hit is posted to the
+        // interface thread to show at once; a fresh one ends the job here,
+        // a stale one falls through to the revalidating walk below.
+        if (req->tryCache && req->keepCache && !req->prefetch) {
+            auto cached = std::make_unique<ScanResult>();
+            CacheMeta cm;
+            bool loaded = false;
+            try {
+                loaded = LoadScanCache(req->root, *cached, cm,
+                                       &req->progress->cancel);
+            } catch (...) {
+                loaded = false;
+            }
+            if (req->progress->cancel.load(std::memory_order_relaxed)) {
+                return 0;   // superseded before it finished; drop silently
+            }
+            if (loaded) {
+                const uint64_t now = UnixNowMs();
+                const bool fresh =
+                    cm.savedUnixMs != 0 && now >= cm.savedUnixMs &&
+                    now - cm.savedUnixMs <= kFreshCacheMs;
+                auto payload = std::make_unique<CacheReady>();
+                payload->result  = cached.release();
+                payload->savedMs = cm.savedUnixMs;
+                payload->fresh   = fresh;
+                if (PostMessageW(req->hwnd, WM_CACHE_READY,
+                                 static_cast<WPARAM>(req->gen),
+                                 reinterpret_cast<LPARAM>(payload.get()))) {
+                    static_cast<void>(payload.release());  // NOLINT
+                } else {
+                    delete payload->result;   // window gone; free the tree
+                }
+                if (fresh) return 0;   // the cached tree stands; no walk
+            }
+        }
+
         SYSTEM_INFO si{};
         GetNativeSystemInfo(&si);
 
@@ -917,7 +967,11 @@ unsigned __stdcall RecycleThread(void* param) {
                 }
             } catch (...) {
             }
-            if (RecycleToBin(p, req->hwnd, false)) {
+            // No owner window and no shell UI: the owner would belong to
+            // the interface thread, and the shell driving it by cross-thread
+            // messages while a close waits on this worker is how a shutdown
+            // hangs. Progress is the status bar's job, not a shell dialog.
+            if (RecycleToBin(p)) {
                 ++outcome->done;
                 g_app.recycleProgress.files.store(outcome->done,
                                                   std::memory_order_relaxed);
@@ -945,8 +999,23 @@ static void JoinRecycleWorker() {
 }
 
 // Confirmation is the caller's business; this only runs what was agreed.
+static void ShowStatusNote(const std::wstring& text, uint64_t ms);
+
+// Drop a drive's on-disk cache so its next visit rescans instead of
+// serving sizes that a recycle just made wrong. Used when the recycle
+// finished on a drive the user has since navigated away from.
+static void InvalidateDriveCache(const std::wstring& volumePath) {
+    if (volumePath.empty()) return;
+    const std::wstring cp = CachePathForVolume(volumePath);
+    if (!cp.empty()) DeleteFileW(cp.c_str());
+}
+
 static void StartRecycle(std::vector<std::wstring> paths, uint64_t bytes) {
-    if (paths.empty() || g_app.recycleRunning) return;
+    if (paths.empty()) return;
+    if (g_app.recycleRunning || g_app.bulkRunning) {
+        ShowStatusNote(L"A recycle is already running. One at a time.", 4000);
+        return;
+    }
     auto req = std::make_unique<RecycleRequest>();
     req->hwnd  = g_app.hwnd;
     req->gen   = ++g_app.recycleGen;
@@ -954,6 +1023,7 @@ static void StartRecycle(std::vector<std::wstring> paths, uint64_t bytes) {
 
     g_app.recycleTotal = req->paths.size();
     g_app.recycleBytes = bytes;
+    g_app.recycleDrive = g_app.selected;   // rescan this one on completion
     g_app.recycleCurrent.clear();
     g_app.recycleProgress.files.store(0);
     g_app.recycleProgress.cancel.store(false, std::memory_order_relaxed);
@@ -1185,46 +1255,11 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     g_app.result.reset();
     g_app.showingCache = false;
 
-    // A cached tree goes up immediately - no animation, that is the point -
-    // and the scan below revalidates it. Skipped after a delete, where the
-    // cache is known to describe the old state of exactly the files the user
-    // is looking at.
-    if (useCache && g_app.settings.keepCaches) {
-        auto cached = std::make_unique<ScanResult>();
-        CacheMeta meta;
-        // A UNC path has no drive letter to key a cache to, so this simply
-        // misses and the ordinary scan runs.
-        // In a try: the cache file is unprivileged-writable and this
-        // runs on the interface thread, where an escaping bad_alloc is
-        // not an error message but a dead process. A cache that cannot
-        // be read is simply no cache.
-        bool loaded = false;
-        try {
-            loaded = LoadScanCache(root, *cached, meta);
-        } catch (...) {
-            loaded = false;
-        }
-        if (loaded) {
-            g_app.result = std::move(cached);
-            g_app.trail.push_back(&g_app.result->root);
-            RebuildTreemap();
-            g_app.panelDirty   = true;
-            g_app.showingCache = true;
-            g_app.cacheSavedMs = meta.savedUnixMs;
-
-            // Fresh enough to trust outright - the launch prefetch or a
-            // scan minutes ago walked this drive - so no revalidating
-            // rescan. Clicking between drives costs nothing; F5 forces.
-            const uint64_t now = UnixNowMs();
-            if (meta.savedUnixMs != 0 && now >= meta.savedUnixMs &&
-                now - meta.savedUnixMs <= kFreshCacheMs) {
-                StartPrefetchNext();
-                InvalidateRect(g_app.hwnd, nullptr, FALSE);
-                return;
-            }
-        }
-    }
-
+    // The cache load and the revalidating walk both run on the worker
+    // below, so the interface thread never parses a large cache. That
+    // parse is what used to freeze the window at launch and on a drive
+    // switch. The worker posts WM_CACHE_READY the moment a cached tree is
+    // ready to show, then keeps walking if that cache was stale.
     g_app.progress.files.store(0);
     g_app.progress.dirs.store(0);
     g_app.progress.bytes.store(0);
@@ -1238,6 +1273,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     req->gen       = g_app.scanGen.fetch_add(1) + 1;
     req->keepCache = g_app.settings.keepCaches;
     req->progress  = &g_app.progress;
+    req->tryCache  = useCache && g_app.settings.keepCaches;
 
     const uintptr_t h =
         _beginthreadex(nullptr, 0, ScanThread, req.get(), 0, nullptr);
@@ -1960,6 +1996,7 @@ static LRESULT CALLBACK RenameEditProc(HWND h, UINT msg, WPARAM wp,
 static void BeginRename(const std::wstring& parent,
                         const std::wstring& name, const Rect& rowDip) {
     EndRename(false);
+    EndAddressEdit(false);
     const float sc = (g_app.dpiScale > 0.0f) ? g_app.dpiScale : 1.0f;
     const int x = static_cast<int>((rowDip.x + 12.0f) * sc);
     const int y = static_cast<int>(rowDip.y * sc);
@@ -2569,7 +2606,8 @@ static void DrawStatus(const Rect& area) {
                                            : g_app.recycleCurrent.substr(
                                                  cut + 1));
         }
-        line += L"…   Esc stops after this item";
+        if (g_app.recycleTotal > 1) line += L"…   Esc stops after this item";
+        else line += L"…";
         DrawText(line, g_app.fmtSmall.get(),
                  Rect{area.x + pad, area.y + 8.0f,
                       area.w - pad * 2 - 220.0f, layout::kLineSmall},
@@ -4844,6 +4882,54 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        case WM_CACHE_READY: {
+            std::unique_ptr<CacheReady> cr(
+                reinterpret_cast<CacheReady*>(lp));
+            std::unique_ptr<ScanResult> res(cr ? cr->result : nullptr);
+            if (cr) cr->result = nullptr;
+            // Superseded by a later scan: drop it. For a fresh cache the
+            // worker has already returned, so also reap its handle here.
+            if (static_cast<uint64_t>(wp) != g_app.scanGen.load()) return 0;
+            if (!res) return 0;
+
+            DropTreeReferences();
+            g_app.result = std::move(res);
+            g_app.trail.push_back(&g_app.result->root);
+            RebuildTreemap();
+            g_app.panelDirty   = true;
+            g_app.showingCache = true;
+            g_app.cacheSavedMs = cr->savedMs;
+
+            // Land a launch or tab target on the cached tree straight away,
+            // rather than waiting for the revalidation to finish.
+            if (!g_app.pendingTrail.empty()) {
+                const std::vector<std::wstring> comps = g_app.pendingTrail;
+                g_app.pendingTrail.clear();
+                RestoreTrailComps(comps);
+            }
+            if (!g_app.pendingReveal.empty()) {
+                const std::wstring full = g_app.pendingReveal;
+                g_app.pendingReveal.clear();
+                NavigateToPath(full);
+            }
+
+            if (cr->fresh) {
+                // No revalidation walk. The worker returned right after it
+                // posted this, so the join is immediate.
+                if (g_app.worker) {
+                    WaitForSingleObject(g_app.worker, INFINITE);
+                    CloseHandle(g_app.worker);
+                    g_app.worker = nullptr;
+                }
+                g_app.scanning = false;
+                StartPrefetchNext();
+            }
+            // A stale cache leaves scanning true: the walk is still going
+            // and WM_SCAN_DONE will replace this tree when it lands.
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
         case WM_SCAN_DONE: {
             // Adopting the pointer first means a discarded result is still
             // freed rather than leaked.
@@ -4991,10 +5077,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 MessageBoxW(hwnd, said.c_str(), L"Spindle",
                             MB_OK | MB_ICONINFORMATION);
             }
-            // Sizes are stale now; rescan, and not from the cache, which
-            // still holds what was just recycled.
-            if (res->done > 0 && g_app.selected >= 0) {
-                StartScan(g_app.selected, false);
+            // Sizes are stale now; rescan the drive the files came from,
+            // off the cache. If the user moved to another drive meanwhile,
+            // do not yank the view back: just drop that drive's stale cache
+            // so its next visit rescans.
+            if (res->done > 0 && g_app.recycleDrive >= 0) {
+                if (g_app.recycleDrive == g_app.selected) {
+                    StartScan(g_app.recycleDrive, false);
+                } else if (g_app.recycleDrive <
+                           static_cast<int>(g_app.volumes.size())) {
+                    InvalidateDriveCache(
+                        g_app.volumes[static_cast<size_t>(g_app.recycleDrive)]
+                            .path);
+                }
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;

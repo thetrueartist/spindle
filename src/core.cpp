@@ -1034,7 +1034,7 @@ void SerializeScan(const ScanResult& in, const CacheMeta& meta,
 }
 
 bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
-                     CacheMeta& meta) {
+                     CacheMeta& meta, const std::atomic<bool>* cancel) {
     out = ScanResult{};
     meta = CacheMeta{};
     if (data == nullptr || len < kCacheHeader || len > kMaxCacheBytes) {
@@ -1085,6 +1085,12 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
 
     uint64_t seen = 1;
     while (!stack.empty()) {
+        // Polled coarsely: the check is cheap but a per-record atomic load
+        // over a million records is not free, and prompt-enough is enough.
+        if (cancel != nullptr && (seen & 0x1FFF) == 0 &&
+            cancel->load(std::memory_order_relaxed)) {
+            return false;
+        }
         Frame& top = stack.back();
         if (top.remaining == 0) {
             stack.pop_back();

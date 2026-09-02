@@ -569,7 +569,7 @@ static uint32_t VolumeSerial(const std::wstring& volumePath) {
 }
 
 bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
-                   CacheMeta& meta) {
+                   CacheMeta& meta, const std::atomic<bool>* cancel) {
     if (!IsVolumeRootPath(volumePath)) return false;
     const std::wstring path = CachePathForVolume(volumePath);
     if (path.empty()) return false;
@@ -602,7 +602,11 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
     CloseHandle(h);
     if (!ok) return false;
 
-    if (!DeserializeScan(bytes.data(), bytes.size(), out, meta)) {
+    if (!DeserializeScan(bytes.data(), bytes.size(), out, meta, cancel)) {
+        // A cancelled load is not a bad file: leave the cache in place.
+        if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
+            return false;
+        }
         // Unreadable or hostile: it will only fail again, so remove it.
         DeleteFileW(path.c_str());
         return false;

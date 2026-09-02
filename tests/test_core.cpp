@@ -1,4 +1,5 @@
 // Tests for Spindle's platform-independent core.
+#include <atomic>
 // Builds and runs on the host; no Windows headers involved.
 
 #include "../src/spindle.h"
@@ -1389,6 +1390,27 @@ static void TestScanCache() {
     ScanResult out;
     CacheMeta om;
     CHECK(DeserializeScan(buf.data(), buf.size(), out, om), "round-trips");
+
+    {
+        // A cancel flag set before the parse makes it bail rather than
+        // build the whole tree; this is what keeps a large cache load from
+        // freezing a drive switch. The check is coarse, so the tree needs
+        // enough records to cross a poll boundary.
+        ScanResult big; big.root = MakeDir(L"C:\\", {});
+        for (int d = 0; d < 40; ++d) {
+            Node dir = MakeDir(L"d", {});
+            for (int f = 0; f < 1000; ++f) dir.children.push_back(MakeFile(L"f", 1));
+            big.root.children.push_back(std::move(dir));
+        }
+        std::vector<uint8_t> bb; SerializeScan(big, m, bb);
+        std::atomic<bool> cancel{true};
+        ScanResult bo; CacheMeta bm;
+        CHECK(!DeserializeScan(bb.data(), bb.size(), bo, bm, &cancel),
+              "a cancelled parse returns false");
+        std::atomic<bool> go{false};
+        CHECK(DeserializeScan(bb.data(), bb.size(), bo, bm, &go),
+              "an uncancelled parse still succeeds");
+    }
 
     {
         // A cache that claims files while its root has no children is what
