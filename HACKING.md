@@ -12,7 +12,7 @@ makes a million-file scan take well under a second.
 
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
-make test       926 assertions under ASan, UBSan and ThreadSanitizer
+make test       host tests under ASan, UBSan and ThreadSanitizer
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
 make icon       regenerate spindle.ico (prints each frame's encoding)
@@ -94,19 +94,18 @@ or double-count.
 
 **The root of a cached tree is a path; every other name is a component.**
 The root is named for the volume, for example `D:\`, so validating it as a
-path component rejects it. Because an unreadable cache is deleted and
-rescanned, the only symptom was that caching silently stopped working
-everywhere. The test fixtures used an empty root name and could not catch
-it; one now uses a real volume path.
+path component rejects it, and because an unreadable cache is deleted and
+rescanned, the only symptom is that caching silently stops working
+everywhere. One test fixture uses a real volume path for exactly this
+reason.
 
-**The cache slot belongs to the volume root alone.** "Scan with Spindle"
-on a folder used to save the folder's tree into the volume's cache slot,
-and the next folder launch loaded it back whatever folder was asked for;
-with a fresh enough cache the fast path then never scanned at all, so
-the window showed the previous folder forever. Save and load both refuse
-non-root paths now, and load also refuses a cache whose stored root does
-not name the requested volume, deleting it so the next clean scan
-replaces it.
+**The cache slot belongs to the volume root alone.** A folder scan saved
+into the volume's slot comes back on the next launch whatever folder was
+asked for, and with a fresh enough cache the fast path never rescans, so
+the window shows the wrong folder forever. Save and load both refuse
+non-root paths, and load also refuses a cache whose stored root does not
+name the requested volume, deleting it so the next clean scan replaces
+it.
 
 **A duplicate is never deleted on the strength of a hash.** Recycling a
 copy from the Dupes panel is gated: it finds a different member of the same
@@ -133,25 +132,23 @@ more still go through the digest. Any deletion passes through this
 verification before touching a file.
 
 **A file is never read in full to prove it is different.** Sharing a size
-makes two files possible duplicates, not actual ones, and the original
-finder spent a whole file discovering otherwise; two 40 GB images
-differing in their first block cost 80 GB of reading. Comparison is
-tiered: exact size (free), a 16 KB head, a 16 KB tail, and for files past
-8 MB (`kDeepProbeFile`) three interior probes at the quarter points, with
-the middle first. Only what survives every probe is read in full. The
-tail and interior tiers exist because disk images and media containers
-share fixed headers and footers, so a head probe alone does not separate
-them; two same-size VM images that differ only in the middle used to cost
-a full read each. Only a complete digest may call two files equal, and
-every reader publishes progress bytes per chunk, because a counter that
-only moves between files reads as a hang during a 60 GB verify.
-Measured on 20 same-size files differing at byte 0: 3.24 s to 0.28 s cold,
-7.09 s to 0.14 s warm.
+makes two files possible duplicates, not actual ones, and reading whole
+files to discover otherwise is ruinous: two 40 GB images differing in
+their first block would cost 80 GB of reading. Comparison is tiered:
+exact size (free), a 16 KB head, a 16 KB tail, and for files past 8 MB
+(`kDeepProbeFile`) three interior probes at the quarter points, with the
+middle first. Only what survives every probe is read in full. The tail
+and interior tiers exist because disk images and media containers share
+fixed headers and footers, so a head probe alone does not separate two
+same-size VM images that differ only in the middle. Only a complete
+digest may call two files equal, and every reader publishes progress
+bytes per chunk, because a counter that only moves between files reads
+as a hang during a 60 GB verify.
 
-**Anything that reads the disk runs off the UI thread.** The scan always
-did; the duplicate hunt did not, and a window that never pumps its message
-loop gets the spinning cursor and a Not Responding title, including for
-the Esc-to-cancel the panel advertised, which could never be delivered.
+**Anything that reads the disk runs off the UI thread.** A window that
+never pumps its message loop gets the spinning cursor and a Not
+Responding title, and cannot receive the Esc-to-cancel its panel
+advertises.
 Candidates are chosen on the UI thread (a fast tree walk, and that thread
 owns the tree), every `Node*` is stripped, and only owned paths cross to
 the worker. Completion arrives as `WM_DUPES_DONE` carrying a generation
@@ -191,18 +188,17 @@ a freed tree and survives every rescan by construction. The active tab
 mirrors the live view and is snapshotted the moment anything switches
 away from it.
 
-## Browse mode (in development on dev-browse)
+## Browse mode
 
 A details list over the already-loaded tree, because the two things a
 file lister is worst at on Windows (folder sizes, search speed) are the
-two things this program already has. Design decisions, made before the
-code:
+two things this program already has. Design decisions:
 
 - The list is a view of `trail.back()`'s children, nothing more. It
   reads no disk, so it is instant by construction, and every folder row
   shows its rolled-up size and file count because the tree already
   knows them.
-- Columns: Name, Size, Kind, Files. No Modified column in phase one:
+- Columns: Name, Size, Kind, Files. No Modified column:
   `Node` deliberately stores no timestamps, and adding one is a cache
   format bump plus eight bytes per node, which is a separate decision.
 - Sorting is per column, both directions, over an index vector owned by
@@ -228,9 +224,7 @@ code:
   Commit order is disk first (MoveFileW after IsSafeNodeName), then the
   tree patched in place by walking to the parent by name, then the
   cache re-saved from the patched tree. A walk that misses patches
-  nothing and the next scan shows the truth; the first cut proved the
-  value of that fail-safe when the parent lost its trailing separator
-  and the disk renamed while the view lagged.
+  nothing and the next scan shows the truth.
 
 ## Launch prefetch
 
@@ -249,48 +243,48 @@ already-posted completion message is recognised as stale.
 
 ## Auto-update
 
-Modelled on Audio-Switcher's updater, which got the trust model right:
-a release is only an update once a manifest signed by the maintainer's
+A release is only an update once a manifest signed by the maintainer's
 OFFLINE key says so. The private key never touches the repo or CI, so a
 compromised repository, action, or GitHub account cannot ship a
 trojaned update; the updater fails closed on anything unsigned,
-malformed, mismatched or unreachable.
+malformed, mismatched, replayed or unreachable.
 
 Mechanics: at launch (and from the menu), a worker fetches the latest
 release metadata from the GitHub API over WinHTTP, finds manifest.json
 and manifest.sig among the assets, verifies the signature (ECDSA P-256
-via CNG), compares the tag, and only then offers the update: a menu
-entry naming the version, never anything silent. Accepting downloads
-the exe asset, hashes it (SHA-256 via CNG), requires the hash the
-signed manifest promised, then swaps by rename: the running exe moves
-aside as spindle.exe.old, the verified download takes its name, and
-the user restarts when they choose. No process is created, the old
-version survives until the next launch cleans it, and every failure
-leaves the current install untouched.
+via CNG), requires the manifest to name the release's own tag and to
+carry a serial newer than the last one this copy accepted, and only
+then offers the update: a menu entry naming the version, never anything
+silent. Accepting downloads the exe asset, capped at the signed size,
+hashes it (SHA-256 via CNG), requires the hash the signed manifest
+promised, then swaps by rename: the running exe moves aside as
+spindle.exe.old, the verified download takes its name, and the user
+restarts when they choose. No process is created, the old version
+survives until the next launch cleans it, and every failure leaves the
+current install untouched. Hosts are allowlisted to GitHub's API and
+release servers, and at most one redirect between them is followed.
 
 The JSON off the API is untrusted input, so the field extractor lives
 in core.cpp with hard bounds and host tests, like every other parser
-of hostile bytes.
+of hostile bytes. The accepted serial is persisted in the settings file,
+which is parsed with the same care.
 
 Signing is deliberately not a CI job. The key is the one thing an
 attacker holding this repository, its Actions and the maintainer's
 GitHub account still does not have, and a CI secret would hand it to
-exactly that attacker. The cost is one command per release, run with
-no arguments: tools/sign-release.ps1 finds the newest release with no
-signature attached, downloads it, signs it and uploads the pair.
+exactly that attacker. The cost is one command per release:
+`tools/sign-release.ps1` finds the newest release with no signature
+attached, downloads it, signs it locally and uploads the manifest pair,
+or takes a file and a tag by hand when the GitHub CLI is not installed.
+The signer lives in the exe itself: `--gen-update-key` writes a keypair
+(keep the private half offline), `--sign-release` hashes a build and
+writes manifest.json plus manifest.sig, and `--verify-update-manifest`
+checks a pair against a public key.
 
-tools/sign-release.ps1 is the owner's post-release step: it downloads
-the CI-built exe for a tag, signs it locally, and attaches the manifest
-pair to the release. Signing lives in the exe itself: --gen-update-key writes a keypair
-(keep the private half offline), --sign-release hashes a build and
-writes manifest.json plus manifest.sig for attaching to the release.
 The embedded public key constant decides whether any of this runs at
-all: empty means no key, no network and no menu entry, which is how the
-feature sat until the owner generated a pair, kept the private half
-offline and embedded the public half. Release builds from v2.2.0 carry
-it, so the launch check is live and the menu can turn it off. A fork
-that wants its own update channel replaces the constant with its own
-public key; leaving someone else's in place would mean trusting their
+all: empty means no key, no network and no menu entry. A fork that
+wants its own update channel replaces the constant with its own public
+key; leaving someone else's in place would mean trusting their
 signatures.
 
 ## Security posture
@@ -300,10 +294,9 @@ structures) is untrusted input, read while elevated.
 
 **Parsing.** `ntfs.cpp` treats every byte as hostile. Every field goes
 through a cursor that cannot read past its buffer; no length, offset or
-count from disk is used without validation. Fuzzing found two real bugs
-there: a 64-bit shift in run-list sign extension, and a signed overflow
-accumulating the cluster delta. The volume itself is opened
-`FILE_READ_DATA`, sharing read, write and delete.
+count from disk is used without validation, and the parser is fuzzed as
+part of `make test`. The volume itself is opened `FILE_READ_DATA`,
+sharing read, write and delete.
 
 **Names off the disk are not path components until they are checked.**
 `IsSafeNodeName` refuses a backslash, a forward slash, a colon, a NUL, the
@@ -330,11 +323,12 @@ that was checked.
 **Trees are bounded in depth wherever they are built.** `Node` owns its
 children by value, so the compiler's destructor recurses once per level; a
 tree deeper than the stack can unwind cannot be freed, and that crash
-cannot be caught. The walker's `kMaxDepth` was not enough. The cache
-reader and the MFT builder both produce trees too, and both now stop at
-`kMaxTreeDepth`. The cache also caps the running total of declared
-children against the declared node count, because per-record bounds
-allowed a chain of directories to reserve gigabytes from a small file.
+cannot be caught. The walker, the cache reader and the MFT builder all
+produce trees, and all stop at `kMaxTreeDepth`, with the walker one level
+short so that what it writes is what the readers accept. The cache also
+caps the running total of declared children against the declared node
+count, and bounds the node count by memory rather than by file size,
+because the reader reserves each directory's children up front.
 
 **Ordinary deletion** is recycle-bin only, confirmed (twice for folders,
 No the default both times), has no keyboard shortcut, and refuses anything
@@ -366,21 +360,26 @@ made no sense.
 A locking process is identified by its image name, never by the Restart
 Manager's `strAppName`. That field is a display string from the version
 resource (`lsass.exe` presents as "Local Security Authority Process"), so
-a list written in image names matched none of the processes it existed to
-protect. The Restart Manager's own `RmCritical`/`RmService`
+a list written in image names would match none of the processes it
+exists to protect. The Restart Manager's own `RmCritical`/`RmService`
 classification is trusted first, the image name is re-read from the
 handle about to be killed, and the process creation time is compared so a
-recycled PID cannot redirect the kill.
+recycled PID cannot redirect the kill. Only the processes that were
+listed in the confirmation are ended; one that took the lock afterwards
+makes the delete fail rather than dying unseen.
 
 Taking ownership acts on a handle opened `FILE_FLAG_OPEN_REPARSE_POINT`,
-never on a path, and it merges into the existing DACL. The path-based
-form followed junctions, so a link aimed at a system directory plus a
-deny ACE on the link was enough to rewrite the target's owner and
-permissions; passing a null old ACL then discarded every existing entry,
-DENY aces included. Escalation is skipped entirely for reparse points,
-because a link's own ACL is not why a delete failed. Reparse points are
-removed as links, never followed; the deletion walk inherits the
-scanner's rule, and breaking it would delete the target.
+never on a path, and it merges into the existing DACL. A path-based form
+would follow junctions, so a link aimed at a system directory plus a
+deny ACE on the link would be enough to rewrite the target's owner and
+permissions, and passing a null old ACL would discard every existing
+entry, DENY aces included. Escalation is skipped entirely for reparse
+points and for files with more than one link: a link's own ACL is not
+why a delete failed, and a hardlink shares one security descriptor with
+every other name for the file. Reparse points are removed as links,
+never followed, and the deletion walk confirms through a handle that a
+directory is still a directory before enumerating it, so one swapped for
+a junction mid-walk is refused rather than followed.
 
 **The registry.** The Explorer folder-menu entry is the one registry write
 in the program. It is off by default, ticked on from the menu, writes
@@ -400,8 +399,9 @@ cloud placeholders are excluded, and the handle is opened
 `FILE_FLAG_OPEN_NO_RECALL` besides, so a placeholder cannot be silently
 downloaded to be hashed.
 
-**Imports.** No network, process-creation or injection APIs.
-`ShellExecuteW` is present to open Explorer at a path and for nothing
+**Imports.** No process-creation or injection APIs, and the only network
+use is the updater's WinHTTP client. `ShellExecuteW` is present to open
+Explorer at a path, and to open a file from browse mode, and for nothing
 else. `LoadLibraryW`, `VirtualProtect` and `CryptGenRandom` appear in the
 import table but are not called by any line of Spindle; they come from
 the MinGW runtime. Force removal adds exactly two capabilities:
@@ -425,9 +425,9 @@ module-base offset, because a raw address is meaningless under ASLR.
 - Memory is roughly 90 bytes plus the filename per node, around 170 MB
   for a 1.6M-file volume. A string pool and index-based tree would cut
   that substantially and is the obvious next optimisation.
-- The MFT path has been verified by parser fuzzing and review, not by
-  running against a real volume (the development environment is Linux).
-  It falls back automatically on any failure.
+- There is no automated test against a real NTFS volume; the MFT path is
+  covered by the parser tests and falls back to the directory walk on any
+  failure.
 - Cache revalidation is a full rescan running behind the cached view, not
   an incremental diff. Reading the NTFS USN journal to patch the cached
   tree in place is the obvious next step, and needs a real volume to

@@ -139,20 +139,20 @@ Explorer, or to recycle that one copy.
 Recycling in bulk is a single button: "Recycle every extra copy" keeps
 the first copy of each set and sends the rest to the Recycle Bin, after
 one confirmation that states the file count, the set count and the
-total size, with No as the default. Every extra is verified byte for
-byte against its kept copy immediately before it is recycled, so the
-last copy can never go and a stale result cannot delete the wrong
-thing; a set that no longer matches is skipped whole and said so. The
-run shows its progress, can be stopped by Esc or a click, and ends with
-an exact accounting of what moved and what was skipped.
+total size, with No as the default. The run shows its progress, can be
+stopped by Esc or a click, and ends with an exact accounting of what
+moved and what was skipped.
+
+Either way, a copy is recycled only after Spindle has re-verified byte
+for byte that a different, identical file still exists, so a hash match
+alone never deletes anything, the last copy can never be the one
+removed, and a stale result cannot delete the wrong thing. A set that
+no longer matches is skipped whole and said so. Deletion always goes to
+the Recycle Bin and always asks first.
 
 The report also exports: "Export duplicates to CSV" in the menu writes
 one row per file with its set number, copy count, sizes and full path,
 so a spreadsheet can take the decision over.
-The delete only proceeds after Spindle has re-verified, byte for byte,
-that another identical copy still exists, so the last copy can never be
-the one deleted, and a hash match alone is never enough. Deletion goes to
-the Recycle Bin and asks first.
 
 The second button, "Across every scanned drive", pools candidates from
 every drive's remembered scan. That finds the file that exists once on
@@ -222,22 +222,12 @@ missing (a network share, exFAT, no elevation) Spindle falls back to the
 parallel directory walk. The status bar shows `MFT` when the fast path
 ran.
 
-Report timings on a synthetic 1.9M-file tree, after optimisation:
-
-| | before | after |
-|---|---|---|
-| Extension breakdown | 122 ms | 64 ms |
-| Largest files | 46 ms | 28 ms |
-| Name search | 45 ms | 25 ms |
-| Treemap rebuild | n/a | 13 ms |
-| Hit test per mouse move | n/a | 0.012 ms |
-
-The gains came from two changes. Extensions are aggregated by a hash
-computed in place instead of building a lower-cased string per file,
-which had been 1.9 million allocations for a table with a few hundred
-rows. And the path walker now only maintains the prefix for directories,
-joining the leaf name for rows a caller actually keeps, where previously
-every file's full path was built and immediately thrown away.
+The side panel stays instant on large trees. On a 1.9M-file tree the
+extension breakdown takes about 60 ms, the largest-files list under
+30 ms, a name search about 25 ms and a treemap rebuild 13 ms, with hit
+testing at a few microseconds per mouse move. Extensions are aggregated
+by a hash computed in place rather than by building a string per file,
+and full paths are only assembled for the rows a caller actually keeps.
 
 ## Feature comparison
 
@@ -274,7 +264,7 @@ under MSYS2), and for ARM64 with llvm-mingw via `make ARCH=aarch64`.
 
 ```
 make            # build/spindle.exe
-make test       # 900+ assertions under ASan, UBSan and ThreadSanitizer
+make test       # host tests under ASan, UBSan and ThreadSanitizer
 make stress     # the scanner's concurrency structure over a real tree
 make analyze    # cppcheck + clang-tidy
 ```
@@ -308,11 +298,9 @@ regenerates it.
 `tools/make_icon.py` uses only the Python standard library; it
 rasterises, encodes and packs the ICO itself. Frame encoding is the part
 that matters: the ICO container allows DIB or PNG frames, but Windows
-only reliably decodes PNG at 256x256. An earlier version wrote every
-frame as PNG through an imaging library, `LoadImage` failed, and the app
-silently showed the stock Windows icon. Frames are now DIB up to 128 and
-PNG only at 256, and `make icon` prints each frame's encoding so a
-regression is visible.
+only reliably decodes PNG at 256x256 and fails silently into the stock
+icon otherwise. Frames are DIB up to 128 and PNG only at 256, and
+`make icon` prints each frame's encoding so a regression is visible.
 
 The manifest declares `PerMonitorV2` DPI awareness as a fallback for
 builds predating `SetProcessDpiAwarenessContext`, and `asInvoker`.
@@ -328,8 +316,8 @@ without a lock. Sizes are rolled up in a single-threaded post-order pass
 afterwards.
 
 Layout is the squarified algorithm from Bruls, Huizing and van Wijk
-(2000). Measured on random inputs it holds a mean aspect ratio of 1.19
-with the worst cell at 2.01, and covers the bounds to within 0.01%.
+(2000), which keeps cells close to square: a mean aspect ratio of about
+1.2 on random inputs.
 
 ## Search
 
@@ -361,32 +349,18 @@ Clicking a row in the Kinds panel searches for that extension, so the
 breakdown doubles as a way into the results. An unrecognised token
 becomes a name term rather than an error.
 
-Fuzzed with 40,000 generated queries built from adversarial fragments
-(`>>>>`, `size:size:>`, `999999999999999999999999gb`, unbalanced quotes)
-plus 20,000 random unicode strings.
-
 ## Text rendering
-
-Two classes of label bug were fixed.
-
-Line boxes are pinned explicitly rather than left to the font's own
-metrics. Segoe UI at 19px needs about 25px of line box, and the
-drive-letter label had a 22px rect with `DRAW_TEXT_OPTIONS_CLIP`, so its
-bottom was cut off. Several 12px labels sat in 16px rects, one pixel from
-the same problem. Each format now sets uniform line spacing to a known
-value, every rect is sized from that constant, and paragraph alignment is
-centred, so a slightly generous rect centres the text and a slightly
-tight one no longer crops it. A lint over the source checks all 24 text
-rects against their format's line box.
 
 Antialiasing is grayscale rather than ClearType. Subpixel rendering puts
 coloured fringes on glyph edges, which is unobtrusive on white and
 clearly visible on a dark background, especially on muted greys.
 
-Also fixed: two full-width status messages were left-aligned against the
-edge of the map area instead of centred in it, and text alignment (a
-property of the shared format object) was not being restored after a
-centred or right-aligned draw, so it leaked into whatever drew next.
+Line boxes are pinned explicitly rather than left to the font's own
+metrics. Segoe UI at 19px needs about 25px of line box, and a rect
+shorter than that gets its descenders clipped. Each text format sets
+uniform line spacing to a known value, every rect is sized from that
+constant, and paragraph alignment is centred, so a slightly generous
+rect centres the text and a slightly tight one does not crop it.
 
 ## Motion
 
@@ -435,13 +409,6 @@ bytes, knows nothing about Windows, and is fuzzed on the host as part of
 buffer, and no length, offset or count taken from the disk is used
 without validation.
 
-Fuzzing found two real bugs immediately, both reachable from a crafted
-filesystem: a 64-bit shift in the run-list sign extension (undefined
-behaviour whenever the offset field is eight bytes wide) and a signed
-overflow accumulating the cluster delta. 78 assertions now cover the
-parser, including 60,000 corrupted records, 40,000 random buffers, and
-every truncation offset of a valid structure.
-
 The volume is opened read-only, `FILE_READ_DATA` with read, write and
 delete sharing, so a scan cannot interfere with a volume in use.
 
@@ -457,16 +424,18 @@ matters as much as what is present:
 - Networking exists for exactly one purpose: the auto-updater, over
   WinHTTP, HTTPS, to the GitHub release API for this repository and the
   release assets it names. Nothing else in the program reaches the
-  network, and there is no Winsock, WinINet or DNS use anywhere. Release
-  builds carry the maintainer's public key, so the check runs at launch
-  and can be turned off in the menu; a build with no key embedded
-  compiles the same code but never opens a socket. An update is accepted
-  only when a manifest signed by the maintainer's offline ECDSA P-256
-  key, verified through CNG, vouches for the exact SHA-256 of the file,
-  it is offered rather than installed, and every failure leaves the
-  current install untouched.
+  network, and there is no Winsock, WinINet or DNS use anywhere. The
+  maintainer's public key is embedded in the source, so the check runs
+  at launch and can be turned off in the menu; a build with the key
+  constant emptied compiles the same code but never opens a socket. An
+  update is accepted only when a manifest signed by the maintainer's
+  offline ECDSA P-256 key, verified through CNG, vouches for the exact
+  SHA-256 and size of the file and carries a serial newer than the last
+  one accepted; it is offered rather than installed, and every failure
+  leaves the current install untouched.
 - No process creation. No `CreateProcess`, no `WinExec`. `ShellExecuteW`
-  is used to open Explorer at a path and for nothing else.
+  is used to open Explorer at a path and, from browse mode, to open a
+  file with its default application; nothing else.
 - No injection primitives. No `CreateRemoteThread`, `WriteProcessMemory`,
   `VirtualAllocEx` or `SetWindowsHookEx`.
 - Registry writes happen in exactly one feature: the opt-in "Scan with

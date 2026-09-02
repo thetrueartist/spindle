@@ -72,7 +72,7 @@ $(OUT): $(SRC) src/spindle.h $(RES)
 	@echo "built $@"
 
 # Core logic and the work queue are platform-independent, so both run under
-# the host sanitizers. The queue is where the scanner used to fall over, so it
+# the host sanitizers. The queue is the scanner's concurrency core, so it
 # gets a ThreadSanitizer pass of its own on top of ASan.
 test:
 	@mkdir -p build

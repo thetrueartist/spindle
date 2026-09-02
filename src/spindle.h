@@ -127,9 +127,11 @@ inline constexpr size_t   kMaxCacheNameLen = 4096;          // UTF-16 units
 // reader reserves children up front, so a count derived from the file
 // size alone let a one gigabyte cache demand nearly four gigabytes of
 // address space in a single call, on a thread with nothing to catch the
-// failure. Four million nodes is roughly 288 MB of Node, and larger than
-// any volume this has been pointed at.
-inline constexpr uint64_t kMaxCacheNodes   = uint64_t{1} << 22;
+// failure. Eight million nodes is roughly 600 MB of Node, which a tree
+// that size needs in memory anyway, and more files than a desktop volume
+// holds; the allocation is caught if it fails, so the cost of a hostile
+// file is a bounded reserve and no cache, never a dead process.
+inline constexpr uint64_t kMaxCacheNodes   = uint64_t{1} << 23;
 
 // Maximum directory nesting any tree may reach, whatever produced it. The
 // directory walker already stops here; the cache reader and the MFT builder
