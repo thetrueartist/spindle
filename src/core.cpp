@@ -1835,7 +1835,7 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
     for (size_t i = 0; i <= len; ++i) {
         const char c = (i < len) ? static_cast<char>(data[i]) : '\n';
         if (c != '\n' && c != '\r') {
-            if (line.size() < 128) line.push_back(c);
+            if (line.size() < 1024) line.push_back(c);
             continue;
         }
         const size_t eq = line.find('=');
@@ -1850,6 +1850,19 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 s.prefetchAll = value;
             } else if (key == "check_updates") {
                 s.checkUpdates = value;
+            } else if (key == "remember_view") {
+                s.rememberView = value;
+            } else if (key == "last_browse") {
+                s.lastBrowse = value;
+            } else if (key == "last_panel") {
+                const std::string v = line.substr(eq + 1);
+                if (v.size() == 1 && v[0] >= '0' && v[0] <= '3') {
+                    s.lastPanel = v[0] - '0';
+                }
+            } else if (key == "last_path") {
+                // Stored verbatim as UTF-8; the Windows layer converts it.
+                // A single value, so any '=' inside a path is kept.
+                s.lastPath = line.substr(eq + 1);
             } else if (key == "update_serial") {
                 // Not a flag: parse the number, bounded, refusing junk.
                 const std::string v = line.substr(eq + 1);
@@ -1879,6 +1892,10 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
         "\nresume_on_launch=" + (s.resumeOnLaunch ? "1" : "0") +
         "\nprefetch_all=" + (s.prefetchAll ? "1" : "0") +
         "\ncheck_updates=" + (s.checkUpdates ? "1" : "0") +
+        "\nremember_view=" + (s.rememberView ? "1" : "0") +
+        "\nlast_browse=" + (s.lastBrowse ? "1" : "0") +
+        "\nlast_panel=" + std::to_string(s.lastPanel) +
+        "\nlast_path=" + s.lastPath +
         "\nupdate_serial=" + std::to_string(s.updateSerial) + "\n";
     out.assign(text.begin(), text.end());
 }

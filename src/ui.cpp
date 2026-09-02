@@ -444,6 +444,38 @@ static std::wstring TrailPath(const std::vector<const Node*>& trail) {
 
 static void EndAddressEdit(bool commit);
 
+// The settings file is UTF-8; paths are wide. These convert at that
+// boundary so a remembered folder with non-ASCII characters survives.
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+                                      static_cast<int>(w.size()),
+                                      nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                        out.data(), n, nullptr, nullptr);
+    return out;
+}
+static std::wstring Utf8ToWide(const std::string& u) {
+    if (u.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, u.c_str(),
+                                      static_cast<int>(u.size()), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, u.c_str(), static_cast<int>(u.size()),
+                        out.data(), n);
+    return out;
+}
+
+// Capture the current place into settings, for "remember where I was".
+static void RememberCurrentView() {
+    if (!g_app.result) return;
+    g_app.settings.lastPath   = WideToUtf8(TrailPath(g_app.trail));
+    g_app.settings.lastBrowse = g_app.browse;
+    g_app.settings.lastPanel  = static_cast<int>(g_app.panel);
+}
+
 // Full path of a cell. Cells nest up to five levels inside the viewed
 // directory, so the breadcrumb has to be extended by the cell's own parent
 // chain -- appending just the cell's name yields a path with every
@@ -3539,6 +3571,9 @@ static void ShowAppMenu(POINT screenPt) {
     AppendMenuW(menu,
                 MF_STRING | (g_app.settings.prefetchAll ? MF_CHECKED : 0u),
                 9, L"Read every drive at launch");
+    AppendMenuW(menu,
+                MF_STRING | (g_app.settings.rememberView ? MF_CHECKED : 0u),
+                13, L"Remember where I was");
     if (UpdateFeatureEnabled()) {
         AppendMenuW(menu,
                     MF_STRING |
@@ -3588,6 +3623,7 @@ static void ShowAppMenu(POINT screenPt) {
                         L"Right-click a block - Explorer, copy path,\n"
                         L"                       recycle, force remove\n"
                         L"Ctrl+F - search names\n"
+                        L"Ctrl+L - type or paste a path\n"
                         L"Ctrl+E - export CSV\n"
                         L"F5 - rescan\n"
                         L"Esc - cancel a running scan",
@@ -3599,6 +3635,13 @@ static void ShowAppMenu(POINT screenPt) {
             break;
         case 4:
             g_app.settings.resumeOnLaunch = !g_app.settings.resumeOnLaunch;
+            SaveSettings(g_app.settings);
+            break;
+        case 13:
+            g_app.settings.rememberView = !g_app.settings.rememberView;
+            // Capture now, so turning it on then closing hard still lands
+            // somewhere sensible next launch.
+            if (g_app.settings.rememberView) RememberCurrentView();
             SaveSettings(g_app.settings);
             break;
         case 9:
@@ -4758,6 +4801,49 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
 
+            // Reopen the exact place last left, when that is asked for and
+            // the drive is still here. Falls through to the default below
+            // if the remembered drive is gone (a card pulled out).
+            if (g_app.settings.rememberView &&
+                !g_app.settings.lastPath.empty()) {
+                const std::wstring last = Utf8ToWide(g_app.settings.lastPath);
+                if (last.size() >= 2 && last[1] == L':') {
+                    int idx = -1;
+                    for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+                        if (!g_app.volumes[i].path.empty() &&
+                            towupper(g_app.volumes[i].path[0]) ==
+                                towupper(last[0])) {
+                            idx = static_cast<int>(i);
+                            break;
+                        }
+                    }
+                    if (idx >= 0) {
+                        const std::wstring drive =
+                            g_app.volumes[static_cast<size_t>(idx)].path;
+                        std::vector<std::wstring> comps;
+                        size_t pos = 3;   // past "X:\"
+                        while (pos < last.size()) {
+                            const size_t sep = last.find(L'\\', pos);
+                            const std::wstring c =
+                                (sep == std::wstring::npos)
+                                    ? last.substr(pos)
+                                    : last.substr(pos, sep - pos);
+                            pos = (sep == std::wstring::npos) ? last.size()
+                                                             : sep + 1;
+                            if (!c.empty()) comps.push_back(c);
+                        }
+                        g_app.browse = g_app.settings.lastBrowse;
+                        const int p = g_app.settings.lastPanel;
+                        g_app.panel = static_cast<App::Panel>(
+                            (p >= 0 && p <= 3) ? p : 0);
+                        StartScanPath(drive, idx, true);
+                        g_app.pendingTrail = comps;   // replayed on completion
+                        QueueLaunchPrefetch(drive);
+                        return 0;
+                    }
+                }
+            }
+
             // Otherwise open where the user left off: the drive with the
             // freshest cache comes up mapped immediately. The other fixed
             // drives are then walked one at a time in the background, so
@@ -5580,6 +5666,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_DESTROY:
+            if (g_app.settings.rememberView) {
+                RememberCurrentView();
+                SaveSettings(g_app.settings);
+            }
             JoinWorker();
             JoinDupeWorker();
             JoinBulkWorker();

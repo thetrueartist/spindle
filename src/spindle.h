@@ -494,6 +494,13 @@ struct Settings {
     bool resumeOnLaunch = true;   // open the freshest cached drive at start
     bool prefetchAll    = true;   // read the other fixed drives at launch
     bool checkUpdates   = true;   // ask GitHub for a newer release at launch
+    // Reopen the exact place last left: drive, folder, map-or-list and
+    // panel. Off by default, because some people want a clean start and
+    // some want to carry on; the menu toggles it.
+    bool rememberView   = false;
+    std::string lastPath;         // UTF-8 folder path to reopen
+    bool lastBrowse     = false;  // list view rather than the map
+    int  lastPanel      = 0;      // which side panel was open
     // Highest signed manifest serial ever accepted. Anti-replay: a
     // genuine but superseded release carries a lower serial and is
     // refused, so nobody can be pinned on an old signed version.

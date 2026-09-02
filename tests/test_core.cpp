@@ -2212,6 +2212,23 @@ static void TestSettings() {
         CHECK(r.updateSerial == 1756742400ull,
               "a plausible update serial round-trips");
 
+        // Remember-view fields round-trip, including a path with a space
+        // and the default-off behaviour.
+        Settings sv;
+        sv.rememberView = true;
+        sv.lastBrowse   = true;
+        sv.lastPanel    = 2;
+        sv.lastPath     = "D:\\Games\\Baldur's Gate 3";
+        std::vector<uint8_t> sb;
+        SerializeSettings(sv, sb);
+        Settings ro = ParseSettings(sb.data(), sb.size());
+        CHECK(ro.rememberView && ro.lastBrowse && ro.lastPanel == 2,
+              "remember-view flags round-trip");
+        CHECK(ro.lastPath == sv.lastPath,
+              "a remembered path with a space survives");
+        CHECK(!ParseSettings(nullptr, 0).rememberView,
+              "remember-view defaults off");
+
         // The fractional part of a size bound multiplies too, reached
         // through the query parser since that is the public door to it.
         const Query wrapped = ParseQuery(L">0.9999999999999999999tb");

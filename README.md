@@ -213,6 +213,11 @@ failure, so a scheduled task can act on the result. Anything beginning
 with a dash is treated as a mistyped option rather than a path, so a typo
 cannot start a scan by accident.
 
+The `···` menu can remember where you were: turn on "Remember
+where I was" and the next launch reopens the same drive and folder in the
+same map or list view. It is off by default, so a normal launch still
+opens the drive with the freshest scan.
+
 Spindle can also add a "Scan with Spindle" entry to folder right-click
 menus, from the `···` menu. It is off by default and is the only registry
 write in the program: per-user under `HKCU`, no elevation, and unticking
