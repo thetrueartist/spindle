@@ -331,8 +331,10 @@ static void TestRecordParsing() {
     CHECK(info.parent == 42, "parent reference");
     CHECK(info.size == 512, "resident $DATA size");
     CHECK(!info.isExtension, "not an extension record");
-    std::printf("    parsed '%ls' parent=%u size=%llu\n", info.name.c_str(),
-                info.parent, static_cast<unsigned long long>(info.size));
+    // parent is 64-bit now (the full $FILE_NAME reference); print it as one.
+    std::printf("    parsed '%ls' parent=%llu size=%llu\n", info.name.c_str(),
+                static_cast<unsigned long long>(info.parent),
+                static_cast<unsigned long long>(info.size));
 
     rec = MakeRecord(L"Users", 5, 0, true);
     ApplyFixups(rec.data(), rec.size(), 512);

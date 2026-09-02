@@ -111,6 +111,13 @@ constexpr uint32_t kCat[static_cast<int>(Cat::COUNT)] = {
 
 }  // namespace theme
 
+// theme colours are 0xRRGGBB; GDI wants COLORREF (0x00BBGGRR). Used to
+// paint the child EDIT controls so they match the dark chrome instead of
+// showing as a stark white box.
+static inline COLORREF ToColorRef(uint32_t rgb) {
+    return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
+
 // --------------------------------------------------------------------- layout
 
 namespace layout {
@@ -161,7 +168,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.0";
+constexpr const wchar_t* kAppVersion = L"2.5.1";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -312,6 +319,7 @@ struct App {
     bool                  recycleRunning = false;
     int                   recycleDrive   = -1;
     HANDLE                recycleWorker  = nullptr;
+    HBRUSH                editBrush      = nullptr;   // dark fill for EDITs
     uint64_t              recycleGen     = 0;
     Progress              recycleProgress;
     std::wstring          recycleCurrent;   // the item being moved
@@ -1670,6 +1678,23 @@ static void DrawSidebar(const Rect& area) {
              theme::kMute);
     y += 22.0f;
 
+    // Every drive at once, first: the whole machine as one view. Above the
+    // per-drive cards so it stays in reach and does not shift as drives
+    // come and go. Map, list and search all span the machine from here.
+    g_app.allDrivesHit = Rect{};
+    {
+        const Rect card{area.x + layout::kPad, y,
+                        area.w - layout::kPad * 2.0f, 30.0f};
+        g_app.allDrivesHit = card;
+        FillRound(card, 6.0f,
+                  g_app.allDrives ? theme::kSlabHi : theme::kSlab);
+        DrawText(L"All drives", g_app.fmtBody.get(),
+                 Rect{card.x + layout::kPad, card.y + 6.0f,
+                      card.w - layout::kPad * 2.0f, layout::kLineBody},
+                 g_app.allDrives ? theme::kSignal : theme::kType);
+        y += 30.0f + 12.0f;
+    }
+
     g_app.driveHits.clear();
     for (size_t i = 0; i < g_app.volumes.size(); ++i) {
         const Rect card{area.x + layout::kPad, y,
@@ -1679,24 +1704,6 @@ static void DrawSidebar(const Rect& area) {
                       static_cast<int>(i) == g_app.selected,
                       static_cast<int>(i));
         y += layout::kDriveCardH + 8.0f;
-    }
-
-    // Every drive at once, under one root: map, list and search span the
-    // whole machine. Sits below the per-drive cards.
-    g_app.allDrivesHit = Rect{};
-    {
-        const Rect card{area.x + layout::kPad, y,
-                        area.w - layout::kPad * 2.0f, 30.0f};
-        if (card.bottom() <= area.bottom() - 200.0f) {
-            g_app.allDrivesHit = card;
-            FillRound(card, 4.0f,
-                      g_app.allDrives ? theme::kSlabHi : theme::kSlab);
-            DrawText(L"All drives", g_app.fmtBody.get(),
-                     Rect{card.x + layout::kPad, card.y + 6.0f,
-                          card.w - layout::kPad * 2.0f, layout::kLineBody},
-                     g_app.allDrives ? theme::kType : theme::kMute);
-            y += 38.0f;
-        }
     }
 
     if (g_app.cells.empty() && g_app.fileList.empty()) { return; }
@@ -4966,6 +4973,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.dpiScale = QueryDpiScale(hwnd);
             g_app.volumes  = EnumerateVolumes();
             g_app.settings = LoadSettings();
+            g_app.editBrush = CreateSolidBrush(ToColorRef(theme::kSlabHi));
 
             // Finish any staged update, then (only when the feature is
             // keyed and wanted) ask about a newer one, quietly.
@@ -5553,6 +5561,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
 
+        case WM_CTLCOLOREDIT: {
+            // The address bar and the rename box are child EDITs. Paint
+            // them in the dark chrome instead of the stock white so they
+            // read as fields in this window, not holes cut out of it.
+            HDC dc = reinterpret_cast<HDC>(wp);
+            SetTextColor(dc, ToColorRef(theme::kType));
+            SetBkColor(dc, ToColorRef(theme::kSlabHi));
+            return reinterpret_cast<LRESULT>(g_app.editBrush);
+        }
+
         case WM_LBUTTONDOWN:
             SetFocus(hwnd);
             OnLeftClick(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
@@ -5865,6 +5883,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_DESTROY:
+            if (g_app.editBrush) {
+                DeleteObject(g_app.editBrush);
+                g_app.editBrush = nullptr;
+            }
             if (g_app.settings.rememberView) {
                 RememberCurrentView();
                 SaveSettings(g_app.settings);
