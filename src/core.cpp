@@ -1114,6 +1114,12 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
 
     if (seen != nodeCount) return false;
     if (r.Left() != 0) return false;   // trailing bytes: not our file
+    // A cache that claims files but whose root has no children is the
+    // product of a scan that counted records it never attached. Serving
+    // it shows an empty map under a confident file count, and the fresh
+    // cache fast path would keep serving it. Refuse it so the next scan
+    // replaces it.
+    if (out.stats.fileCount > 0 && out.root.children.empty()) return false;
     return true;
 }
 

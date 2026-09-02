@@ -445,8 +445,26 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
 
             const ntfs::RecordInfo info =
                 ntfs::ParseRecord(r, bi.bytesPerRecord);
-            if (!info.valid || !info.inUse || !info.hasName) continue;
+            if (!info.valid || !info.inUse) continue;
             if (info.isExtension) continue;
+
+            // The root directory names itself "." in its own $FILE_NAME,
+            // which the name filter rightly refuses as a path component.
+            // The root is not one: its name is the volume, set by the
+            // caller, and this record only has to exist so that every
+            // top-level entry finds its parent in use. Without it the
+            // table is counted in full and the tree comes back empty.
+            if (idx == ntfs::kRootRecord) {
+                if (info.isDir) {
+                    Entry& e = entries[idx];
+                    e.used   = true;
+                    e.isDir  = true;
+                    e.parent = ntfs::kRootRecord;
+                }
+                continue;
+            }
+
+            if (!info.hasName) continue;
             // Compared at full width, so a 48-bit reference past the
             // table is rejected instead of wrapping onto a valid index.
             if (info.parent >= recordCount) continue;   // dangling parent
@@ -483,6 +501,15 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     }
 
     if (files == 0 && dirs == 0) return false;   // nothing usable; fall back
+
+    // Without a usable root record nothing can attach to the tree, and an
+    // empty tree under a full file count is worse than the slow path. This
+    // is checked here, after the reads have drained, rather than inside
+    // the loop where a read may still be in flight.
+    if (recordCount <= ntfs::kRootRecord ||
+        !entries[static_cast<size_t>(ntfs::kRootRecord)].used) {
+        return false;
+    }
 
     // Everything from here to the end of the tree build is inside one
     // try: these are the five largest allocations in the function, and

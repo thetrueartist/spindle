@@ -1340,6 +1340,27 @@ static void TestScanCache() {
     ScanResult out;
     CacheMeta om;
     CHECK(DeserializeScan(buf.data(), buf.size(), out, om), "round-trips");
+
+    {
+        // A cache that claims files while its root has no children is what
+        // a scan that counted records it never attached produces. It must
+        // be refused, or the fresh-cache fast path serves an empty map
+        // under a confident file count for as long as the file stays fresh.
+        ScanResult hollow;
+        hollow.root = MakeDir(L"C:\\", {});
+        hollow.stats.fileCount = 1500686;
+        hollow.stats.bytes     = 0;
+        std::vector<uint8_t> hb;
+        SerializeScan(hollow, m, hb);
+        ScanResult hr;
+        CacheMeta  hm;
+        CHECK(!DeserializeScan(hb.data(), hb.size(), hr, hm),
+              "a cache with files but no tree is refused");
+        hollow.stats.fileCount = 0;
+        SerializeScan(hollow, m, hb);
+        CHECK(DeserializeScan(hb.data(), hb.size(), hr, hm),
+              "a genuinely empty volume still round-trips");
+    }
     CHECK(om.savedUnixMs == m.savedUnixMs, "timestamp survives");
     CHECK(om.volumeSerial == m.volumeSerial, "serial survives");
     CHECK(out.stats.bytes == in.stats.bytes, "byte total survives");
