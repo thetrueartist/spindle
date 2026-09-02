@@ -157,7 +157,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.3.1";
+constexpr const wchar_t* kAppVersion = L"2.4.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -259,6 +259,9 @@ struct App {
     std::wstring             updateTag;
     HANDLE                   updateWorker = nullptr;
     HWND                     renameEdit = nullptr;
+    HWND                     addressEdit = nullptr;   // the breadcrumb, typed into
+    std::wstring             fileListBase;   // what fileList paths are relative to
+    Rect                     crumbArea{};             // where it was last drawn
     std::wstring             renameParent;
     std::wstring             renameOld;
     std::vector<Rect>        browseRowHits;     // visible rows only
@@ -421,6 +424,8 @@ static std::wstring TrailPath(const std::vector<const Node*>& trail) {
     for (const Node* n : trail) AppendComponent(p, n->name);
     return p;
 }
+
+static void EndAddressEdit(bool commit);
 
 // Full path of a cell. Cells nest up to five levels inside the viewed
 // directory, so the breadcrumb has to be extended by the cell's own parent
@@ -618,6 +623,7 @@ static void DropTreeReferences() {
         g_app.renameOld.clear();
         g_app.renameParent.clear();
     }
+    EndAddressEdit(false);
     // Duplicate results deliberately survive: every Node pointer is
     // stripped before the hunt starts, so the report is owned strings only,
     // and losing an expensive answer just because the user looked at
@@ -1184,12 +1190,32 @@ static void RefreshPanel() {
             g_app.extStats = ExtensionBreakdown(cur, 12);
             break;
         case App::Panel::Largest:
+            g_app.fileListBase = TrailPath(g_app.trail);
             g_app.fileList = LargestFiles(cur, 40);
             break;
-        case App::Panel::Search:
-            g_app.fileList =
-                FindMatching(cur, ParseQuery(g_app.query), 200);
+        case App::Panel::Search: {
+            const Query q = ParseQuery(g_app.query);
+            // A term naming a drive asks about the whole drive, wherever
+            // the view happens to be. The results then join to the drive
+            // root rather than to the folder on screen, which is why the
+            // base travels with the list.
+            bool wholeDrive = false;
+            for (const std::wstring& t : q.pathInclude) {
+                if (t.size() >= 3 && t[1] == L':' && t[2] == L'\\') {
+                    wholeDrive = true;
+                    break;
+                }
+            }
+            if (wholeDrive && g_app.result) {
+                g_app.fileListBase = g_app.result->root.name;
+                g_app.fileList = FindMatching(g_app.result->root, q, 200,
+                                              g_app.fileListBase);
+            } else {
+                g_app.fileListBase = TrailPath(g_app.trail);
+                g_app.fileList = FindMatching(cur, q, 200, g_app.fileListBase);
+            }
             break;
+        }
         case App::Panel::Dupes:
             // Nothing to refresh: duplicates are found on request, not on
             // every navigation, because finding them reads files.
@@ -1645,8 +1671,10 @@ static void DrawSidebar(const Rect& area) {
         if (g_app.panel == App::Panel::Search) {
             // Search is scoped to the directory being viewed, and the empty
             // states are where that is worth saying out loud.
-            const std::wstring where =
-                SanitizeForDisplay(TrailPath(g_app.trail));
+            const std::wstring where = SanitizeForDisplay(
+                (!g_app.query.empty() && !g_app.fileListBase.empty())
+                    ? g_app.fileListBase
+                    : TrailPath(g_app.trail));
             if (g_app.query.empty()) {
                 empty = where.empty() ? std::wstring()
                                       : L"Searches " + where;
@@ -1908,6 +1936,19 @@ static void EnsureBrowseOrder() {
 // the tree already knows everything about, so no disk is read and every
 // folder row has a size. Only the visible span draws.
 static void DrawBrowse(const Rect& area) {
+    // Everything in the list stays inside its area. The last row would
+    // otherwise run on under the status bar, whose text sits on an open
+    // background. Popped on every way out of this function.
+    struct ClipScope {
+        explicit ClipScope(const Rect& r) {
+            g_app.rt->PushAxisAlignedClip(ToD2D(r),
+                                          D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        ~ClipScope() { g_app.rt->PopAxisAlignedClip(); }
+        ClipScope(const ClipScope&) = delete;
+        ClipScope& operator=(const ClipScope&) = delete;
+    } clip(area);
+
     g_app.browseRowHits.clear();
     g_app.browseRowNodes.clear();
     g_app.browseBar = Rect{};
@@ -1985,8 +2026,12 @@ static void DrawBrowse(const Rect& area) {
         const float y = listY + upH +
                         static_cast<float>(i) * browse::kRowH -
                         g_app.browseScroll;
-        if (y + browse::kRowH < listY + upH || y > area.bottom()) continue;
-        const Rect row{area.x, y, area.w - 12.0f, browse::kRowH};
+        if (y + browse::kRowH < listY + upH || y >= area.bottom()) continue;
+        Rect row{area.x, y, area.w - 12.0f, browse::kRowH};
+        // A row straddling the bottom edge is clipped by the draw scope;
+        // its hit rectangle stops at the same edge, or a click on the
+        // status bar would land on a row that is not visibly there.
+        if (row.bottom() > area.bottom()) row.h = area.bottom() - row.y;
 
         const bool hot = row.contains(g_app.mouseX, g_app.mouseY);
         if (BrowseSelected(nd)) {
@@ -2081,6 +2126,7 @@ static void DrawViewTabs(const Rect& area) {
 
 static void DrawBreadcrumb(const Rect& area) {
     g_app.crumbHits.clear();
+    g_app.crumbArea = area;
     // Map | List, right-aligned. Per tab, like the panel and the search.
     {
         const float w = 46.0f;
@@ -2998,6 +3044,151 @@ static void ShowDupeInMap(const std::wstring& full) {
     RevealInExplorer(full);
 }
 
+// ---- address bar --------------------------------------------------------
+// The breadcrumb doubles as an input: click it, or press Ctrl+L, and it
+// becomes a text box holding the current path, ready to be typed or
+// pasted over. Enter goes there, on any drive; Esc or clicking away
+// cancels. A real EDIT control, like rename, because the caret, the
+// selection, the clipboard and the IME all come with it.
+
+static void GoToTypedPath(std::wstring text) {
+    // Tolerate what a paste brings: quotes, whitespace, forward slashes.
+    size_t b = 0;
+    while (b < text.size() &&
+           (text[b] == L' ' || text[b] == L'\t' || text[b] == L'"')) {
+        ++b;
+    }
+    text.erase(0, b);
+    while (!text.empty() &&
+           (text.back() == L' ' || text.back() == L'\t' ||
+            text.back() == L'"' || text.back() == L'\r' ||
+            text.back() == L'\n')) {
+        text.pop_back();
+    }
+    for (wchar_t& c : text) if (c == L'/') c = L'\\';
+    if (text.size() < 2 || text[1] != L':' || !iswalpha(text[0])) {
+        MessageBeep(MB_OK);   // not a lettered path; UNC scans come from the command line
+        return;
+    }
+    if (text.size() == 2 || text[2] != L'\\') text.insert(2, 1, L'\\');
+
+    // Already on screen: a file path flashes its cell and that is enough.
+    if (NavigateToPath(text)) return;
+
+    int vi = -1;
+    for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+        const std::wstring& vp = g_app.volumes[i].path;
+        if (!vp.empty() && towupper(vp[0]) == towupper(text[0])) {
+            vi = static_cast<int>(i);
+            break;
+        }
+    }
+    if (vi < 0) {
+        MessageBeep(MB_OK);   // no such drive here
+        return;
+    }
+
+    // Described the way a tab is, then applied the way a tab is: the
+    // current view keeps its panel, its search and its map-or-list choice
+    // and simply looks somewhere else, switching drives if it must.
+    ViewTab t;
+    t.root        = text.substr(0, 3);
+    t.volumeIndex = vi;
+    t.panel       = static_cast<int>(g_app.panel);
+    t.query       = g_app.query;
+    t.browse      = g_app.browse;
+    t.title       = ViewTitleFor(t.root);
+    size_t pos = 3;
+    while (pos < text.size()) {
+        const size_t sep = text.find(L'\\', pos);
+        const std::wstring comp = (sep == std::wstring::npos)
+                                      ? text.substr(pos)
+                                      : text.substr(pos, sep - pos);
+        pos = (sep == std::wstring::npos) ? text.size() : sep + 1;
+        if (comp.empty() || comp == L".") continue;
+        if (comp == L"..") {
+            if (!t.comps.empty()) t.comps.pop_back();
+            continue;
+        }
+        t.comps.push_back(comp);
+    }
+    ApplyView(t);
+
+    // A path ending in a file: the walk stopped at its folder. Flash the
+    // file now if the tree is here, or once it lands.
+    if (!NavigateToPath(text) && !g_app.result) g_app.pendingReveal = text;
+    SnapshotActiveView();
+}
+
+static void EndAddressEdit(bool commit) {
+    if (!g_app.addressEdit) return;
+    wchar_t buf[2048] = {};
+    GetWindowTextW(g_app.addressEdit, buf, 2047);
+    const HWND edit = g_app.addressEdit;
+    g_app.addressEdit = nullptr;   // re-entry guard: WM_KILLFOCUS fires here
+    DestroyWindow(edit);
+    if (commit) GoToTypedPath(buf);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    UpdateWindow(g_app.hwnd);   // the control's pixels must not outlive it
+}
+
+static LRESULT CALLBACK AddressEditProc(HWND h, UINT msg, WPARAM wp,
+                                        LPARAM lp) {
+    const WNDPROC prev = reinterpret_cast<WNDPROC>(
+        GetWindowLongPtrW(h, GWLP_USERDATA));
+    switch (msg) {
+        case WM_KEYDOWN:
+            if (wp == VK_RETURN) { EndAddressEdit(true); return 0; }
+            if (wp == VK_ESCAPE) { EndAddressEdit(false); return 0; }
+            break;
+        case WM_CHAR:
+            // The control beeps at Enter and Esc otherwise.
+            if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
+            break;
+        case WM_KILLFOCUS:
+            // An address bar abandoned is cancelled, unlike a rename.
+            EndAddressEdit(false);
+            return 0;
+        default:
+            break;
+    }
+    return prev ? CallWindowProcW(prev, h, msg, wp, lp)
+                : DefWindowProcW(h, msg, wp, lp);
+}
+
+static void BeginAddressEdit() {
+    EndRename(false);
+    EndAddressEdit(false);
+    if (g_app.trail.empty()) return;
+    const Rect& a = g_app.crumbArea;
+    const float left  = a.x + layout::kPad;
+    const float right = g_app.mapToggleHit.x - 12.0f;
+    if (a.w <= 0.0f || right - left < 80.0f) return;
+
+    const float sc = (g_app.dpiScale > 0.0f) ? g_app.dpiScale : 1.0f;
+    const int x = static_cast<int>(left * sc);
+    const int y = static_cast<int>((a.y + 8.0f) * sc);
+    const int w = static_cast<int>((right - left) * sc);
+    const int h = static_cast<int>(24.0f * sc);
+    const std::wstring current = TrailPath(g_app.trail);
+    const HWND edit = CreateWindowExW(
+        0, L"EDIT", current.c_str(),
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, x, y, w, h, g_app.hwnd,
+        nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!edit) return;
+    SendMessageW(edit, WM_SETFONT,
+                 reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+                 TRUE);
+    SendMessageW(edit, EM_SETLIMITTEXT, 2000, 0);
+    const LONG_PTR prev = SetWindowLongPtrW(
+        edit, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(AddressEditProc));
+    SetWindowLongPtrW(edit, GWLP_USERDATA, prev);
+    SendMessageW(edit, EM_SETSEL, 0, -1);   // typing replaces, as in a browser
+    SetFocus(edit);
+    g_app.addressEdit = edit;
+}
+
 // Paste into the search box: first line only, printable characters only, the
 // same 128-character cap as typing. Clipboard text is as attacker-controlled
 // as filenames are.
@@ -3633,7 +3824,7 @@ static void ShowRowMenu(int rowIndex, POINT screenPt) {
     // dispatches WM_SCAN_DONE, which clears fileList and refills it from a
     // different tree. An index taken now means nothing afterwards.
     const std::wstring rel = g_app.fileList[i].path;
-    std::wstring full = TrailPath(g_app.trail);
+    std::wstring full = g_app.fileListBase;   // not the trail: a search can span the drive
     AppendComponent(full, rel);
 
     HMENU menu = CreatePopupMenu();
@@ -4170,7 +4361,7 @@ static void OnLeftClick(int x, int y) {
         // separator that produced.
         if (i >= g_app.fileList.size()) return;
         {
-            std::wstring full = TrailPath(g_app.trail);
+            std::wstring full = g_app.fileListBase;
             AppendComponent(full, g_app.fileList[i].path);
             RevealInExplorer(full);
         }
@@ -4286,11 +4477,19 @@ static void OnLeftClick(int x, int y) {
     for (size_t i = 0; i < g_app.crumbHits.size(); ++i) {
         if (!g_app.crumbHits[i].contains(fx, fy)) continue;
         const size_t target = g_app.crumbFirst + i;
-        if (target + 1 >= g_app.trail.size()) return;
+        if (target + 1 >= g_app.trail.size()) {
+            BeginAddressEdit();   // the folder you are in: edit the path
+            return;
+        }
         g_app.trail.resize(target + 1);
         ResetBrowseView();
         g_app.hoverNode = nullptr;
         NavigateTo(g_app.trail.back(), g_app.mapBounds);
+        return;
+    }
+    // Empty space on the breadcrumb bar (the toggles were handled above).
+    if (g_app.crumbArea.contains(fx, fy)) {
+        BeginAddressEdit();
         return;
     }
 
@@ -4411,6 +4610,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_SIZE: {
+            EndAddressEdit(false);
             if (g_app.rt) {
                 const D2D1_SIZE_U s{
                     static_cast<UINT32>(std::max<int>(LOWORD(lp), 1)),
@@ -5039,6 +5239,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == 'E' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 DoExport();
+                return 0;
+            }
+            if (wp == 'L' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                BeginAddressEdit();
                 return 0;
             }
             switch (wp) {

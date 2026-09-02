@@ -1133,6 +1133,55 @@ static void TestQueryParsing() {
     CHECK(q.minSize == 0, "overflowing size rejected");
 }
 
+static void TestPathQueries() {
+    std::printf("FindMatching: path terms\n");
+
+    const Node root = BuildSearchTree();
+    auto count = [&](const wchar_t* text) {
+        return FindMatching(root, ParseQuery(text), 500).size();
+    };
+
+    // A term with a separator matches the full path, folder included.
+    CHECK(count(L"root\\VMware") == 4,
+          "a folder path lists the folder and everything under it");
+    CHECK(count(L"VMware\\kali.vmdk") == 1,
+          "a file path finds exactly that file");
+    CHECK(count(L"root/Steam") == 4, "forward slashes are accepted");
+    CHECK(count(L"ROOT\\vmware") == 4, "path terms are case-insensitive");
+    CHECK(count(L"root\\nowhere") == 0,
+          "a path that is not there matches nothing");
+    CHECK(count(L"root\\VMware -notes") == 3,
+          "path terms combine with name terms");
+    CHECK(count(L"root\\VMware ext:vmdk") == 2, "and with filters");
+
+    // A whole query that is a path is one term, spaces and all.
+    Query q = ParseQuery(L"C:\\Users\\some one\\Documents");
+    CHECK(q.pathInclude.size() == 1 && q.include.empty(),
+          "a pasted path is not split on spaces");
+    CHECK(q.pathInclude[0] == L"c:\\users\\some one\\documents",
+          "and is lower-cased with one separator");
+    q = ParseQuery(L"\\\\server\\share\\dir");
+    CHECK(q.pathInclude.size() == 1, "a UNC path is one term too");
+    q = ParseQuery(L"pak");
+    CHECK(q.pathInclude.empty() && q.include.size() == 1,
+          "a plain word is still a name term");
+    CHECK(!ParseQuery(L"D:\\").Empty(), "a bare drive is a query");
+
+    // A scoped search starts at a node whose name is one component, so
+    // the scope's real path has to be supplied for a full path to match.
+    const Node* vm = nullptr;
+    for (const Node& c : root.children) if (c.name == L"VMware") vm = &c;
+    CHECK(vm != nullptr, "fixture has the VMware folder");
+    if (vm) {
+        CHECK(FindMatching(*vm, ParseQuery(L"root\\VMware\\kali"), 500)
+                      .empty(),
+              "without the scope's path a full path cannot match");
+        CHECK(FindMatching(*vm, ParseQuery(L"root\\VMware\\kali"), 500,
+                           L"root\\VMware").size() == 1,
+              "with it, a full path matches inside a scoped search");
+    }
+}
+
 static void TestQueryMatching() {
     std::printf("FindMatching\n");
 
@@ -2174,6 +2223,7 @@ int main() {
     TestFindByName();
     TestQueryParsing();
     TestQueryMatching();
+    TestPathQueries();
     FuzzQueries();
     TestCsvExport();
     TestReportsOnHostileTrees();

@@ -23,6 +23,7 @@ users' profiles, which on a typical system adds up to tens of gigabytes.
 | Ctrl+E | export to CSV |
 | Backspace / mouse-back | go up |
 | Click a breadcrumb | jump to that level |
+| Ctrl+L, or click the current folder's name | type or paste a path, Enter goes there |
 | Right-click a block | show in Explorer, copy path, recycle, force remove |
 | F5 | rescan |
 | Esc | cancel a running scan |
@@ -64,7 +65,10 @@ direction. Double-click descends, the ".." row and Backspace come back
 out, and right-click carries the same actions as the map plus rename.
 Selection speaks the usual grammar (click, ctrl, shift), the status bar
 sums what is selected, and a right-click on the selection copies every
-path or recycles the lot behind one confirmation.
+path or recycles the lot behind one confirmation. The breadcrumb doubles
+as an address bar: click the folder you are in, or press Ctrl+L, and type
+or paste a path; Enter goes there on any drive, and a path that names a
+file outlines that file's cell.
 
 ![browse mode](docs/browse.png)
 
@@ -339,6 +343,11 @@ must match.
 `kind:media >500mb -temp` reads as "large media files that aren't
 temporary", which is usually the real question when a drive fills up, and
 typing it is faster than a row of dropdowns would be to operate.
+
+A term containing a backslash matches the full path instead of the name,
+so pasting a folder lists everything under it and pasting a file's path
+finds that file. A query that is entirely a path is taken whole, spaces
+included.
 
 Size bounds apply to a folder's rolled-up total, so `is:folder >10gb`
 finds the directories worth opening. Kind tokens accept several spellings

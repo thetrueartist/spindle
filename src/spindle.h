@@ -655,6 +655,12 @@ std::vector<FileHit> LargestFiles(const Node& root, size_t limit);
 struct Query {
     std::vector<std::wstring> include;   // name substrings, all must match
     std::vector<std::wstring> exclude;   // name substrings, none may match
+    // Path substrings, matched against the full path rather than the name.
+    // A term lands here when it contains a separator, or when the whole
+    // query is a path: a pasted path is a request to see what lives there,
+    // and could never match a name.
+    std::vector<std::wstring> pathInclude;
+    std::vector<std::wstring> pathExclude;
     std::vector<Cat>          kinds;     // any match; empty means any kind
     std::vector<std::wstring> exts;      // any match; empty means any
     uint64_t minSize = 0;
@@ -667,8 +673,12 @@ struct Query {
     // nothing rather than treating an empty query as "match all".
     bool Empty() const {
         return include.empty() && exclude.empty() && kinds.empty() &&
+               pathInclude.empty() && pathExclude.empty() &&
                exts.empty() && minSize == 0 && maxSize == UINT64_MAX &&
                only == Only::Any;
+    }
+    bool HasPathTerms() const {
+        return !pathInclude.empty() || !pathExclude.empty();
     }
 };
 
@@ -683,8 +693,13 @@ bool CatFromToken(const std::wstring& token, Cat& out);
 bool QueryMatches(const Query& q, const Node& n);
 
 // Nodes matching `q`, largest first.
+// rootPath is the real path of `root`, used when the query carries path
+// terms: a scoped search starts at a node whose name is one component,
+// and a full path could never match against that alone. Empty means the
+// root's own name is its path, which is true of a volume root.
 std::vector<FileHit> FindMatching(const Node& root, const Query& q,
-                                  size_t limit);
+                                  size_t limit,
+                                  const std::wstring& rootPath = std::wstring());
 
 // Convenience wrapper: a plain name substring search.
 std::vector<FileHit> FindByName(const Node& root, const std::wstring& needle,

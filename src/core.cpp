@@ -2026,8 +2026,35 @@ bool StartsWith(const std::wstring& s, const wchar_t* prefix, size_t& after) {
 
 }  // namespace
 
+// Path terms are lower-cased like name terms and use one separator, so
+// a path pasted from anywhere compares against what the tree builds.
+static std::wstring PathTerm(const std::wstring& s) {
+    std::wstring out = Lower(s);
+    for (wchar_t& c : out) if (c == L'/') c = L'\\';
+    return out;
+}
+
 Query ParseQuery(const std::wstring& text) {
     Query q;
+
+    // A query that is a path, drive-lettered or UNC, is one term with its
+    // spaces intact. Splitting it on spaces would turn "New folder" into
+    // two words that must both match a name, which no path can.
+    {
+        size_t b = 0;
+        while (b < text.size() && (text[b] == L' ' || text[b] == L'\t')) ++b;
+        size_t e = text.size();
+        while (e > b && (text[e - 1] == L' ' || text[e - 1] == L'\t')) --e;
+        const std::wstring t = text.substr(b, e - b);
+        const auto sep = [](wchar_t c) { return c == L'\\' || c == L'/'; };
+        const bool drive = t.size() >= 3 && t[1] == L':' && sep(t[2]) &&
+                           LowerAscii(t[0]) >= L'a' && LowerAscii(t[0]) <= L'z';
+        const bool unc = t.size() >= 3 && sep(t[0]) && sep(t[1]);
+        if (drive || unc) {
+            q.pathInclude.push_back(PathTerm(t));
+            return q;
+        }
+    }
 
     for (const std::wstring& raw : Tokenise(text)) {
         if (raw.empty()) continue;
@@ -2084,6 +2111,18 @@ Query ParseQuery(const std::wstring& text) {
             }
         }
 
+        // A separator makes it a path term: names cannot contain one, so
+        // matching it against names would only ever find nothing.
+        if (token.find(L'\\') != std::wstring::npos ||
+            token.find(L'/') != std::wstring::npos) {
+            const std::wstring pt = PathTerm(token);
+            if (!pt.empty()) {
+                if (negate) q.pathExclude.push_back(pt);
+                else        q.pathInclude.push_back(pt);
+            }
+            continue;
+        }
+
         const std::wstring lowered = Lower(token);
         if (lowered.empty()) continue;
         if (negate) q.exclude.push_back(lowered);
@@ -2138,14 +2177,55 @@ bool QueryMatches(const Query& q, const Node& n) {
     return true;
 }
 
+// Case-folded substring test that allocates nothing; the needle is
+// already lower-cased by the parser.
+static bool ContainsFolded(const std::wstring& hay,
+                           const std::wstring& needle) {
+    const size_t hl = hay.size(), nl = needle.size();
+    if (nl == 0 || nl > hl) return false;
+    for (size_t i = 0; i + nl <= hl; ++i) {
+        size_t k = 0;
+        while (k < nl && LowerAscii(hay[i + k]) == needle[k]) ++k;
+        if (k == nl) return true;
+    }
+    return false;
+}
+
+static bool PathTermsMatch(const Query& q, const std::wstring& full) {
+    for (const std::wstring& t : q.pathInclude) {
+        if (!ContainsFolded(full, t)) return false;
+    }
+    for (const std::wstring& t : q.pathExclude) {
+        if (ContainsFolded(full, t)) return false;
+    }
+    return true;
+}
+
 std::vector<FileHit> FindMatching(const Node& root, const Query& q,
-                                  size_t limit) {
+                                  size_t limit,
+                                  const std::wstring& rootPath) {
     std::vector<FileHit> hits;
     if (limit == 0 || q.Empty()) return hits;
+
+    // One buffer reused for every node's full path, and only when a path
+    // term exists: the walk covers the whole tree, so a fresh string per
+    // node would be a million allocations to answer a name search.
+    const bool wantPath = q.HasPathTerms();
+    std::wstring full;
 
     ForEachNodeWithPath(root, [&](const Node& n, const std::wstring& prefix) {
         if (hits.size() >= limit) return;
         if (!QueryMatches(q, n)) return;
+        if (wantPath) {
+            full.assign(rootPath.empty() ? root.name : rootPath);
+            if (!full.empty() && full.back() != L'\\') full.push_back(L'\\');
+            if (!prefix.empty()) {
+                full += prefix;
+                full.push_back(L'\\');
+            }
+            full += n.name;
+            if (!PathTermsMatch(q, full)) return;
+        }
 
         FileHit hit;
         hit.node = &n;
