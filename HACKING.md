@@ -244,10 +244,9 @@ already-posted completion message is recognised as stale.
 ## Auto-update
 
 A release is only an update once a manifest signed by the maintainer's
-OFFLINE key says so. The private key never touches the repo or CI, so a
-compromised repository, action, or GitHub account cannot ship a
-trojaned update; the updater fails closed on anything unsigned,
-malformed, mismatched, replayed or unreachable.
+key says so, and producing that signature takes a human approval. The
+updater fails closed on anything unsigned, malformed, mismatched,
+replayed or unreachable.
 
 Mechanics: at launch (and from the menu), a worker fetches the latest
 release metadata from the GitHub API over WinHTTP, finds manifest.json
@@ -269,17 +268,22 @@ in core.cpp with hard bounds and host tests, like every other parser
 of hostile bytes. The accepted serial is persisted in the settings file,
 which is parsed with the same care.
 
-Signing is deliberately not a CI job. The key is the one thing an
-attacker holding this repository, its Actions and the maintainer's
-GitHub account still does not have, and a CI secret would hand it to
-exactly that attacker. The cost is one command per release:
-`tools/sign-release.ps1` finds the newest release with no signature
-attached, downloads it, signs it locally and uploads the manifest pair,
-or takes a file and a tag by hand when the GitHub CLI is not installed.
-The signer lives in the exe itself: `--gen-update-key` writes a keypair
-(keep the private half offline), `--sign-release` hashes a build and
-writes manifest.json plus manifest.sig, and `--verify-update-manifest`
-checks a pair against a public key.
+Signing runs in `.github/workflows/sign.yml`, called by the release
+workflow after it publishes. The job lives in the `release-signing`
+environment, which holds the private key as a secret and requires the
+maintainer's approval before any run may start, so the key is never
+available to anything unattended: a push, a hijacked action or a
+workflow trigger gets as far as "waiting for approval" and stops. The
+job downloads the release asset, refuses it unless it is byte for byte
+what the same run built, signs it, verifies the result against the
+embedded public key (so a wrong secret uploads nothing), checks the
+manifest names the right tag and hash, and attaches the pair. It can
+also be run by hand for an existing tag. `tools/sign-release.ps1` is
+the offline fallback and does the same signing locally. The signer
+lives in the exe itself: `--gen-update-key` writes a keypair,
+`--sign-release` hashes a build and writes manifest.json plus
+manifest.sig, and `--verify-update-manifest` checks a pair against a
+public key.
 
 The embedded public key constant decides whether any of this runs at
 all: empty means no key, no network and no menu entry. A fork that

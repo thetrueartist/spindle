@@ -10,11 +10,10 @@
   release's exe, signs it locally, and attaches manifest.json and
   manifest.sig. Pass a tag to sign a specific one instead.
 
-  Why this is not a GitHub Action: the signing key is the only thing an
-  attacker who owns this repository, its Actions, or the maintainer's
-  GitHub account still cannot get. Putting it in a CI secret would hand
-  it to exactly the attacker the signature exists to stop. It stays on
-  this machine, and that is the whole guarantee.
+  This is the offline fallback. Releases are normally signed by the
+  sign workflow, which waits for the maintainer's approval in the
+  release-signing environment before it can touch the key. Use this when
+  that path is unavailable or in doubt; it produces the same manifest.
 
 .EXAMPLE
   .\sign-release.ps1

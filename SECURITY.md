@@ -60,24 +60,29 @@ GitHub's API and release hosts, follows at most one redirect between
 them, and caps the download at the signed size. A build with the public
 key constant emptied never opens a socket at all.
 
-The private key is offline and exists on no build machine, no CI runner
-and nothing GitHub can reach. A full compromise of this repository, its
-Actions, or the maintainer's GitHub account therefore still cannot
-deliver an update to anybody: the attacker can publish a release, but
-they cannot sign one. The updater fails closed on anything unsigned,
-altered, replayed or unreachable, and it never installs anything without
-being asked.
+The private key is a GitHub environment secret that is released only to
+the signing job, and that job cannot start until the maintainer approves
+the run. Nothing unattended can sign, and neither can anything that
+merely has write access to this repository, its Actions or its releases:
+a compromise there can publish a release, but every installed copy keeps
+refusing it until a person approves signing it, and the approval screen
+shows exactly which commit and tag are being signed. What this does not
+defend against is a compromise of the maintainer's own GitHub account,
+which could approve a run. That is the trade made for signing being a
+click rather than a ritual, and it is why that account is expected to
+carry strong two-factor authentication. Signing can also be done offline
+with `tools/sign-release.ps1` should the hosted path ever be in doubt.
 
-Signing happens on the maintainer's machine, never in CI. A signing key
-held by GitHub Actions could be used by anyone who compromised the
-repository, so it would defeat the only guarantee this scheme offers.
+The updater fails closed on anything unsigned, altered, replayed or
+unreachable, and it never installs anything without being asked.
 
 ## Build integrity
 
 Releases are built by GitHub Actions from a tagged commit and carry a
-`SHA256SUMS` file. The workflow that publishes them holds the only write
-permission in CI, and the third-party action it uses is pinned to a
-commit rather than a movable tag.
+`SHA256SUMS` file. The release workflow and its signing job hold the only
+write permission in CI, the signing job refuses an asset that is not byte
+for byte what the same run built, and the third-party action the
+workflow uses is pinned to a commit rather than a movable tag.
 
 The binary is not code-signed with an Authenticode certificate, so
 SmartScreen will warn on a fresh download until the file earns

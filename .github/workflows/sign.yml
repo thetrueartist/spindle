@@ -1,0 +1,114 @@
+name: sign
+
+# Signs a published release so installed copies will accept it as an
+# update. The private key is an environment secret that GitHub releases
+# only to a job in the "release-signing" environment, and that environment
+# requires the maintainer's approval before the job may start. Nothing
+# unattended can sign: a push, a hijacked action or a workflow trigger
+# gets as far as "waiting for approval" and no further.
+#
+# Called automatically by release.yml after a release is published, and
+# runnable by hand for an existing tag.
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+      verify_against_build:
+        description: 'Require the release asset to match the exe this run built'
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to sign (e.g. v2.3.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: windows-latest
+    environment: release-signing
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag_name }}
+      # The public half, so the job proves the secret is the matching key
+      # before it uploads anything.
+      SPINDLE_PUBLIC_KEY: QTPCug6/3n/9X4E3jp/FC8zMsPCkCmW+i46q3PsdfvhweKGqUyKXxOSVsgFxDhsyzSk590AXaNVcEsLVOsmNCQ==
+    steps:
+      - name: Download the release asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force rel | Out-Null
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern spindle.exe --dir rel --clobber
+          if (-not (Test-Path rel\spindle.exe)) { throw "release $env:TAG has no spindle.exe asset" }
+          Write-Host "asset sha256: $((Get-FileHash rel\spindle.exe -Algorithm SHA256).Hash.ToLower())"
+
+      # Only in the release flow: the bytes being signed must be the bytes
+      # this same run built, so an asset swapped between publish and
+      # approval is refused rather than signed.
+      - name: Fetch the exe this run built
+        if: ${{ inputs.verify_against_build }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-exe
+          path: built
+      - name: Require the asset to match the build
+        if: ${{ inputs.verify_against_build }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $a = (Get-FileHash rel\spindle.exe   -Algorithm SHA256).Hash
+          $b = (Get-FileHash built\spindle.exe -Algorithm SHA256).Hash
+          if ($a -ne $b) { throw "release asset does not match this run's build: $a vs $b" }
+          Write-Host "asset matches the build"
+
+      - name: Sign, verify, upload
+        shell: pwsh
+        env:
+          SPINDLE_SIGNING_KEY: ${{ secrets.SPINDLE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:SPINDLE_SIGNING_KEY)) {
+            throw "SPINDLE_SIGNING_KEY is not set in the release-signing environment"
+          }
+
+          # Accept either the bare private key or the full --gen-update-key
+          # output pasted as-is; only the private value is written to disk.
+          $lines = $env:SPINDLE_SIGNING_KEY -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          $privLine = $lines | Where-Object { $_ -match "private" } | Select-Object -First 1
+          $priv = if ($privLine) { [string]($privLine -replace ".*:\s*", "") } else { [string]($lines | Select-Object -First 1) }
+          if ($priv.Length -lt 100) { throw "the signing key looks wrong (length $($priv.Length))" }
+          [IO.File]::WriteAllText((Join-Path $PWD "priv.key"), $priv)
+
+          try {
+            Start-Process -FilePath .\rel\spindle.exe -Wait -NoNewWindow -ArgumentList @(
+              "--sign-release", "rel\spindle.exe", "priv.key", $env:TAG)
+            if (-not (Test-Path rel\manifest.json) -or -not (Test-Path rel\manifest.sig)) {
+              throw "signing wrote no manifest: $(Get-Content rel\sign-error.txt -ErrorAction SilentlyContinue)"
+            }
+
+            # The same check every installed copy runs, against the public
+            # key they carry. A wrong secret fails here and uploads nothing.
+            $p = Start-Process -FilePath .\rel\spindle.exe -Wait -NoNewWindow -PassThru -ArgumentList @(
+              "--verify-update-manifest", "rel\manifest.json", "rel\manifest.sig", $env:SPINDLE_PUBLIC_KEY)
+            if ($p.ExitCode -ne 0) { throw "the manifest does not verify against the embedded public key: wrong signing key?" }
+
+            $m = Get-Content rel\manifest.json -Raw
+            $hash = (Get-FileHash rel\spindle.exe -Algorithm SHA256).Hash.ToLower()
+            if ($m -notmatch [regex]::Escape("`"tag`":`"$env:TAG`""))  { throw "manifest names a different tag" }
+            if ($m -notmatch [regex]::Escape("`"sha256`":`"$hash`"")) { throw "manifest hash does not match the asset" }
+            Write-Host "manifest: $m"
+
+            gh release upload $env:TAG rel\manifest.json rel\manifest.sig --repo $env:GITHUB_REPOSITORY --clobber
+            Write-Host "signed $env:TAG"
+          } finally {
+            Remove-Item priv.key -Force -ErrorAction SilentlyContinue
+          }
