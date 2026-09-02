@@ -68,9 +68,13 @@ sums what is selected, and a right-click on the selection copies every
 path or recycles the lot behind one confirmation. The breadcrumb doubles
 as an address bar: click the folder you are in, or press Ctrl+L, and type
 or paste a path; Enter goes there on any drive, and a path that names a
-file outlines that file's cell. Recycling runs in the background: the
-status bar says which item is moving and how far along the run is, Esc
-stops it after the current item, and the window stays usable throughout.
+file outlines that file's cell.
+
+![the breadcrumb as an address bar](docs/addressbar.png)
+
+Recycling runs in the background: the status bar says which item is
+moving and how far along the run is, Esc stops it after the current
+item, and the window stays usable throughout.
 
 ![browse mode](docs/browse.png)
 
