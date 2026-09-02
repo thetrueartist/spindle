@@ -84,6 +84,12 @@ write permission in CI, the signing job refuses an asset that is not byte
 for byte what the same run built, and the third-party action the
 workflow uses is pinned to a commit rather than a movable tag.
 
+CodeQL scans the C++ on every push and weekly, building it with the
+project's own MinGW cross-compile so the analysis sees exactly what
+ships. Secret scanning with push protection is on, so a key can never be
+committed, and the repository accepts private vulnerability reports
+through its Security tab.
+
 The binary is not code-signed with an Authenticode certificate, so
 SmartScreen will warn on a fresh download until the file earns
 reputation. That is a known gap, not an oversight.

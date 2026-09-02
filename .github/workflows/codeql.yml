@@ -1,0 +1,42 @@
+name: codeql
+
+# CodeQL security analysis. Default setup cannot build Spindle, which is a
+# Windows binary cross-compiled with MinGW, so this drives the build itself
+# in manual mode: install the cross toolchain, run the ordinary `make`
+# under CodeQL's tracer, then analyse. Findings appear under Security ->
+# Code scanning; they do not fail the build unless a branch ruleset says so.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 7 * * 1'   # a weekly sweep catches advisories in dormant code
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: analyze c-cpp
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+      - name: Build
+        run: make
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
