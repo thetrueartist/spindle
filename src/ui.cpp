@@ -161,7 +161,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.4.0";
+constexpr const wchar_t* kAppVersion = L"2.5.0";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -233,6 +233,8 @@ struct App {
     Rect                        hoverRect;
 
     std::vector<DriveHit> driveHits;
+    Rect                  allDrivesHit;      // the "All drives" card
+    bool                  allDrives = false; // the aggregate view is shown
     std::vector<Rect>     crumbHits;
     std::vector<ViewTab>  viewTabs;
     int                   activeView = 0;
@@ -431,6 +433,16 @@ static void AppendComponent(std::wstring& p, const std::wstring& name) {
     // one would take the other. Names are validated at every boundary they
     // enter by; this makes the collapse impossible rather than unlikely.
     if (name.empty()) { p.clear(); return; }
+    // An absolute component is a fresh base, not a child of what came
+    // before. A real file or folder name can never be absolute (a colon
+    // and a backslash are both refused by IsSafeNodeName), so the only
+    // component that resets here is a volume root like "C:\" or a UNC
+    // root. This is what lets the all-drives view hang every volume under
+    // one synthetic root and still build a correct path for every file.
+    const bool absolute =
+        (name.size() >= 2 && name[1] == L':') ||
+        (name.size() >= 2 && name[0] == L'\\' && name[1] == L'\\');
+    if (absolute) { p = name; return; }
     if (p.empty()) { p = name; return; }
     if (p.back() != L'\\') p += L'\\';
     p += name;
@@ -743,6 +755,17 @@ struct CacheReady {
     ScanResult* result  = nullptr;
     uint64_t    savedMs = 0;
     bool        fresh   = false;   // recent enough to skip the revalidation
+};
+
+// The all-drives view: every fixed volume hung under one synthetic root so
+// the map, list and search all span the machine at once. Built on a worker
+// because it may load or walk several drives.
+struct AllDrivesRequest {
+    HWND                      hwnd = nullptr;
+    uint64_t                  gen  = 0;
+    Progress*                 progress = nullptr;
+    bool                      keepCache = true;
+    std::vector<std::wstring> volumePaths;   // a copy, so no cross-thread read
 };
 
 // Scan thread entry. Wrapped end to end: an exception escaping here would
@@ -1293,6 +1316,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     g_app.pendingReveal.clear();
     g_app.pendingTrail.clear();
     g_app.selected  = volumeIndex;
+    g_app.allDrives = false;
     DropTreeReferences();
     g_app.result.reset();
     g_app.showingCache = false;
@@ -1340,6 +1364,125 @@ static void StartScan(int volumeIndex, bool useCache = true) {
     }
     StartScanPath(g_app.volumes[static_cast<size_t>(volumeIndex)].path,
                   volumeIndex, useCache);
+}
+
+// Builds the all-drives view on a worker: every fixed volume hung under one
+// synthetic root. A cached drive loads at once; a fixed drive with no cache
+// is walked and cached for next time; removable and network drives without
+// a cache are left alone, the same rule the rest of the program follows.
+// Posts the aggregate as an ordinary WM_SCAN_DONE, so adoption, path
+// building (via AppendComponent's absolute-reset), the map, the list and
+// search all work over it unchanged.
+unsigned __stdcall AllDrivesThread(void* param) {
+    std::unique_ptr<AllDrivesRequest> req(
+        static_cast<AllDrivesRequest*>(param));
+    if (req->progress == nullptr) req->progress = &g_app.progress;
+    auto agg = std::make_unique<ScanResult>();
+    agg->root.name = L"All drives";
+    agg->root.dir  = true;
+    agg->root.cat  = Cat::Directory;
+    uint64_t aggDirs = 0;
+    try {
+        for (const std::wstring& path : req->volumePaths) {
+            if (req->progress->cancel.load(std::memory_order_relaxed)) {
+                return 0;
+            }
+            ScanResult one;
+            CacheMeta  cm;
+            bool ok = false;
+            if (req->keepCache) {
+                try {
+                    ok = LoadScanCache(path, one, cm, &req->progress->cancel);
+                } catch (...) {
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                if (req->progress->cancel.load(std::memory_order_relaxed)) {
+                    return 0;
+                }
+                // Only a fixed local drive is walked unprompted; a removable
+                // or network volume with no cache is skipped, not read.
+                wchar_t root3[4] = {path.empty() ? L'C' : path[0], L':',
+                                    L'\\', 0};
+                if (GetDriveTypeW(root3) != DRIVE_FIXED) continue;
+                one = Scan(path, 0, req->progress);
+                if (req->progress->cancel.load(std::memory_order_relaxed)) {
+                    return 0;
+                }
+                if (req->keepCache && !one.stats.faulted) {
+                    SaveScanCache(path, one);
+                }
+            }
+            if (one.root.children.empty() && one.root.size == 0) continue;
+            aggDirs += one.stats.dirCount;
+            agg->root.children.push_back(std::move(one.root));
+        }
+    } catch (...) {
+        PostMessageW(req->hwnd, WM_SCAN_DONE,
+                     static_cast<WPARAM>(req->gen), 0);
+        return 0;
+    }
+
+    uint64_t total = 0;
+    uint32_t files = 0;
+    for (const Node& c : agg->root.children) {
+        total = SatAdd(total, c.size);
+        files += c.files;
+    }
+    agg->root.size       = total;
+    agg->root.files      = files;
+    agg->stats.bytes     = total;
+    agg->stats.fileCount = files;
+    agg->stats.dirCount  = aggDirs;
+    agg->stats.usedMft   = false;
+
+    if (PostMessageW(req->hwnd, WM_SCAN_DONE,
+                     static_cast<WPARAM>(req->gen),
+                     reinterpret_cast<LPARAM>(agg.get()))) {
+        static_cast<void>(agg.release());  // NOLINT
+    }
+    return 0;
+}
+
+static void StartAllDrives() {
+    JoinWorker();
+    CancelPrefetch(false);
+    g_app.prefetchQueue.clear();
+    g_app.pendingReveal.clear();
+    g_app.pendingTrail.clear();
+    g_app.selected    = -1;
+    g_app.allDrives   = true;
+    DropTreeReferences();
+    g_app.result.reset();
+    g_app.showingCache = false;
+
+    g_app.progress.files.store(0);
+    g_app.progress.dirs.store(0);
+    g_app.progress.bytes.store(0);
+    g_app.progress.cancel.store(false);
+    g_app.progress.done.store(false);
+    g_app.scanning = true;
+
+    auto req = std::make_unique<AllDrivesRequest>();
+    req->hwnd      = g_app.hwnd;
+    req->gen       = g_app.scanGen.fetch_add(1) + 1;
+    req->keepCache = g_app.settings.keepCaches;
+    req->progress  = &g_app.progress;
+    for (const auto& v : g_app.volumes) req->volumePaths.push_back(v.path);
+
+    const uintptr_t h =
+        _beginthreadex(nullptr, 0, AllDrivesThread, req.get(), 0, nullptr);
+    if (h == 0) {
+        g_app.scanning = false;
+        MessageBoxW(g_app.hwnd, L"Could not start: the system refused a new "
+                                L"thread.",
+                    L"Spindle", MB_OK | MB_ICONERROR);
+        return;
+    }
+    static_cast<void>(req.release());  // NOLINT
+    g_app.worker = reinterpret_cast<HANDLE>(h);
+    SetTimer(g_app.hwnd, kTimerId, 33, nullptr);
 }
 
 // The layout is area-proportional, so scaling every cell by the same factor
@@ -1536,6 +1679,24 @@ static void DrawSidebar(const Rect& area) {
                       static_cast<int>(i) == g_app.selected,
                       static_cast<int>(i));
         y += layout::kDriveCardH + 8.0f;
+    }
+
+    // Every drive at once, under one root: map, list and search span the
+    // whole machine. Sits below the per-drive cards.
+    g_app.allDrivesHit = Rect{};
+    {
+        const Rect card{area.x + layout::kPad, y,
+                        area.w - layout::kPad * 2.0f, 30.0f};
+        if (card.bottom() <= area.bottom() - 200.0f) {
+            g_app.allDrivesHit = card;
+            FillRound(card, 4.0f,
+                      g_app.allDrives ? theme::kSlabHi : theme::kSlab);
+            DrawText(L"All drives", g_app.fmtBody.get(),
+                     Rect{card.x + layout::kPad, card.y + 6.0f,
+                          card.w - layout::kPad * 2.0f, layout::kLineBody},
+                     g_app.allDrives ? theme::kType : theme::kMute);
+            y += 38.0f;
+        }
     }
 
     if (g_app.cells.empty() && g_app.fileList.empty()) { return; }
@@ -3136,6 +3297,14 @@ static void ApplyView(ViewTab t) {
     g_app.panel  = static_cast<App::Panel>(t.panel);
     g_app.query  = t.query;
     g_app.browse = t.browse;
+    // An aggregate tab restores through the same builder rather than a
+    // volume scan; its root is the synthetic name, not a drive path.
+    if (t.root == L"All drives") {
+        g_app.searchFocus = false;
+        g_app.searchSelectAll = false;
+        StartAllDrives();
+        return;
+    }
     g_app.searchFocus = false;
     g_app.searchSelectAll = false;
     if (!t.root.empty() &&
@@ -4541,6 +4710,12 @@ static void OnLeftClick(int x, int y) {
         g_app.dupeRunning = true;
         // Repaint on the timer so the count climbs while it works.
         SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if (g_app.allDrivesHit.w > 0.0f && g_app.allDrivesHit.contains(fx, fy)) {
+        StartAllDrives();
         InvalidateRect(g_app.hwnd, nullptr, FALSE);
         return;
     }

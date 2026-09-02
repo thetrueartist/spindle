@@ -88,6 +88,15 @@ are two tabs to choose from.
 
 ![tabs](docs/tabs.png)
 
+An "All drives" card at the bottom of the drive list opens every volume
+at once, under one view. The map shows each drive as a top-level block
+and descends into folders across the machine; the list shows the drives
+as rows; and Find, Kinds and Largest all span every drive, so a search
+there covers the whole computer rather than one volume. Cached drives
+appear at once, a fixed drive with no cache yet is walked in the
+background, and removable or network drives are left alone unless you
+have already scanned them.
+
 Filenames are treated as untrusted input; see the Security section.
 
 Force removal handles the things that will not delete normally: locked
