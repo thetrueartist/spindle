@@ -118,6 +118,17 @@ static inline COLORREF ToColorRef(uint32_t rgb) {
     return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
+// A GDI font that matches one of the DirectWrite formats: same family, and
+// the same em size in pixels once DPI is applied. A negative height asks
+// GDI for that em size directly rather than a cell height.
+static HFONT MakeEditFont(float dip, float dpiScale) {
+    const int px = static_cast<int>(std::lround(dip * dpiScale));
+    return CreateFontW(-px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                       L"Segoe UI");
+}
+
 // --------------------------------------------------------------------- layout
 
 namespace layout {
@@ -168,7 +179,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.1";
+constexpr const wchar_t* kAppVersion = L"2.5.2";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -320,6 +331,10 @@ struct App {
     int                   recycleDrive   = -1;
     HANDLE                recycleWorker  = nullptr;
     HBRUSH                editBrush      = nullptr;   // dark fill for EDITs
+    // GDI fonts matching the DirectWrite formats, so a text box opened over
+    // a label shows the same face at the same size, not the system default.
+    HFONT                 editFontBody   = nullptr;   // Segoe UI 14 px
+    HFONT                 editFontSmall  = nullptr;   // Segoe UI 12 px
     uint64_t              recycleGen     = 0;
     Progress              recycleProgress;
     std::wstring          recycleCurrent;   // the item being moved
@@ -495,6 +510,19 @@ static void RememberCurrentView() {
     g_app.settings.lastPath   = WideToUtf8(TrailPath(g_app.trail));
     g_app.settings.lastBrowse = g_app.browse;
     g_app.settings.lastPanel  = static_cast<int>(g_app.panel);
+}
+
+static void DestroyEditFonts() {
+    if (g_app.editFontBody)  { DeleteObject(g_app.editFontBody);  g_app.editFontBody  = nullptr; }
+    if (g_app.editFontSmall) { DeleteObject(g_app.editFontSmall); g_app.editFontSmall = nullptr; }
+}
+
+// Sized from the live DPI, so they are rebuilt whenever that changes.
+static void CreateEditFonts() {
+    DestroyEditFonts();
+    const float sc = (g_app.dpiScale > 0.0f) ? g_app.dpiScale : 1.0f;
+    g_app.editFontBody  = MakeEditFont(14.0f, sc);   // matches fmtBody
+    g_app.editFontSmall = MakeEditFont(12.0f, sc);   // matches fmtSmall
 }
 
 // The typed query redraws at once; the results wait until typing pauses.
@@ -2224,9 +2252,13 @@ static void BeginRename(const std::wstring& parent,
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, x, y, w, h, g_app.hwnd,
         nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!edit) return;
+    // The row's own face and size, so the name does not change font the
+    // moment it becomes editable.
+    if (!g_app.editFontSmall) CreateEditFonts();
     SendMessageW(edit, WM_SETFONT,
-                 reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
-                 TRUE);
+                 reinterpret_cast<WPARAM>(g_app.editFontSmall), TRUE);
+    SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELPARAM(0, 0));
     const LONG_PTR prev = SetWindowLongPtrW(
         edit, GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(RenameEditProc));
@@ -3588,19 +3620,27 @@ static void BeginAddressEdit() {
     if (a.w <= 0.0f || right - left < 80.0f) return;
 
     const float sc = (g_app.dpiScale > 0.0f) ? g_app.dpiScale : 1.0f;
+    // Placed on the breadcrumb's own text line, at its own height, so the
+    // path appears to become editable in place rather than a box opening
+    // over it. baseY and the line box are the same numbers DrawBreadcrumb
+    // uses; a single-line EDIT centres its text vertically as DirectWrite
+    // does in its line box, so the baselines coincide.
     const int x = static_cast<int>(left * sc);
-    const int y = static_cast<int>((a.y + 8.0f) * sc);
+    const int y = static_cast<int>((a.y + 11.0f) * sc);
     const int w = static_cast<int>((right - left) * sc);
-    const int h = static_cast<int>(24.0f * sc);
+    const int h = static_cast<int>(layout::kLineBody * sc);
     const std::wstring current = TrailPath(g_app.trail);
     const HWND edit = CreateWindowExW(
         0, L"EDIT", current.c_str(),
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, x, y, w, h, g_app.hwnd,
         nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!edit) return;
+    if (!g_app.editFontBody) CreateEditFonts();
     SendMessageW(edit, WM_SETFONT,
-                 reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
-                 TRUE);
+                 reinterpret_cast<WPARAM>(g_app.editFontBody), TRUE);
+    // No inner margin: the text starts where the crumb text started.
+    SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELPARAM(0, 0));
     SendMessageW(edit, EM_SETLIMITTEXT, 2000, 0);
     const LONG_PTR prev = SetWindowLongPtrW(
         edit, GWLP_WNDPROC,
@@ -4974,6 +5014,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.volumes  = EnumerateVolumes();
             g_app.settings = LoadSettings();
             g_app.editBrush = CreateSolidBrush(ToColorRef(theme::kSlabHi));
+            CreateEditFonts();
 
             // Finish any staged update, then (only when the feature is
             // keyed and wanted) ask about a newer one, quietly.
@@ -5092,6 +5133,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_DPICHANGED: {
             g_app.dpiScale = static_cast<float>(LOWORD(wp)) / 96.0f;
+            CreateEditFonts();   // pixel sizes follow the new DPI
             if (g_app.rt) {
                 const float d = g_app.dpiScale * 96.0f;
                 g_app.rt->SetDpi(d, d);
@@ -5887,6 +5929,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DeleteObject(g_app.editBrush);
                 g_app.editBrush = nullptr;
             }
+            DestroyEditFonts();
             if (g_app.settings.rememberView) {
                 RememberCurrentView();
                 SaveSettings(g_app.settings);
