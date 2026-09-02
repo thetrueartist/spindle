@@ -520,6 +520,11 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     try {
 
     // ---- pass two: count children so every vector is sized exactly -------
+    // Polled here and in pass three so a drive switch that cancels this
+    // scan returns promptly instead of waiting out the whole tree build.
+    if (progress && progress->cancel.load(std::memory_order_relaxed)) {
+        return false;
+    }
 
     std::vector<uint32_t> childCount(static_cast<size_t>(recordCount), 0);
     for (size_t i = 0; i < entries.size(); ++i) {
@@ -574,7 +579,13 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         }
     }
 
+    uint64_t builtGuard = 0;
     while (!queue.empty()) {
+        if ((++builtGuard & 0x3FFF) == 0 && progress &&
+            progress->cancel.load(std::memory_order_relaxed)) {
+            out.root.children.clear();
+            return false;
+        }
         const Pending p = queue.back();
         queue.pop_back();
 

@@ -351,8 +351,10 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
     // directory walk below runs instead. The user is not told which ran,
     // because the answer is the same either way.
     if (ScanMft(root, progress, result)) {
-        RollUp(result.root);
-        SortTree(result.root);
+        if (!(progress && progress->cancel.load(std::memory_order_relaxed))) {
+            RollUp(result.root);
+            SortTree(result.root);
+        }
         result.stats.bytes   = result.root.size;
         result.stats.usedMft = true;
 
@@ -360,6 +362,12 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
         result.stats.seconds =
             std::chrono::duration<double>(tMft - t0).count();
         if (progress) progress->done.store(true, std::memory_order_release);
+        return result;
+    }
+
+    // Cancelled during the MFT build: return the partial result, which the
+    // caller drops by generation, rather than starting a whole walk.
+    if (progress && progress->cancel.load(std::memory_order_relaxed)) {
         return result;
     }
 
@@ -399,8 +407,10 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
         CloseHandle(h);
     }
 
-    RollUp(result.root);
-    SortTree(result.root);
+    if (!(progress && progress->cancel.load(std::memory_order_relaxed))) {
+        RollUp(result.root);
+        SortTree(result.root);
+    }
 
     result.stats.bytes       = result.root.size;
     result.stats.fileCount   = sh.fileCount.load();
@@ -588,6 +598,11 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
         bytes.resize(static_cast<size_t>(size.QuadPart));
         size_t got = 0;
         while (ok && got < bytes.size()) {
+            if (cancel != nullptr &&
+                cancel->load(std::memory_order_relaxed)) {
+                ok = false;
+                break;
+            }
             const DWORD chunk = static_cast<DWORD>(
                 std::min<size_t>(bytes.size() - got, 1u << 24));
             DWORD read = 0;

@@ -149,6 +149,7 @@ constexpr UINT WM_CACHE_READY   = WM_APP + 9;
 // again on every click buys nothing but disk noise. F5 always forces one.
 constexpr uint64_t kFreshCacheMs = 5u * 60u * 1000u;
 constexpr UINT_PTR kTimerId = 1;
+constexpr UINT_PTR kSearchTimer = 2;   // debounces the Find results
 
 // Durations. Deliberately short: the job of these is to show what moved, not
 // to be watched. Anything past about 200 ms starts to feel like waiting.
@@ -474,6 +475,15 @@ static void RememberCurrentView() {
     g_app.settings.lastPath   = WideToUtf8(TrailPath(g_app.trail));
     g_app.settings.lastBrowse = g_app.browse;
     g_app.settings.lastPanel  = static_cast<int>(g_app.panel);
+}
+
+// The typed query redraws at once; the results wait until typing pauses.
+// Find walks the whole subtree, so running it on every keystroke froze the
+// window on a large drive. The one-shot timer collapses a burst of keys
+// into a single search.
+static void QueueSearchRefresh() {
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    SetTimer(g_app.hwnd, kSearchTimer, 160, nullptr);
 }
 
 // Full path of a cell. Cells nest up to five levels inside the viewed
@@ -4952,6 +4962,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_TIMER: {
+            if (wp == kSearchTimer) {
+                KillTimer(hwnd, kSearchTimer);
+                if (g_app.panel == App::Panel::Search) {
+                    g_app.panelDirty = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (wp != kTimerId) break;
             if (g_app.scanning || g_app.dupeRunning || g_app.zoom.Running() ||
                 g_app.reveal.Running() || g_app.hoverFade.Running() ||
@@ -5561,8 +5579,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 return 0;
             }
-            g_app.panelDirty = true;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            QueueSearchRefresh();
             return 0;
         }
 
