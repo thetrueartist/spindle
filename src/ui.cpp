@@ -899,6 +899,9 @@ unsigned __stdcall RecycleThread(void* param) {
     std::unique_ptr<RecycleRequest> req(static_cast<RecycleRequest*>(param));
     auto outcome = std::make_unique<RecycleOutcome>();
     outcome->total = req->paths.size();
+    // SHFileOperationW shows shell UI and expects COM on the calling
+    // thread; this is not the UI thread, so it initialises its own.
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
     try {
         for (const std::wstring& p : req->paths) {
             if (g_app.recycleProgress.cancel.load(std::memory_order_relaxed)) {
@@ -923,6 +926,7 @@ unsigned __stdcall RecycleThread(void* param) {
     } catch (...) {
         outcome->cancelled = true;
     }
+    if (com) CoUninitialize();
     if (PostMessageW(req->hwnd, WM_RECYCLE_DONE,
                      static_cast<WPARAM>(req->gen),
                      reinterpret_cast<LPARAM>(outcome.get()))) {
