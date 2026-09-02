@@ -2004,8 +2004,15 @@ static void EndRename(bool commit) {
                     break;
                 }
             }
+            // The tree is patched in memory, so the view is already
+            // right. Persisting it here re-serialised the whole tree on
+            // the interface thread, which stalled a rename on a large
+            // drive. Drop the now-stale cache instead: the next scan
+            // rewrites it, and until then a launch simply rescans that
+            // drive rather than serving a name that is one edit out of
+            // date.
             if (g_app.settings.keepCaches) {
-                SaveScanCache(g_app.result->root.name, *g_app.result);
+                InvalidateDriveCache(g_app.result->root.name);
             }
         }
     }
