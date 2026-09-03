@@ -1860,6 +1860,14 @@ static void TestCommandLine() {
     CHECK(Narrow(csv.path) == "D:\\", "and the path");
 
     CHECK(!Parse({L"--csv"}).valid, "--csv with no file is refused");
+    {
+        const CommandLine an = Parse({L"--csv", L"o.csv", L"--allow-network",
+                                      L"\\\\srv\\share"});
+        CHECK(an.valid && an.allowNetwork && an.path == L"\\\\srv\\share",
+              "--allow-network is parsed and the path kept");
+        CHECK(!Parse({L"--csv", L"o.csv", L"\\\\srv\\share"}).allowNetwork,
+              "network is not allowed unless asked for");
+    }
     CHECK(!Parse({L"--csv", L"out.csv"}).valid,
           "--csv with no path to scan is refused");
     CHECK(!Parse({L"--nonsense"}).valid, "unknown option refused");
@@ -2145,6 +2153,23 @@ static void TestUtf8() {
     std::wstring lone;
     lone.push_back(static_cast<wchar_t>(0xD800));
     CHECK(WideToUtf8(lone) == "\xEF\xBF\xBD", "lone high surrogate replaced");
+    std::wstring low;
+    low.push_back(static_cast<wchar_t>(0xDC00));
+    CHECK(WideToUtf8(low) == "\xEF\xBF\xBD", "lone low surrogate replaced");
+    std::wstring pairless;
+    pairless.push_back(static_cast<wchar_t>(0xD800));
+    pairless.push_back(L'a');
+    CHECK(WideToUtf8(pairless) == "\xEF\xBF\xBD" "a",
+          "a high surrogate not followed by a low one is replaced alone");
+    auto onlyReplacements = [](const std::string& in) {
+        const std::string out = WideToUtf8(Utf8ToWide(in));
+        return !out.empty() &&
+               out.find_first_not_of("\xEF\xBF\xBD") == std::string::npos;
+    };
+    CHECK(onlyReplacements("\xF4\x90\x80\x80"), "beyond U+10FFFF is refused");
+    CHECK(onlyReplacements("\xE0\x80\x80"), "overlong three-byte is refused");
+    CHECK(onlyReplacements("\xF0\x80\x80\x80"), "overlong four-byte is refused");
+    CHECK(onlyReplacements("\xED\xBF\xBF"), "an encoded low surrogate is refused");
     CHECK(WideToUtf8(L"a\\\\b") == "a\\\\b", "backslashes untouched");
 }
 
@@ -2223,21 +2248,61 @@ static void TestShareKeys() {
     CHECK(NormalizeShareKey(L"C:\\Users").empty(),
           "a local path is not a share key");
     CHECK(NormalizeShareKey(L"").empty(), "empty is empty");
-    CHECK(NormalizeShareKey(L"Y:#1A2B3C4D") == L"y:#1a2b3c4d",
-          "lettered fallback normalises");
-    CHECK(NormalizeShareKey(L"Y:#xyz").empty(),
-          "fallback serial must be hex");
+    CHECK(NormalizeShareKey(L"Y:#1A2B3C4D").empty(),
+          "a lettered key is not a share identity");
     CHECK(NormalizeShareKey(std::wstring(kMaxShareKeyChars + 1, L'a')).empty(),
           "over-long input rejected");
+
+    // Spellings that reach a share without naming one are refused, so
+    // consent for one of them can never be remembered or widened.
+    CHECK(NormalizeShareKey(L"\\\\?\\GLOBALROOT\\Device\\Mup\\srv\\share")
+              .empty(),
+          "GLOBALROOT spelling is not a share");
+    CHECK(NormalizeShareKey(L"\\\\?\\GLOBALROOT\\??\\UNC\\srv\\share").empty(),
+          "GLOBALROOT UNC spelling is not a share");
+    CHECK(NormalizeShareKey(L"\\\\.\\UNC\\a\\b").empty(),
+          "device spelling is not a share");
+    CHECK(NormalizeShareKey(L"\\\\?\\C:\\Users").empty(),
+          "long-path local spelling is not a share");
+    CHECK(NormalizeShareKey(L"\\\\server\\.\\share").empty(),
+          "a dot component is refused");
+    CHECK(NormalizeShareKey(L"\\\\server\\..\\share").empty(),
+          "a dot-dot component is refused");
+    CHECK(NormalizeShareKey(L"\\\\server\\share.").empty(),
+          "a trailing dot is refused");
+    CHECK(NormalizeShareKey(L"\\\\server\\sha:re").empty(),
+          "a character no share name may hold is refused");
+    CHECK(NormalizeShareKey(L"\\\\server\\share\r").empty(),
+          "a carriage return is refused");
+    CHECK(NormalizeShareKey(L"\\\\server\\share\ntrusted_share=x").empty(),
+          "a line feed is refused, so no key can forge a settings line");
+    CHECK(NormalizeShareKey(L"\\\\server\\share\x7f").empty(),
+          "DEL is refused");
+    CHECK(NormalizeShareKey(L"\\\\fe80--1.ipv6-literal.net\\share") ==
+              L"\\\\fe80--1.ipv6-literal.net\\share",
+          "an IPv6 literal host is an ordinary key");
+    {
+        // Exactly the cap after the long-path fold is accepted; one more
+        // is not. \\?\UNC\ is 8 chars and folds to 2.
+        std::wstring atCap = L"\\\\s\\" + std::wstring(kMaxShareKeyChars - 4, L'a');
+        CHECK(atCap.size() == kMaxShareKeyChars && !NormalizeShareKey(atCap).empty(),
+              "a key exactly at the cap is accepted");
+        std::wstring folded = L"\\\\?\\UNC\\s\\" +
+                              std::wstring(kMaxShareKeyChars - 4, L'a');
+        CHECK(NormalizeShareKey(folded) == NormalizeShareKey(atCap),
+              "the fold happens before the length check");
+        CHECK(NormalizeShareKey(atCap + L"a").empty(), "one over the cap is refused");
+    }
 
     CHECK(ShareRootOf(L"\\\\Server\\Share\\deep\\er") == L"\\\\server\\share",
           "a folder within a share belongs to the share");
     CHECK(ShareRootOf(L"\\\\server\\share") == L"\\\\server\\share",
           "a share root is its own root");
     CHECK(ShareRootOf(L"\\\\server").empty(), "a bare server has no share");
-    CHECK(ShareRootOf(L"Y:#1a2b3c4d") == L"y:#1a2b3c4d",
-          "the lettered fallback passes through");
+    CHECK(ShareRootOf(L"Y:#1a2b3c4d").empty(), "no lettered identity exists");
     CHECK(ShareRootOf(L"C:\\Users").empty(), "a local path is not a share");
+    CHECK(ShareRootOf(L"\\\\?\\GLOBALROOT\\Device\\Mup\\a\\b").empty(),
+          "GLOBALROOT has no share root to remember");
 
     Settings s;
     CHECK(!ShareTrusted(s, L"\\\\a\\b"), "nothing trusted by default");
@@ -2253,13 +2318,26 @@ static void TestShareKeys() {
     CHECK(!TrustShare(s, L"\\\\one\\more"), "the cap holds");
     CHECK(TrustShare(s, L"\\\\a\\b"), "an existing one still answers yes");
 
-    // The full list at its cap must survive the settings size limit.
+    // The full list at its cap, every key at its longest, plus the longest
+    // remembered path, must fit the settings size limit with room.
+    Settings big;
+    for (size_t i = 0; i < kMaxTrustedShares; ++i) {
+        std::wstring k = L"\\\\" + std::to_wstring(i) + L"s" +
+                         std::wstring(120, L'\u00e4') + L"\\" +
+                         std::wstring(kMaxShareKeyChars, L'b');
+        k.resize(kMaxShareKeyChars);
+        CHECK(TrustShare(big, k), "a longest key is accepted");
+    }
+    big.rememberView = true;
+    big.lastPath     = std::string(1000, 'p');
     std::vector<uint8_t> buf;
-    SerializeSettings(s, buf);
-    CHECK(buf.size() <= kMaxSettingsBytes, "capped list fits the file limit");
-    CHECK(ParseSettings(buf.data(), buf.size()).trustedShares.size() ==
-              kMaxTrustedShares,
-          "capped list round-trips whole");
+    SerializeSettings(big, buf);
+    CHECK(buf.size() <= kMaxSettingsBytes,
+          "worst case fits the file limit, so the reader never sees a prefix");
+    const Settings back = ParseSettings(buf.data(), buf.size());
+    CHECK(back.trustedShares.size() == kMaxTrustedShares,
+          "worst case round-trips whole");
+    CHECK(back.lastPath.size() == 1000, "and the path with it");
 }
 
 static void TestSettings() {
@@ -2308,16 +2386,49 @@ static void TestSettings() {
     {
         Settings t;
         CHECK(TrustShare(t, L"\\\\Server\\Share\\"), "share accepted");
-        CHECK(TrustShare(t, L"Y:#1A2B3C4D"), "lettered fallback accepted");
+        CHECK(!TrustShare(t, L"Y:#1A2B3C4D"), "a lettered key is refused");
         SerializeSettings(t, buf);
         const Settings back = ParseSettings(buf.data(), buf.size());
-        CHECK(back.trustedShares.size() == 2, "trusted shares round-trip");
+        CHECK(back.trustedShares.size() == 1, "trusted shares round-trip");
         CHECK(ShareTrusted(back, L"\\\\SERVER\\share"),
               "trusted after reload, case-insensitively");
-        CHECK(ShareTrusted(back, L"y:#1a2b3c4d"),
-              "lettered fallback trusted after reload");
         CHECK(!ShareTrusted(back, L"\\\\server\\other"),
               "a different share is not trusted");
+
+        // A folder name carrying a line feed must not be able to write a
+        // settings line of its own through the remembered path.
+        Settings forged;
+        forged.rememberView = true;
+        forged.keepCaches   = false;
+        forged.lastPath = "D:\\x\ntrusted_share=\\\\corp\\finance\nkeep_caches=1";
+        SerializeSettings(forged, buf);
+        const Settings after = ParseSettings(buf.data(), buf.size());
+        CHECK(after.trustedShares.empty(), "a forged path trusts nothing");
+        CHECK(!after.keepCaches, "and flips no setting");
+        CHECK(after.lastPath.empty(), "and the path itself is dropped");
+
+        Settings unwanted;
+        unwanted.rememberView = false;
+        unwanted.lastPath     = "D:\\somewhere";
+        SerializeSettings(unwanted, buf);
+        CHECK(ParseSettings(buf.data(), buf.size()).lastPath.empty(),
+              "a path is not written while remembering is off");
+
+        const char* ctl = "remember_view=1\nlast_path=D:\\a\tb\n";
+        CHECK(ParseSettings(reinterpret_cast<const uint8_t*>(ctl), strlen(ctl))
+                  .lastPath.empty(),
+              "a stored path with a control character is ignored");
+
+        // Security-relevant lines come first, so nothing after them can
+        // push them past a limit.
+        Settings ordered;
+        ordered.updateSerial = 77;
+        ordered.rememberView = true;
+        ordered.lastPath     = "D:\\deep";
+        SerializeSettings(ordered, buf);
+        const std::string text(buf.begin(), buf.end());
+        CHECK(text.find("update_serial=") < text.find("last_path="),
+              "the serial is written before the path");
         const char* damaged =
             "trusted_share=not a share\ntrusted_share=\\\\ok\\share\n"
             "trusted_share=\n";

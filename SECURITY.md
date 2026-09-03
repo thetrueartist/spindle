@@ -48,14 +48,19 @@ before display and before CSV export, and are refused as path components
 if they contain separators, reserved characters or trailing dots and
 spaces.
 
-Data at rest is kept small and short-lived. The only thing written
-besides settings is the scan cache under `%LOCALAPPDATA%\Spindle`: one
-file per internal fixed disk holding names, sizes and kinds, never file
-contents. Removable media, externally attached disks and network shares
-are never cached, stale caches are removed at launch, and turning caching
-off deletes what exists. Every cache is sealed with DPAPI to the account
-that wrote it, so a copied or imaged cache is unreadable elsewhere; this
-is not a defence against that account or code running as it. A network share is read only after an explicit
+Data at rest is kept small and short-lived. Besides settings, the program
+writes the scan cache under `%LOCALAPPDATA%\Spindle`, one file per
+internal fixed disk holding names, sizes and kinds, never file contents.
+Removable media, externally attached disks and network shares are never
+cached, stale caches are removed at launch, and turning caching off
+deletes what exists. Every cache is sealed with DPAPI to the account that
+wrote it, so a copied or imaged cache is unreadable elsewhere; this is not
+a defence against that account or code running as it. Two other files can
+appear next to the executable: a crash report holding fault addresses
+only, never names or paths, and the previous binary for one launch after
+an update you approved. Exports go where you choose. The settings file is
+plain text and holds the remembered shares and, if asked for, the last
+folder. A network share is read only after an explicit
 per-share permission, remembered only if asked to be.
 
 ## Updates

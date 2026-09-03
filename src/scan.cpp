@@ -437,8 +437,10 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
 
 // ------------------------------------------------------------------ volumes
 
-// Defined with the cache code below; EnumerateVolumes needs it first.
+// Defined with the cache code below; EnumerateVolumes and the launch
+// sweep need them first.
 static bool VolumeIsHotplug(wchar_t letter);
+static void DeleteMatching(const std::wstring& dir, const wchar_t* pattern);
 
 std::vector<Volume> EnumerateVolumes() {
     std::vector<Volume> out;
@@ -465,6 +467,15 @@ std::vector<Volume> EnumerateVolumes() {
         v.remote = (type == DRIVE_REMOTE);
         v.path = rootPath;
         v.cacheable = v.fixed && !VolumeIsHotplug(rootPath[0]);
+
+        // A network letter is listed by its letter alone. Asking it for a
+        // label or free space is a connection to the server, and nothing
+        // reaches a server before the person has said yes to it.
+        if (v.remote) {
+            v.ready = true;
+            out.push_back(std::move(v));
+            continue;
+        }
 
         wchar_t label[MAX_PATH + 1] = {};
         wchar_t fsName[64] = {};
@@ -600,9 +611,10 @@ static bool VolumeIsHotplug(wchar_t letter) {
                         sizeof(buf), &got, nullptr) &&
         got >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
         const auto* d = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(buf);
+        // Not SD/MMC as a bus: eMMC system disks report it, and a card in
+        // a reader reports removable media or a USB bus instead.
         hot = d->RemovableMedia != 0 || d->BusType == BusTypeUsb ||
-              d->BusType == BusType1394 || d->BusType == BusTypeSd ||
-              d->BusType == BusTypeMmc;
+              d->BusType == BusType1394;
     }
     CloseHandle(h);
     return hot;
@@ -617,6 +629,15 @@ static int CacheVerdict(wchar_t letter) {
         return 0;
     }
     if (type != DRIVE_FIXED) return -1;
+    // A SUBST or other redirected letter is a doorway, not a volume: it
+    // may lead into a share or a link, so it is never cached or read
+    // unasked. A real volume's device name starts with \Device\.
+    const wchar_t dev[3] = {letter, L':', 0};
+    wchar_t target[1024] = {};
+    if (QueryDosDeviceW(dev, target, 1024) != 0 &&
+        _wcsnicmp(target, L"\\Device\\", 8) != 0) {
+        return 0;
+    }
     return VolumeIsHotplug(letter) ? 0 : 1;
 }
 
@@ -628,6 +649,8 @@ bool VolumeCacheable(const std::wstring& root) {
 size_t PruneStaleCaches() {
     const std::wstring dir = CacheDir();
     if (dir.empty()) return 0;
+    // A temporary left by a write that never finished is never valid.
+    DeleteMatching(dir, L"*.spincache.tmp");
 
     std::vector<wchar_t> cached;
     WIN32_FIND_DATAW fd{};
@@ -746,9 +769,12 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
     const std::wstring path = CachePathForVolume(volumePath);
     if (path.empty()) return false;
     // A listing of media that should never have been cached (written by
-    // an older build) is removed on first touch rather than served.
-    if (!VolumeCacheable(volumePath)) {
-        DeleteFileW(path.c_str());
+    // an older build) is removed on first touch rather than served. A
+    // volume that cannot be judged right now (locked, not ready) keeps
+    // its file, the same rule the launch sweep follows.
+    const int verdict = CacheVerdict(volumePath[0]);
+    if (verdict != 1) {
+        if (verdict == 0) DeleteFileW(path.c_str());
         return false;
     }
 
@@ -792,10 +818,13 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
         DeleteFileW(path.c_str());
         return false;
     }
-    bytes.swap(plain);
-    SecureZeroMemory(plain.data(), plain.size());
+    // The plaintext is wiped on every way out of this function.
+    struct Wipe {
+        std::vector<uint8_t>& v;
+        ~Wipe() { if (!v.empty()) SecureZeroMemory(v.data(), v.size()); }
+    } wipe{plain};
 
-    if (!DeserializeScan(bytes.data(), bytes.size(), out, meta, cancel)) {
+    if (!DeserializeScan(plain.data(), plain.size(), out, meta, cancel)) {
         // A cancelled load is not a bad file: leave the cache in place.
         if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
             return false;
@@ -844,10 +873,13 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
     std::vector<uint8_t> bytes;
     {
         std::vector<uint8_t> plain;
+        struct Wipe {
+            std::vector<uint8_t>& v;
+            ~Wipe() { if (!v.empty()) SecureZeroMemory(v.data(), v.size()); }
+        } wipe{plain};
         SerializeScan(res, meta, plain);
         if (plain.empty() || plain.size() > kMaxCacheBytes) return false;
         if (!SealCache(plain, bytes)) return false;
-        SecureZeroMemory(plain.data(), plain.size());
     }
     if (bytes.size() > kMaxCacheBytes) return false;
 
@@ -855,7 +887,9 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
     // old cache or none - never a torn file for the next launch to read.
     const std::wstring tmp = path + L".tmp";
     const HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                 CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL |
+                                     FILE_FLAG_OPEN_REPARSE_POINT,
                                  nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
 
@@ -914,11 +948,16 @@ static HANDLE OpenForRead(const std::wstring& full, OpenWhy& why) {
 
     // FILE_FLAG_OPEN_NO_RECALL: if a file became a cloud placeholder since
     // the scan, refuse it rather than silently costing a large download.
+    // FILE_FLAG_OPEN_REPARSE_POINT: a symbolic link opens as itself, so
+    // the check below sees the link and refuses it, rather than opening
+    // whatever it points at (which could be a file on a share).
     const HANDLE h = CreateFileW(
         extended.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING,
-        FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL, nullptr);
+        FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL |
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD err = GetLastError();
         why = (err == ERROR_CLOUD_FILE_ACCESS_DENIED || err == ERROR_NOT_READY)
@@ -2003,41 +2042,84 @@ ForceRemoveResult ForceRemove(const std::wstring& path,
 
 std::wstring CacheDirPath() { return CacheDir(); }
 
+NetPlace ClassifyPath(const std::wstring& path, bool resolve) {
+    NetPlace r;
+    std::wstring p = path;
+    if (p.size() >= 8 && _wcsnicmp(p.c_str(), L"\\\\?\\UNC\\", 8) == 0) {
+        p = L"\\\\" + p.substr(8);
+    }
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') {
+        r.network = true;
+        r.key     = ShareRootOf(p);   // empty for \\?\ and \\.\ spellings
+        return r;
+    }
+    if (p.size() < 2 || p[1] != L':') return r;
+
+    const wchar_t root3[4] = {p[0], L':', L'\\', 0};
+    if (GetDriveTypeW(root3) == DRIVE_REMOTE) {
+        r.network = true;
+        // The mapping's own name, from the local redirector table: no
+        // server is contacted to learn it. A mapping with no name has no
+        // identity, and is asked about every time.
+        const wchar_t local[3] = {p[0], L':', 0};
+        wchar_t remote[1024] = {};
+        DWORD len = 1024;
+        if (WNetGetConnectionW(local, remote, &len) == NO_ERROR &&
+            remote[0] != 0) {
+            r.key = ShareRootOf(remote);
+        }
+        return r;
+    }
+
+    // A local letter can still be a doorway into a share: a SUBST of a
+    // UNC path shows in the device table, without touching anything.
+    const wchar_t dev[3] = {p[0], L':', 0};
+    wchar_t target[1024] = {};
+    if (QueryDosDeviceW(dev, target, 1024) != 0) {
+        std::wstring t = target;
+        if (t.compare(0, 4, L"\\??\\") == 0) t = t.substr(4);
+        if (t.size() >= 4 && _wcsnicmp(t.c_str(), L"UNC\\", 4) == 0) {
+            r.network = true;
+            r.key     = ShareRootOf(L"\\\\" + t.substr(4));
+            return r;
+        }
+    }
+    if (!resolve) return r;
+
+    // A folder that is a symbolic link or junction into a share, or a
+    // SUBST of one: open it once, following links, and ask where the
+    // handle ended up. Local for a local folder; for a link into a share
+    // this single open is the least that can establish the fact.
+    const HANDLE h = CreateFileW(
+        p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return r;   // unopenable: the scan fails too
+    wchar_t fin[2048] = {};
+    const DWORD n = GetFinalPathNameByHandleW(
+        h, fin, 2047, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(h);
+    if (n == 0 || n >= 2047) return r;
+    std::wstring f = fin;
+    if (f.size() >= 8 && _wcsnicmp(f.c_str(), L"\\\\?\\UNC\\", 8) == 0) {
+        r.network = true;
+        r.key     = ShareRootOf(L"\\\\" + f.substr(8));
+        return r;
+    }
+    if (f.compare(0, 4, L"\\\\?\\") == 0) f = f.substr(4);
+    if (f.size() >= 2 && f[1] == L':' && towupper(f[0]) != towupper(p[0])) {
+        // Landed on another letter (a SUBST of a local folder, say): judge
+        // that letter, without following anything further.
+        return ClassifyPath(f.substr(0, 3), false);
+    }
+    return r;
+}
+
 bool RootIsNetwork(const std::wstring& root) {
-    if (root.size() >= 2 && root[0] == L'\\' && root[1] == L'\\') return true;
-    if (root.size() < 2 || root[1] != L':') return false;
-    const wchar_t r3[4] = {root[0], L':', L'\\', 0};
-    return GetDriveTypeW(r3) == DRIVE_REMOTE;
+    return ClassifyPath(root, true).network;
 }
 
 std::wstring ShareIdentityForRoot(const std::wstring& root) {
-    if (root.size() >= 2 && root[0] == L'\\' && root[1] == L'\\') {
-        return ShareRootOf(root);
-    }
-    if (root.size() < 2 || root[1] != L':') return {};
-
-    // A mapped letter knows the share it points at; remember that, not
-    // the letter, so Y: remapped to a different server asks again.
-    const wchar_t local[3] = {root[0], L':', 0};
-    wchar_t remote[1024] = {};
-    DWORD len = 1024;
-    if (WNetGetConnectionW(local, remote, &len) == NO_ERROR &&
-        remote[0] != 0) {
-        const std::wstring key = ShareRootOf(remote);
-        if (!key.empty()) return key;
-    }
-
-    // No name to go by: the letter and the volume's serial together.
-    const wchar_t r3[4] = {root[0], L':', L'\\', 0};
-    DWORD serial = 0;
-    if (!GetVolumeInformationW(r3, nullptr, 0, &serial, nullptr, nullptr,
-                               nullptr, 0)) {
-        return {};
-    }
-    wchar_t buf[24] = {};
-    swprintf(buf, 24, L"%c:#%08lx", static_cast<wchar_t>(towlower(root[0])),
-             static_cast<unsigned long>(serial));
-    return NormalizeShareKey(buf);
+    return ClassifyPath(root, true).key;
 }
 
 // ----------------------------------------------------- shell integration
@@ -2103,19 +2185,22 @@ bool ShellVerbRegistered() {
     return true;
 }
 
-void ClearScanCaches() {
-    const std::wstring dir = CacheDir();
-    if (dir.empty()) return;
-
+static void DeleteMatching(const std::wstring& dir, const wchar_t* pattern) {
     WIN32_FIND_DATAW fd{};
-    const std::wstring pattern = dir + L"\\*.spincache";
-    const HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    const HANDLE h = FindFirstFileW((dir + L"\\" + pattern).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
         DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
     } while (FindNextFileW(h, &fd));
     FindClose(h);
+}
+
+void ClearScanCaches() {
+    const std::wstring dir = CacheDir();
+    if (dir.empty()) return;
+    DeleteMatching(dir, L"*.spincache");
+    DeleteMatching(dir, L"*.spincache.tmp");   // a write that never finished
 }
 
 // ---------------------------------------------------------------- settings
@@ -2136,12 +2221,15 @@ Settings LoadSettings() {
                                  FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return s;
 
-    uint8_t buf[kMaxSettingsBytes];
+    // One byte past the limit: a larger file is refused whole, never
+    // parsed as a prefix that could end mid-line.
+    std::vector<uint8_t> buf(kMaxSettingsBytes + 1);
     DWORD got = 0;
-    const bool ok = ReadFile(h, buf, sizeof(buf), &got, nullptr) != 0;
+    const bool ok = ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()),
+                             &got, nullptr) != 0;
     CloseHandle(h);
-    if (!ok) return s;
-    return ParseSettings(buf, got);
+    if (!ok || got > kMaxSettingsBytes) return s;
+    return ParseSettings(buf.data(), got);
 }
 
 bool SaveSettings(const Settings& s) {
@@ -2151,10 +2239,14 @@ bool SaveSettings(const Settings& s) {
     std::vector<uint8_t> bytes;
     SerializeSettings(s, bytes);
 
-    // Same temp-and-swap as the caches: never a torn file.
+    // Same temp-and-swap as the caches: never a torn file. Never through
+    // a reparse point either: a link planted at the predictable name must
+    // not redirect the write, least of all when running elevated.
     const std::wstring tmp = path + L".tmp";
     const HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                 CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL |
+                                     FILE_FLAG_OPEN_REPARSE_POINT,
                                  nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
 

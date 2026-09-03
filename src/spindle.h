@@ -364,6 +364,10 @@ struct CommandLine {
     std::wstring verifyManifest;   // --verify-update-manifest inputs
     std::wstring verifySig;
     std::wstring verifyPub;
+    // --allow-network: headless mode may read a network location. Nothing
+    // can ask there, so without this only a share remembered in the window
+    // is read.
+    bool         allowNetwork = false;
     bool         valid = true;
     std::wstring error;
 };
@@ -512,16 +516,20 @@ struct Settings {
     uint64_t updateSerial = 0;
 };
 
-// Room for the trusted share list at its cap; the parser refuses anything
-// larger outright rather than reading a prefix.
-inline constexpr size_t kMaxSettingsBytes  = 16384;
+// Room for the trusted share list at its cap and a long remembered path;
+// the writer stays within this by construction and the reader refuses a
+// larger file outright rather than parsing a prefix of it.
+inline constexpr size_t kMaxSettingsBytes  = 65536;
 inline constexpr size_t kMaxTrustedShares  = 32;
 inline constexpr size_t kMaxShareKeyChars  = 260;
 
-// Portable share identity handling, host-tested. A key is either a UNC
-// path (\\server\share[\deeper]) or a lettered fallback (y:#serial).
-// NormalizeShareKey returns the canonical lowercase form, or empty when
-// the input is not a share identity at all.
+// Portable share identity handling, host-tested. A key is a UNC path,
+// \\server\share[\deeper], and nothing else: the long-path spelling folds
+// to it, every other \\?\ or \\.\ spelling is refused, as are dot
+// components, control characters and characters no server or share name
+// may contain. NormalizeShareKey returns the canonical lowercase form, or
+// empty when the input is not a share identity at all; a scan of a
+// location with no identity asks every time and is never remembered.
 // UTF-8 both ways, portable (wchar_t is 16-bit on Windows and 32-bit on
 // the host, so this works in code points and handles surrogate pairs).
 // Malformed input is replaced with U+FFFD rather than dropped or trusted.
@@ -587,9 +595,20 @@ struct Volume {
 
 std::vector<Volume> EnumerateVolumes();
 
-// Windows-only, scan.cpp. Whether a scan root is a network location, and
-// the identity to remember permission under (empty when unknowable).
-bool RootIsNetwork(const std::wstring& root);
+// Windows-only, scan.cpp. Where a path physically lives. A UNC path is a
+// network location by spelling; a lettered path is one when the letter is
+// a network drive, a SUBST of a UNC path, or (with `resolve`) a folder
+// that is a symbolic link or junction into a share, found by opening it
+// once and asking where the handle ended up. `resolve` is false at launch,
+// where nothing may be opened unasked, and true at the moment of a click.
+// `key` is the share identity to remember permission under, empty when
+// the location has no identity worth remembering.
+struct NetPlace {
+    bool         network = false;
+    std::wstring key;
+};
+NetPlace ClassifyPath(const std::wstring& path, bool resolve);
+bool RootIsNetwork(const std::wstring& root);              // ClassifyPath(root, true)
 std::wstring ShareIdentityForRoot(const std::wstring& root);
 
 // A cache file on disk is a small frame around a Windows data-protection

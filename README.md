@@ -66,9 +66,11 @@ cache rather than merely stopping new ones. The trade-off is that an
 external disk rescans each time it is opened.
 
 Each cache is sealed with Windows data protection (DPAPI) before it
-touches the disk. The key belongs to your Windows account on this
-machine, Windows manages it, and Spindle never stores one. A cache that
-is copied, backed up, imaged or read from another account is unreadable.
+touches the disk. The key belongs to your Windows account, Windows
+manages it, and Spindle never stores one. A cache that is copied, backed
+up, imaged or read from another account is unreadable; for a local
+account that holds on any other machine too, while a domain account's
+key follows the account.
 It is not a defence against the account itself or code running as it,
 which can read the drive anyway. Caches from earlier builds were plain;
 they are deleted rather than read, so each drive rescans once.
@@ -79,9 +81,15 @@ only after you click it and answer a question that names the share and
 says what a scan involves. Tick "remember" and that share never asks
 again; leave it unticked and the answer lasts for this run. The memory is
 the share itself, `\\server\share`, not the drive letter, so a letter
-mapped somewhere else later asks afresh. Nothing at launch reaches a
-share, and "Forget remembered network drives" in the `···` menu clears
-every saved answer. The cache
+mapped somewhere else later asks afresh, and a mapping with no name is
+asked every time and never remembered. A folder that is a symbolic link,
+junction or SUBST into a share counts as that share, wherever the path
+started. Nothing at launch reaches a share: a network letter is listed by
+its letter alone, without asking the server for a label or free space,
+until you allow it. "Forget remembered network drives" in the `···` menu
+clears every saved answer. The scan reads names and sizes; finding
+duplicates on a share reads file contents too, and the permission text
+says so. The cache
 is keyed to the volume serial and parsed with the same validation as
 everything else read from disk.
 
@@ -99,7 +107,8 @@ as an address bar: click the folder you are in, or press Ctrl+L, and type
 or paste a path; Enter goes there on any drive, and a path that names a
 file outlines that file's cell. A UNC path such as `\\server\share` works
 too, for a share that has no drive letter: it asks for permission the way
-a network drive does, then opens. Tab completes the path against the real
+a network drive does, then opens. Tab completion lists a folder to do its
+job, so on a share it works only once that share has been allowed. Tab completes the path against the real
 filesystem, folders first, so "E:\Stea" and Tab becomes "E:\SteamLibrary\"
 ready to keep going.
 
@@ -239,10 +248,12 @@ its root rather than as thousands of files inside it.
 
 ## Command line
 
-The command line lets Task Scheduler handle scheduling, and it is how a
-UNC path gets scanned unattended; the sidebar lists lettered volumes only,
-so a share without a letter is opened by pasting its path into the address
-bar or by giving it here.
+The command line lets Task Scheduler handle scheduling. Nothing can ask
+for permission there, so `--csv` refuses a network location, exit code 3,
+unless that share was remembered in the window or `--allow-network` is on
+the command line in as many words. The sidebar lists lettered volumes
+only, so a share without a letter is opened by pasting its path into the
+address bar or by giving it here.
 
 ```
 spindle.exe [path]                 open the window on a volume, folder or
@@ -528,6 +539,11 @@ Everything is verifiable from the source, which is included. Nothing is
 downloaded, and nothing is generated at build time except the icon.
 
 ## Known limits
+
+A DFS namespace is remembered as one share, its root, so allowing it
+allows every link beneath it. A user-mode filesystem that presents itself
+as a fixed disk (some cloud and archive mounts) is treated as one. A disk
+in a Thunderbolt enclosure may report as internal and be cached.
 
 Sizes are logical file length, so compressed and sparse files read larger
 than their footprint on disk. Hardlinked and cloud-only bytes are the two

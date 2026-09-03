@@ -1323,12 +1323,15 @@ const wchar_t* CommandLineHelp() {
         L"  path                  volume, folder or \\\\server\\share to open\n"
         L"  --csv <file>          scan, write CSV, exit (no window)\n"
         L"  --duplicates [bytes]  include duplicates, minimum size\n"
+        L"  --allow-network       let --csv read a network location\n"
         L"  --version             print the version and exit\n"
         L"  --help                this text\n"
         L"\n"
         L"With --csv nothing is shown and the exit code is 0 on success, 1\n"
         L"on failure, so Task Scheduler can run it on whatever schedule you\n"
-        L"like rather than Spindle keeping a service alive to do it.\n";
+        L"like rather than Spindle keeping a service alive to do it. Nothing\n"
+        L"can ask for permission there, so a network location exits with 3\n"
+        L"unless it was remembered in the window or --allow-network is given.\n";
 }
 
 CommandLine ParseCommandLine(const std::vector<std::wstring>& args) {
@@ -1388,6 +1391,10 @@ CommandLine ParseCommandLine(const std::vector<std::wstring>& args) {
                 }
                 cl.csvOut = args[++i];
                 cl.mode   = CommandLine::Mode::Export;
+                continue;
+            }
+            if (flag == L"allow-network") {
+                cl.allowNetwork = true;
                 continue;
             }
             if (flag == L"duplicates") {
@@ -1862,8 +1869,17 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 }
             } else if (key == "last_path") {
                 // Stored verbatim as UTF-8; the Windows layer converts it.
-                // A single value, so any '=' inside a path is kept.
-                s.lastPath = line.substr(eq + 1);
+                // A single value, so any '=' inside a path is kept. A
+                // control character means a damaged or forged line.
+                const std::string v = line.substr(eq + 1);
+                bool clean = true;
+                for (char ch : v) {
+                    if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) {
+                        clean = false;
+                        break;
+                    }
+                }
+                if (clean) s.lastPath = v;
             } else if (key == "trusted_share") {
                 // Repeated key, one share per line. Re-normalised on the
                 // way in, so a hand-edited or damaged line that is not a
@@ -1896,7 +1912,12 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
 
 void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
     out.clear();
-    const std::string text =
+    // Everything security-relevant first and the remembered path last, so
+    // nothing about a path could ever push the serial or the share list
+    // past the reader's limit. The path is only written while it is
+    // wanted, only when it is plain text a name could not have forged,
+    // and only up to a length that cannot approach the file limit.
+    std::string all =
         std::string("keep_caches=") + (s.keepCaches ? "1" : "0") +
         "\nresume_on_launch=" + (s.resumeOnLaunch ? "1" : "0") +
         "\nprefetch_all=" + (s.prefetchAll ? "1" : "0") +
@@ -1904,11 +1925,22 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
         "\nremember_view=" + (s.rememberView ? "1" : "0") +
         "\nlast_browse=" + (s.lastBrowse ? "1" : "0") +
         "\nlast_panel=" + std::to_string(s.lastPanel) +
-        "\nlast_path=" + s.lastPath +
         "\nupdate_serial=" + std::to_string(s.updateSerial) + "\n";
-    std::string all = text;
+    size_t shares = 0;
     for (const std::string& share : s.trustedShares) {
+        if (shares++ >= kMaxTrustedShares) break;
+        if (share.empty() || share.size() > kMaxShareKeyChars * 3) continue;
         all += "trusted_share=" + share + "\n";
+    }
+    if (s.rememberView && !s.lastPath.empty() && s.lastPath.size() <= 1000) {
+        bool clean = true;
+        for (char ch : s.lastPath) {
+            if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) {
+                clean = false;
+                break;
+            }
+        }
+        if (clean) all += "last_path=" + s.lastPath + "\n";
     }
     out.assign(all.begin(), all.end());
 }
@@ -2056,14 +2088,21 @@ std::wstring NormalizeShareKey(std::wstring s) {
     for (wchar_t& c : s) {
         if (c == L'/') c = L'\\';
     }
-    // Trim whitespace either end.
     size_t b = 0;
     while (b < s.size() && (s[b] == L' ' || s[b] == L'\t')) ++b;
     s.erase(0, b);
     while (!s.empty() && (s.back() == L' ' || s.back() == L'\t')) s.pop_back();
-    if (s.size() > kMaxShareKeyChars) return {};
 
-    // The long-path spelling of a UNC root folds to the plain one.
+    // A control character has no place in a name and would let a name
+    // write a line of its own into the settings file.
+    for (wchar_t c : s) {
+        if (c < 0x20 || c == 0x7F) return {};
+    }
+
+    // The long-path spelling of a UNC root folds to the plain one. Every
+    // other \\?\ or \\.\ spelling (\\?\GLOBALROOT\..., \\.\UNC\...,
+    // \\?\C:\...) is refused below by its "server" being ? or . - such a
+    // path may well reach a share, but it names no identity to remember.
     static const wchar_t kLong[] = L"\\\\?\\unc\\";
     if (s.size() >= 8) {
         bool match = true;
@@ -2075,42 +2114,39 @@ std::wstring NormalizeShareKey(std::wstring s) {
         }
         if (match) s = L"\\\\" + s.substr(8);
     }
-
+    if (s.size() > kMaxShareKeyChars) return {};
     for (wchar_t& c : s) c = static_cast<wchar_t>(towlower(c));
 
-    if (s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\') {
-        while (!s.empty() && s.back() == L'\\') s.pop_back();
-        // \\server\share at least: a bare server is not a share.
-        size_t comps = 0;
-        size_t pos   = 2;
-        while (pos < s.size()) {
-            const size_t sep = s.find(L'\\', pos);
-            const size_t end = (sep == std::wstring::npos) ? s.size() : sep;
-            if (end == pos) return {};   // empty component: malformed
-            ++comps;
-            pos = end + 1;
-        }
-        return comps >= 2 ? s : std::wstring();
-    }
+    if (!(s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\')) return {};
+    while (!s.empty() && s.back() == L'\\') s.pop_back();
 
-    // Lettered fallback: y:#hexserial.
-    if (s.size() >= 4 && s[0] >= L'a' && s[0] <= L'z' && s[1] == L':' &&
-        s[2] == L'#') {
-        for (size_t i = 3; i < s.size(); ++i) {
-            const wchar_t c = s[i];
-            const bool hex = (c >= L'0' && c <= L'9') ||
-                             (c >= L'a' && c <= L'f');
-            if (!hex) return {};
+    // \\server\share at least, every component a plausible name: not
+    // empty, not . or .., no trailing dot or space, none of the characters
+    // that no server or share name may contain.
+    size_t comps = 0;
+    size_t pos   = 2;
+    while (pos < s.size()) {
+        const size_t sep = s.find(L'\\', pos);
+        const size_t end = (sep == std::wstring::npos) ? s.size() : sep;
+        if (end == pos) return {};
+        const std::wstring comp = s.substr(pos, end - pos);
+        if (comp == L"." || comp == L"..") return {};
+        if (comp.back() == L'.' || comp.back() == L' ') return {};
+        for (wchar_t c : comp) {
+            if (c == L':' || c == L'*' || c == L'?' || c == L'"' ||
+                c == L'<' || c == L'>' || c == L'|') {
+                return {};
+            }
         }
-        return s;
+        ++comps;
+        pos = end + 1;
     }
-    return {};
+    return comps >= 2 ? s : std::wstring();
 }
 
 std::wstring ShareRootOf(const std::wstring& key) {
     const std::wstring k = NormalizeShareKey(key);
     if (k.empty()) return {};
-    if (!(k.size() >= 2 && k[0] == L'\\' && k[1] == L'\\')) return k;
     // Keep \\server\share: the third separator, if any, ends it.
     const size_t s1 = k.find(L'\\', 2);
     if (s1 == std::wstring::npos) return {};

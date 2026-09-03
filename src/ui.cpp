@@ -180,7 +180,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.8";
+constexpr const wchar_t* kAppVersion = L"2.5.9";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -1247,6 +1247,16 @@ static bool YieldScanToHunt() {
 // Walk the next queued drive, if nothing that wants the disk is running.
 // Called wherever the disk goes quiet: a scan or hunt finishing, a prefetch
 // completing, launch.
+// Whether a location may be read right now without asking: not a network
+// location at all, or a share that is remembered or was agreed to this
+// run. Anything without an identity is never allowed silently.
+static bool ShareAllowed(const NetPlace& np) {
+    if (!np.network) return true;
+    if (np.key.empty()) return false;
+    return ShareTrusted(g_app.settings, np.key) ||
+           g_app.sessionShares.count(np.key) != 0;
+}
+
 static void StartPrefetchNext() {
     if (g_app.prefetchWorker || g_app.prefetchQueue.empty()) return;
     if (g_app.scanning || g_app.dupeRunning || g_app.bulkRunning ||
@@ -1255,8 +1265,18 @@ static void StartPrefetchNext() {
     }
     if (!g_app.settings.keepCaches || !g_app.settings.prefetchAll) return;
 
-    const std::wstring root = g_app.prefetchQueue.front();
-    g_app.prefetchQueue.erase(g_app.prefetchQueue.begin());
+    // A queued root is re-checked at the moment it would be read: consent
+    // that existed when it was queued may have been forgotten since.
+    std::wstring root;
+    while (!g_app.prefetchQueue.empty()) {
+        std::wstring next = g_app.prefetchQueue.front();
+        g_app.prefetchQueue.erase(g_app.prefetchQueue.begin());
+        if (ShareAllowed(ClassifyPath(next, false))) {
+            root = std::move(next);
+            break;
+        }
+    }
+    if (root.empty()) return;
 
     g_app.prefetchProgress.files.store(0);
     g_app.prefetchProgress.dirs.store(0);
@@ -1323,22 +1343,19 @@ static void QueueLaunchPrefetch(const std::wstring& excludeRoot) {
 // mapped elsewhere later asks afresh. Nothing at launch ever reaches here
 // for a share: resume and prefetch skip them before asking.
 static bool ConfirmNetworkScan(const std::wstring& root) {
-    if (!RootIsNetwork(root)) return true;
-    const std::wstring key = ShareIdentityForRoot(root);
-    if (!key.empty()) {
-        if (ShareTrusted(g_app.settings, key)) return true;
-        if (g_app.sessionShares.count(key) != 0) return true;
-    }
+    const NetPlace np = ClassifyPath(root, true);
+    if (ShareAllowed(np)) return true;
+    const std::wstring& key = np.key;
 
     std::wstring content = SanitizeForDisplay(root);
     if (content.size() == 3 && content[1] == L':') content.resize(2);
-    content += L" is a network drive";
-    if (!key.empty() && key.size() > 2 && key[0] == L'\\' && key[1] == L'\\') {
-        content += L" (" + SanitizeForDisplay(key) + L")";
-    }
+    content += L" is a network location";
+    if (!key.empty()) content += L" (" + SanitizeForDisplay(key) + L")";
     content += L".\n\nSpindle will read every folder and file name on it, "
                L"which can take a while and puts load on the server. "
-               L"Nothing on the drive is changed.";
+               L"Finding duplicates there reads file contents as well. "
+               L"Nothing changes unless you recycle, remove or rename "
+               L"something yourself.";
 
     TASKDIALOGCONFIG cfg{};
     cfg.cbSize     = sizeof(cfg);
@@ -1485,11 +1502,13 @@ unsigned __stdcall AllDrivesThread(void* param) {
                 if (req->progress->cancel.load(std::memory_order_relaxed)) {
                     return 0;
                 }
-                // Only a fixed local drive is walked unprompted; a removable
-                // or network volume with no cache is skipped, not read.
+                // A fixed drive is walked; removable media is left alone.
+                // A share reaches this thread only after StartAllDrives
+                // found it allowed, so it is walked too.
                 wchar_t root3[4] = {path.empty() ? L'C' : path[0], L':',
                                     L'\\', 0};
-                if (GetDriveTypeW(root3) != DRIVE_FIXED) continue;
+                const UINT type = GetDriveTypeW(root3);
+                if (type != DRIVE_FIXED && type != DRIVE_REMOTE) continue;
                 one = Scan(path, 0, req->progress);
                 if (req->progress->cancel.load(std::memory_order_relaxed)) {
                     return 0;
@@ -1558,13 +1577,7 @@ static void StartAllDrives() {
     // otherwise it is left out entirely, cache included, so the master
     // view never reaches a server nobody asked about.
     for (const auto& v : g_app.volumes) {
-        if (v.remote) {
-            const std::wstring key = ShareIdentityForRoot(v.path);
-            const bool allowed =
-                !key.empty() && (ShareTrusted(g_app.settings, key) ||
-                                 g_app.sessionShares.count(key) != 0);
-            if (!allowed) continue;
-        }
+        if (v.remote && !ShareAllowed(ClassifyPath(v.path, false))) continue;
         req->volumePaths.push_back(v.path);
     }
 
@@ -1736,7 +1749,9 @@ static void DrawDriveCard(const Volume& v, const Rect& r, bool active,
         }
     }
 
-    const std::wstring freeText = FormatSize(v.free) + L" free";
+    const std::wstring freeText =
+        (v.remote && v.capacity == 0) ? std::wstring(L"read on request")
+                                      : FormatSize(v.free) + L" free";
     DrawText(freeText, g_app.fmtSmall.get(),
              Rect{r.x + pad, r.y + 44.0f, r.w - pad * 2.0f,
                   layout::kLineSmall},
@@ -2263,6 +2278,13 @@ static void EndRename(bool commit) {
     AppendComponent(oldFull, oldName);
     std::wstring newFull = parent;
     AppendComponent(newFull, newName);
+    if (IsProtectedSystemPath(oldFull)) {
+        MessageBoxW(g_app.hwnd,
+                    L"Spindle will not rename that: it is part of Windows, "
+                    L"or somewhere it cannot vouch for.",
+                    L"Spindle", MB_OK | MB_ICONWARNING);
+        return;
+    }
     if (!MoveFileW(oldFull.c_str(), newFull.c_str())) {
         MessageBoxW(g_app.hwnd,
                     L"Could not rename it. A file with that name may "
@@ -3724,6 +3746,10 @@ static void EndAddressEdit(bool commit) {
 static bool CompleteAddressPath(std::wstring text, std::wstring& out) {
     const PathPrefix pfx = SplitPathForCompletion(text);
     if (!pfx.ok) return false;
+    // Listing a folder to complete a name is a read like any other: a
+    // share that has not been agreed to is not listed, one name at a time
+    // or otherwise.
+    if (!ShareAllowed(ClassifyPath(pfx.dir, true))) return false;
 
     // One directory listing, bounded, matching "partial*". The pure choice
     // of what to complete to lives in ApplyPathCompletion, host-tested.
@@ -4055,13 +4081,24 @@ static void ShowAppMenu(POINT screenPt) {
         case 13:
             g_app.settings.rememberView = !g_app.settings.rememberView;
             // Capture now, so turning it on then closing hard still lands
-            // somewhere sensible next launch.
-            if (g_app.settings.rememberView) RememberCurrentView();
+            // somewhere sensible next launch; off means nothing kept.
+            if (g_app.settings.rememberView) {
+                RememberCurrentView();
+            } else {
+                g_app.settings.lastPath.clear();
+            }
             SaveSettings(g_app.settings);
             break;
         case 14:
             g_app.settings.trustedShares.clear();
             g_app.sessionShares.clear();
+            g_app.prefetchQueue.erase(
+                std::remove_if(g_app.prefetchQueue.begin(),
+                               g_app.prefetchQueue.end(),
+                               [](const std::wstring& r) {
+                                   return ClassifyPath(r, false).network;
+                               }),
+                g_app.prefetchQueue.end());
             SaveSettings(g_app.settings);
             break;
         case 9:
@@ -5258,7 +5295,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // A remembered place on a share is not reopened at
                     // launch: that would read the server before any click.
                     if (idx >= 0 &&
-                        g_app.volumes[static_cast<size_t>(idx)].remote) {
+                        !g_app.volumes[static_cast<size_t>(idx)].cacheable) {
                         idx = -1;
                     }
                     if (idx >= 0) {
@@ -6298,7 +6335,8 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     MessageBoxW(nullptr,
                 L"Spindle hit a fault and has to close.\n\n"
                 L"A report was written to spindle-crash.txt next to the "
-                L"executable. Nothing on disk was changed.",
+                L"executable. It holds fault addresses only, no file names "
+                L"or paths. Nothing else on disk was changed.",
                 L"Spindle", MB_OK | MB_ICONERROR);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -6336,6 +6374,21 @@ static void ConsoleLine(const std::wstring& text) {
 // Scheduler can act on - which is what makes an external scheduler a
 // complete answer rather than an excuse.
 static int RunHeadlessExport(const CommandLine& cl) {
+    // Nothing can ask here. A network location is read only when the
+    // window already remembers that share, or the command line says so
+    // in as many words; a location with no identity needs the flag.
+    const NetPlace np = ClassifyPath(cl.path, true);
+    if (np.network && !cl.allowNetwork) {
+        const Settings s = LoadSettings();
+        if (np.key.empty() || !ShareTrusted(s, np.key)) {
+            ConsoleLine(L"spindle: " + cl.path +
+                        L" is a network location and nothing can ask "
+                        L"permission here. Open it once in the window and "
+                        L"tick remember, or pass --allow-network.");
+            return 3;
+        }
+    }
+
     SYSTEM_INFO si{};
     GetNativeSystemInfo(&si);
 
