@@ -528,6 +528,10 @@ inline constexpr size_t kMaxShareKeyChars  = 260;
 std::string  WideToUtf8(const std::wstring& w);
 std::wstring Utf8ToWide(const std::string& u);
 std::wstring NormalizeShareKey(std::wstring s);
+// The share a normalised key belongs to: \\server\share\deep\er folds to
+// \\server\share, since permission is granted per share, not per folder.
+// A lettered fallback key is returned as it is; anything else, empty.
+std::wstring ShareRootOf(const std::wstring& key);
 bool ShareTrusted(const Settings& s, const std::wstring& key);
 // Adds a normalised key; false when invalid or the list is at its cap.
 bool TrustShare(Settings& s, const std::wstring& key);

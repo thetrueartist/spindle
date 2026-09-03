@@ -2012,7 +2012,7 @@ bool RootIsNetwork(const std::wstring& root) {
 
 std::wstring ShareIdentityForRoot(const std::wstring& root) {
     if (root.size() >= 2 && root[0] == L'\\' && root[1] == L'\\') {
-        return NormalizeShareKey(root);
+        return ShareRootOf(root);
     }
     if (root.size() < 2 || root[1] != L':') return {};
 
@@ -2023,7 +2023,7 @@ std::wstring ShareIdentityForRoot(const std::wstring& root) {
     DWORD len = 1024;
     if (WNetGetConnectionW(local, remote, &len) == NO_ERROR &&
         remote[0] != 0) {
-        const std::wstring key = NormalizeShareKey(remote);
+        const std::wstring key = ShareRootOf(remote);
         if (!key.empty()) return key;
     }
 

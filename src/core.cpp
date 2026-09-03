@@ -2107,6 +2107,17 @@ std::wstring NormalizeShareKey(std::wstring s) {
     return {};
 }
 
+std::wstring ShareRootOf(const std::wstring& key) {
+    const std::wstring k = NormalizeShareKey(key);
+    if (k.empty()) return {};
+    if (!(k.size() >= 2 && k[0] == L'\\' && k[1] == L'\\')) return k;
+    // Keep \\server\share: the third separator, if any, ends it.
+    const size_t s1 = k.find(L'\\', 2);
+    if (s1 == std::wstring::npos) return {};
+    const size_t s2 = k.find(L'\\', s1 + 1);
+    return (s2 == std::wstring::npos) ? k : k.substr(0, s2);
+}
+
 bool ShareTrusted(const Settings& s, const std::wstring& key) {
     const std::wstring norm = NormalizeShareKey(key);
     if (norm.empty()) return false;

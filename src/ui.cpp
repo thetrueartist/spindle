@@ -180,7 +180,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.7";
+constexpr const wchar_t* kAppVersion = L"2.5.8";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -3632,8 +3632,26 @@ static void GoToTypedPath(std::wstring text) {
         text.pop_back();
     }
     for (wchar_t& c : text) if (c == L'/') c = L'\\';
+
+    // A UNC path, the way a share is browsed when it has no letter. It
+    // goes through the same door as a network drive: the permission
+    // question, then the scan, cached never. A bare server is refused;
+    // a share or a folder within one is opened as the command line would.
+    if (text.size() >= 8 && _wcsnicmp(text.c_str(), L"\\\\?\\UNC\\", 8) == 0) {
+        text = L"\\\\" + text.substr(8);
+    }
+    if (text.size() >= 2 && text[0] == L'\\' && text[1] == L'\\') {
+        if (ShareRootOf(text).empty()) {
+            MessageBeep(MB_OK);   // \\server alone names nothing to read
+            return;
+        }
+        while (text.size() > 2 && text.back() == L'\\') text.pop_back();
+        StartScanPath(text, -1, true);
+        return;
+    }
+
     if (text.size() < 2 || text[1] != L':' || !iswalpha(text[0])) {
-        MessageBeep(MB_OK);   // not a lettered path; UNC scans come from the command line
+        MessageBeep(MB_OK);   // neither lettered nor UNC
         return;
     }
     if (text.size() == 2 || text[2] != L'\\') text.insert(2, 1, L'\\');

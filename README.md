@@ -97,7 +97,9 @@ sums what is selected, and a right-click on the selection copies every
 path or recycles the lot behind one confirmation. The breadcrumb doubles
 as an address bar: click the folder you are in, or press Ctrl+L, and type
 or paste a path; Enter goes there on any drive, and a path that names a
-file outlines that file's cell. Tab completes the path against the real
+file outlines that file's cell. A UNC path such as `\\server\share` works
+too, for a share that has no drive letter: it asks for permission the way
+a network drive does, then opens. Tab completes the path against the real
 filesystem, folders first, so "E:\Stea" and Tab becomes "E:\SteamLibrary\"
 ready to keep going.
 
@@ -237,8 +239,10 @@ its root rather than as thousands of files inside it.
 
 ## Command line
 
-The command line lets Task Scheduler handle scheduling, and it is also how
-a UNC path gets scanned, since the window only lists lettered volumes.
+The command line lets Task Scheduler handle scheduling, and it is how a
+UNC path gets scanned unattended; the sidebar lists lettered volumes only,
+so a share without a letter is opened by pasting its path into the address
+bar or by giving it here.
 
 ```
 spindle.exe [path]                 open the window on a volume, folder or

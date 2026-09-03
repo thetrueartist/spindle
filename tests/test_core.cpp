@@ -2230,6 +2230,15 @@ static void TestShareKeys() {
     CHECK(NormalizeShareKey(std::wstring(kMaxShareKeyChars + 1, L'a')).empty(),
           "over-long input rejected");
 
+    CHECK(ShareRootOf(L"\\\\Server\\Share\\deep\\er") == L"\\\\server\\share",
+          "a folder within a share belongs to the share");
+    CHECK(ShareRootOf(L"\\\\server\\share") == L"\\\\server\\share",
+          "a share root is its own root");
+    CHECK(ShareRootOf(L"\\\\server").empty(), "a bare server has no share");
+    CHECK(ShareRootOf(L"Y:#1a2b3c4d") == L"y:#1a2b3c4d",
+          "the lettered fallback passes through");
+    CHECK(ShareRootOf(L"C:\\Users").empty(), "a local path is not a share");
+
     Settings s;
     CHECK(!ShareTrusted(s, L"\\\\a\\b"), "nothing trusted by default");
     CHECK(!TrustShare(s, L"junk"), "junk cannot be trusted");
