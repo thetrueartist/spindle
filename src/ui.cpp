@@ -181,7 +181,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.11";
+constexpr const wchar_t* kAppVersion = L"2.5.12";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -320,6 +320,7 @@ struct App {
     };
     bool         pendingStartSet = false;
     PendingStart pendingStart;
+    std::wstring scanRoot;   // what the foreground worker is reading
     size_t                crumbFirst = 0;   // trail index of crumbHits[0]
 
     // Side panel. Every comparable tool carries these two views next to the
@@ -904,6 +905,10 @@ unsigned __stdcall ScanThread(void* param) {
 struct DupRequest {
     std::vector<DupFile> candidates;
     std::wstring         rootPath;
+    // For the pooled hunt: drives whose cached trees the worker loads and
+    // gathers candidates from, off the interface thread. The drive on
+    // screen contributes its candidates directly, gathered before start.
+    std::vector<std::wstring> cacheVolumes;
     HWND                 hwnd = nullptr;
     uint64_t             gen  = 0;
     uint64_t             lastNote = 0;   // throttle for the reading-now notes
@@ -1024,6 +1029,41 @@ static void JoinBulkWorker() {
     CloseHandle(g_app.bulkWorker);
     g_app.bulkWorker = nullptr;
     g_app.bulkRunning = false;
+}
+
+static void CancelPrefetch(bool requeue);
+
+// Recycling copies always happens on the bulk worker, whether one copy or
+// every extra: each is verified byte for byte against its kept copy
+// immediately before it goes, and the window stays live throughout.
+static bool StartBulkRecycle(
+    std::vector<std::vector<std::pair<std::wstring, uint64_t>>> groups) {
+    if (g_app.bulkRunning || g_app.dupeRunning) return false;
+    CancelPrefetch(true);
+    auto req = std::make_unique<BulkRequest>();
+    req->hwnd   = g_app.hwnd;
+    req->gen    = g_app.dupeGen.fetch_add(1) + 1;
+    req->groups = std::move(groups);
+
+    g_app.dupeCurrentFile.clear();
+    g_app.dupeProgress.files.store(0);
+    g_app.dupeProgress.bytes.store(0);
+    g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
+
+    const uintptr_t h =
+        _beginthreadex(nullptr, 0, BulkThread, req.get(), 0, nullptr);
+    if (h == 0) {
+        MessageBoxW(g_app.hwnd, L"Could not start: the system refused "
+                                L"a new thread.",
+                    L"Spindle", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    static_cast<void>(req.release());  // NOLINT
+    g_app.bulkWorker  = reinterpret_cast<HANDLE>(h);
+    g_app.bulkRunning = true;
+    SetTimer(g_app.hwnd, kTimerId, kFrameMs, nullptr);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    return true;
 }
 
 // ---- recycling, off the interface thread ---------------------------------
@@ -1182,6 +1222,38 @@ unsigned __stdcall UpdateCheckThread(void* param) {
 unsigned __stdcall DupeThread(void* param) {
     std::unique_ptr<DupRequest> req(static_cast<DupRequest*>(param));
     try {
+        // The pooled hunt gathers the other drives' candidates here, from
+        // their caches: unsealing and parsing a large cache takes real
+        // time, and the window must not stand still for it.
+        for (const std::wstring& vol : req->cacheVolumes) {
+            if (g_app.dupeProgress.cancel.load(std::memory_order_relaxed)) {
+                break;
+            }
+            {
+                auto copy = std::make_unique<std::wstring>(
+                    vol.substr(0, 2) + L" (cache)");
+                if (PostMessageW(req->hwnd, WM_DUPE_FILE,
+                                 static_cast<WPARAM>(req->gen),
+                                 reinterpret_cast<LPARAM>(copy.get()))) {
+                    static_cast<void>(copy.release());  // NOLINT
+                }
+            }
+            ScanResult cached;
+            CacheMeta  meta;
+            if (!LoadScanCache(vol, cached, meta, &g_app.dupeProgress.cancel)) {
+                continue;
+            }
+            std::vector<DupFile> part =
+                CollectDupFiles(cached.root, vol, kDefaultDupMinSize);
+            for (DupFile& f : part) {
+                f.node = nullptr;   // `cached` is gone once this loop moves on
+                req->candidates.push_back(std::move(f));
+            }
+        }
+        if (!req->cacheVolumes.empty()) {
+            req->candidates = FilterBySharedSize(std::move(req->candidates));
+            for (DupFile& f : req->candidates) f.node = nullptr;
+        }
         // An empty root marks the pooled hunt: files carry their own
         // volumes, so the reads fan out one worker per drive.
         auto rep = std::make_unique<DupReport>(
@@ -1434,6 +1506,15 @@ static bool DeferUntilWorkerStops(App::PendingStart start) {
     if (!g_app.worker) return false;
     g_app.progress.cancel.store(true, std::memory_order_relaxed);
     g_app.scanGen.fetch_add(1);   // whatever it reports is stale now
+    // The interrupted drive is not forgotten: if it is an internal disk
+    // and not the one being asked for, it goes to the head of the
+    // background queue so its map is ready by the time it is wanted.
+    if (!g_app.scanRoot.empty() && g_app.scanRoot != start.root &&
+        VolumeCacheable(g_app.scanRoot) &&
+        std::find(g_app.prefetchQueue.begin(), g_app.prefetchQueue.end(),
+                  g_app.scanRoot) == g_app.prefetchQueue.end()) {
+        g_app.prefetchQueue.insert(g_app.prefetchQueue.begin(), g_app.scanRoot);
+    }
     g_app.pendingStart    = std::move(start);
     g_app.pendingStartSet = true;
     g_app.scanNote        = L"Stopping the current scan";
@@ -1453,6 +1534,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
         if (DeferUntilWorkerStops(std::move(p))) return;
     }
     g_app.scanNote.clear();
+    g_app.scanRoot = root;
     // A running duplicate hunt deliberately survives this: it holds owned
     // paths only, every row it produces carries its own volume, and the
     // panel can show its progress and its results from any drive. Killing
@@ -1625,6 +1707,7 @@ static void StartAllDrives() {
         if (DeferUntilWorkerStops(std::move(p))) return;
     }
     g_app.scanNote.clear();
+    g_app.scanRoot.clear();
     CancelPrefetch(false);
     g_app.prefetchQueue.clear();
     g_app.pendingReveal.clear();
@@ -1901,7 +1984,13 @@ static void DrawSidebar(const Rect& area) {
         y += layout::kDriveCardH + 8.0f;
     }
 
-    if (g_app.cells.empty() && g_app.fileList.empty()) { return; }
+    // The panel stays while there is anything to show in it. A duplicate
+    // report outlives the tree it came from: a rescan after a recycle, or
+    // the master view gathering its drives, must not blank it.
+    if (g_app.cells.empty() && g_app.fileList.empty() && !g_app.dupesRun &&
+        !g_app.dupeRunning && !g_app.bulkRunning) {
+        return;
+    }
 
     if (g_app.panelDirty) RefreshPanel();
 
@@ -2080,10 +2169,13 @@ static void DrawSidebar(const Rect& area) {
             y += 28.0f;
         }
 
-        std::wstring head = FormatSize(g_app.dupes.totalWasted) +
-                            L" recoverable in " +
-                            FormatCount(g_app.dupes.groups.size()) +
-                            L" sets";
+        // "0 B recoverable in 0 sets" is a true sentence that reads like
+        // a broken one; say the plain thing when nothing was found.
+        std::wstring head =
+            g_app.dupes.groups.empty()
+                ? std::wstring(L"No duplicates found here")
+                : FormatSize(g_app.dupes.totalWasted) + L" recoverable in " +
+                      FormatCount(g_app.dupes.groups.size()) + L" sets";
         // A stopped hunt has seen only part of the tree, and presenting a
         // partial answer as a complete one is the kind of quiet lie this
         // program tries not to tell.
@@ -3762,7 +3854,8 @@ static void GoToTypedPath(std::wstring text) {
     }
     if (text.size() >= 2 && text[0] == L'\\' && text[1] == L'\\') {
         if (ShareRootOf(text).empty()) {
-            MessageBeep(MB_OK);   // \\server alone names nothing to read
+            ShowStatusNote(L"A share is \\server\\share; a server alone "
+                           L"names nothing to read", 5000);
             return;
         }
         while (text.size() > 2 && text.back() == L'\\') text.pop_back();
@@ -3771,7 +3864,8 @@ static void GoToTypedPath(std::wstring text) {
     }
 
     if (text.size() < 2 || text[1] != L':' || !iswalpha(text[0])) {
-        MessageBeep(MB_OK);   // neither lettered nor UNC
+        ShowStatusNote(L"A path starts with a drive letter, like D:\\, or "
+                       L"with \\\\server\\share", 5000);
         return;
     }
     if (text.size() == 2 || text[2] != L'\\') text.insert(2, 1, L'\\');
@@ -3788,7 +3882,8 @@ static void GoToTypedPath(std::wstring text) {
         }
     }
     if (vi < 0) {
-        MessageBeep(MB_OK);   // no such drive here
+        ShowStatusNote(L"There is no " + text.substr(0, 2) +
+                           L" drive on this computer", 5000);
         return;
     }
 
@@ -4489,9 +4584,11 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
     // Scoped, not held: the confirmations below pump, and a report
     // arriving mid-dialog reallocates this vector. Re-found afterwards.
     std::wstring twin;
+    uint64_t     size = 0;
     {
         const DupGroup& g =
             g_app.dupes.groups[static_cast<size_t>(ref.first)];
+        size = g.size;
         for (size_t j = 0; j < g.files.size(); ++j) {
             const std::wstring cand = g.files[j].Full();
             if (cand != path) { twin = cand; break; }
@@ -4505,22 +4602,7 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
         return;
     }
 
-    // Prove it byte for byte before anything is touched. This reads both
-    // files in full; for a very large pair it blocks briefly, with the wait
-    // cursor to say so.
-    g_app.dupeProgress.cancel.store(false, std::memory_order_relaxed);
-    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    const bool identical =
-        VerifyFilesIdentical(path, twin, &g_app.dupeProgress);
-    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-    if (!identical) {
-        MessageBoxW(g_app.hwnd,
-                    L"Could not confirm an identical copy still exists - the "
-                    L"file may have changed since the search - so nothing "
-                    L"was deleted.",
-                    L"Spindle", MB_OK | MB_ICONWARNING);
-        return;
-    }
+    if (g_app.bulkRunning) return;
 
     const std::wstring prompt =
         (ClassifyPath(path, false).network
@@ -4528,51 +4610,21 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
                             L"drive has no Recycle Bin.\n\n")
              : std::wstring(L"Recycle this copy?\n\n")) +
         SanitizeForDisplay(path) +
-        L"\n\nA verified identical copy remains:\n" +
-        SanitizeForDisplay(twin);
+        L"\n\nIt is first verified byte for byte against the copy that "
+        L"stays:\n" + SanitizeForDisplay(twin) +
+        L"\n\nIf they no longer match, nothing is deleted.";
     if (MessageBoxW(g_app.hwnd, prompt.c_str(), L"Spindle",
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
 
-    if (!RecycleToBin(path)) {
-        MessageBoxW(g_app.hwnd,
-                    L"Could not move that file to the Recycle Bin.",
-                    L"Spindle", MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    // Drop the recycled file from the report so the panel reflects it. The
-    // group is located again rather than remembered: every dialog above
-    // pumped messages, and a hunt finishing in one of them replaces the
-    // whole report. An index from before means nothing now, so match on
-    // the path, which is what was actually deleted.
-    for (size_t gi = 0; gi < g_app.dupes.groups.size(); ++gi) {
-        DupGroup& grp = g_app.dupes.groups[gi];
-        bool hit = false;
-        for (size_t j = 0; j < grp.files.size(); ++j) {
-            if (grp.files[j].Full() == path) {
-                grp.files.erase(grp.files.begin() + static_cast<long>(j));
-                hit = true;
-                break;
-            }
-        }
-        if (!hit) continue;
-        if (grp.files.size() >= 2) {
-            grp.wasted = SatMul(grp.size, grp.files.size() - 1);
-        } else {
-            g_app.dupes.groups.erase(g_app.dupes.groups.begin() +
-                                     static_cast<long>(gi));
-        }
-        break;
-    }
-    RebuildDupePathSet();
-    MarkDupeCells();
-    g_app.dupes.totalWasted = 0;
-    for (const DupGroup& grp : g_app.dupes.groups) {
-        g_app.dupes.totalWasted += grp.wasted;
-    }
-    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    // The verification reads both files in full; for a large pair that is
+    // seconds. It runs on the bulk worker, the same path every other
+    // recycle of a duplicate takes, and the report is updated when it
+    // reports back, so the window never stands still for it.
+    std::vector<std::vector<std::pair<std::wstring, uint64_t>>> groups;
+    groups.push_back({{twin, size}, {path, size}});
+    StartBulkRecycle(std::move(groups));
 }
 
 // Right-click on a sidebar row: Kinds rows offer their search in a new
@@ -4980,29 +5032,30 @@ static void OnLeftClick(int x, int y) {
         size_t drives = 0;
         try {
             for (const Volume& v : g_app.volumes) {
-                ScanResult cached;
-                CacheMeta meta;
-                const Node* tree = nullptr;
                 // The drive on screen is already in memory and fresher than
-                // anything on disk; the rest come from their caches.
+                // anything on disk: its candidates are gathered here. Every
+                // other drive with a cache is left to the worker, which
+                // loads and gathers off this thread.
                 if (g_app.result && g_app.selected >= 0 &&
                     g_app.selected < static_cast<int>(g_app.volumes.size()) &&
                     g_app.volumes[static_cast<size_t>(g_app.selected)].path ==
                         v.path) {
-                    tree = &g_app.result->root;
-                } else if (LoadScanCache(v.path, cached, meta)) {
-                    tree = &cached.root;
+                    ++drives;
+                    std::vector<DupFile> part = CollectDupFiles(
+                        g_app.result->root, v.path, kDefaultDupMinSize);
+                    for (DupFile& f : part) {
+                        f.node = nullptr;
+                        req->candidates.push_back(std::move(f));
+                    }
+                    continue;
                 }
-                if (!tree) continue;
-                ++drives;
-                // Collected, not filtered: the shared-size filter runs
-                // once over the pool below, because a file whose only twin
-                // is on another drive has a unique size on its own.
-                std::vector<DupFile> part =
-                    CollectDupFiles(*tree, v.path, kDefaultDupMinSize);
-                for (DupFile& f : part) {
-                    f.node = nullptr;   // `cached` dies at the end of this turn
-                    req->candidates.push_back(std::move(f));
+                const std::wstring cp = CachePathForVolume(v.path);
+                if (cp.empty()) continue;
+                WIN32_FILE_ATTRIBUTE_DATA fad{};
+                if (GetFileAttributesExW(cp.c_str(), GetFileExInfoStandard,
+                                         &fad)) {
+                    ++drives;
+                    req->cacheVolumes.push_back(v.path);
                 }
             }
         } catch (...) {
@@ -5019,8 +5072,10 @@ static void OnLeftClick(int x, int y) {
                         L"Spindle", MB_OK | MB_ICONINFORMATION);
             return;
         }
-        req->candidates = FilterBySharedSize(std::move(req->candidates));
-        for (DupFile& f : req->candidates) f.node = nullptr;
+        if (req->cacheVolumes.empty()) {
+            req->candidates = FilterBySharedSize(std::move(req->candidates));
+            for (DupFile& f : req->candidates) f.node = nullptr;
+        }
         req->rootPath = std::wstring();   // each file carries its own volume
         req->hwnd     = g_app.hwnd;
         req->gen      = g_app.dupeGen.fetch_add(1) + 1;
