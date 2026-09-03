@@ -23,7 +23,7 @@
 #include <process.h>
 #include <shlobj.h>    // SHGetFolderPathW, for the cache directory
 #include <shellapi.h> // SHFileOperationW, for the Recycle Bin
-#include <aclapi.h>    // SetNamedSecurityInfoW, for taking ownership
+#include <aclapi.h>    // SetSecurityInfo on a handle, for taking ownership
 #include <sddl.h>
 #include <restartmanager.h>   // RmStartSession: who has this file open
 
@@ -330,6 +330,8 @@ void SortTree(Node& root) {
 
 }  // namespace
 
+static bool IsVolumeRootPath(const std::wstring& p);
+
 ScanResult Scan(const std::wstring& root, unsigned threads,
                 Progress* progress) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -353,7 +355,9 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
     // of that is missing it returns false having done nothing, and the
     // directory walk below runs instead. The user is not told which ran,
     // because the answer is the same either way.
-    if (ScanMft(root, progress, result)) {
+    // The table describes the whole volume, so it answers only for a
+    // volume root; a folder scan walks, and sees only that folder.
+    if (IsVolumeRootPath(root) && ScanMft(root, progress, result)) {
         if (!(progress && progress->cancel.load(std::memory_order_relaxed))) {
             RollUp(result.root);
             SortTree(result.root);
@@ -440,7 +444,44 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
 // Defined with the cache code below; EnumerateVolumes and the launch
 // sweep need them first.
 static bool VolumeIsHotplug(wchar_t letter);
+static int  CacheVerdict(wchar_t letter);
+static bool IsVolumeRootPath(const std::wstring& p);
 static void DeleteMatching(const std::wstring& dir, const wchar_t* pattern);
+
+// What a drive letter is, from the local device table alone, so that no
+// server is contacted to find out. A mapped drive's device is one of the
+// redirectors, a SUBST is a \??\ path, a real volume is \Device\Harddisk*
+// and friends. Asking Windows for the drive type would do for a local
+// volume, but for a redirector letter that call opens the share's root.
+enum class LetterKind { Unknown, Volume, Network, SubstLocal, SubstUnc };
+static LetterKind KindOfLetter(wchar_t letter, std::wstring* target) {
+    const wchar_t dev[3] = {letter, L':', 0};
+    wchar_t buf[1024] = {};
+    if (QueryDosDeviceW(dev, buf, 1024) == 0) return LetterKind::Unknown;
+    std::wstring t = buf;
+    if (target != nullptr) *target = t;
+    if (t.compare(0, 4, L"\\??\\") == 0) {
+        std::wstring rest = t.substr(4);
+        if (rest.size() >= 4 && _wcsnicmp(rest.c_str(), L"UNC\\", 4) == 0) {
+            return LetterKind::SubstUnc;
+        }
+        if (rest.size() >= 2 && rest[1] == L':') return LetterKind::SubstLocal;
+        // \??\Volume{...} and other object paths: a real volume by another
+        // name, never a share.
+        return LetterKind::Volume;
+    }
+    static const wchar_t* const kRedirectors[] = {
+        L"\\Device\\LanmanRedirector", L"\\Device\\Mup",
+        L"\\Device\\WebDavRedirector", L"\\Device\\DfsClient",
+        L"\\Device\\NetWareRedirector", L"\\Device\\WinDfs",
+        L"\\Device\\Nfs", L"\\Device\\SmbRedirector"};
+    for (const wchar_t* r : kRedirectors) {
+        const size_t n = wcslen(r);
+        if (_wcsnicmp(t.c_str(), r, n) == 0) return LetterKind::Network;
+    }
+    if (_wcsnicmp(t.c_str(), L"\\Device\\", 8) == 0) return LetterKind::Volume;
+    return LetterKind::Unknown;
+}
 
 std::vector<Volume> EnumerateVolumes() {
     std::vector<Volume> out;
@@ -456,17 +497,26 @@ std::vector<Volume> EnumerateVolumes() {
 
         wchar_t rootPath[4] = {static_cast<wchar_t>(L'A' + i), L':', L'\\', 0};
 
-        const UINT type = GetDriveTypeW(rootPath);
-        if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE &&
-            type != DRIVE_REMOTE) {
-            continue;
+        // The device table says whether this letter is a share before
+        // anything asks Windows a question that would open its root.
+        const LetterKind kind = KindOfLetter(rootPath[0], nullptr);
+        const bool network = kind == LetterKind::Network ||
+                             kind == LetterKind::SubstUnc;
+        UINT type = DRIVE_REMOTE;
+        if (!network) {
+            type = GetDriveTypeW(rootPath);
+            if (type == DRIVE_REMOTE) {
+                // A redirector the table did not name: still a share.
+            } else if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE) {
+                continue;
+            }
         }
 
         Volume v;
         v.fixed  = (type == DRIVE_FIXED);
         v.remote = (type == DRIVE_REMOTE);
         v.path = rootPath;
-        v.cacheable = v.fixed && !VolumeIsHotplug(rootPath[0]);
+        v.cacheable = v.fixed && CacheVerdict(rootPath[0]) == 1;
 
         // A network letter is listed by its letter alone. Asking it for a
         // label or free space is a connection to the server, and nothing
@@ -554,6 +604,16 @@ static std::wstring CacheDir() {
     std::wstring dir(buf);
     dir += L"\\Spindle";
     CreateDirectoryW(dir.c_str(), nullptr);   // fine if it already exists
+    // The folder itself must be a folder, not a junction or link planted
+    // there by something else running as this user: an elevated instance
+    // would otherwise write and delete wherever the link points. With no
+    // trustworthy folder there is no cache and no saved settings.
+    const DWORD attrs = GetFileAttributesW(dir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return {};
+    }
     return dir;
 }
 
@@ -622,6 +682,16 @@ static bool VolumeIsHotplug(wchar_t letter) {
 
 // 1 cacheable, 0 never, -1 unknowable (letter exists, volume not ready).
 static int CacheVerdict(wchar_t letter) {
+    // A share or a SUBST is never a volume of its own: a share's listing
+    // must not persist, and a substituted letter is a doorway that may
+    // lead into a share or a link. Decided from the device table, so a
+    // share's root is never opened to find out.
+    const LetterKind kind = KindOfLetter(letter, nullptr);
+    if (kind == LetterKind::Network || kind == LetterKind::SubstUnc ||
+        kind == LetterKind::SubstLocal) {
+        return 0;
+    }
+    if (kind == LetterKind::Unknown) return -1;
     const wchar_t r3[4] = {letter, L':', L'\\', 0};
     const UINT type = GetDriveTypeW(r3);
     if (type == DRIVE_REMOVABLE || type == DRIVE_REMOTE ||
@@ -629,15 +699,6 @@ static int CacheVerdict(wchar_t letter) {
         return 0;
     }
     if (type != DRIVE_FIXED) return -1;
-    // A SUBST or other redirected letter is a doorway, not a volume: it
-    // may lead into a share or a link, so it is never cached or read
-    // unasked. A real volume's device name starts with \Device\.
-    const wchar_t dev[3] = {letter, L':', 0};
-    wchar_t target[1024] = {};
-    if (QueryDosDeviceW(dev, target, 1024) != 0 &&
-        _wcsnicmp(target, L"\\Device\\", 8) != 0) {
-        return 0;
-    }
     return VolumeIsHotplug(letter) ? 0 : 1;
 }
 
@@ -651,6 +712,7 @@ size_t PruneStaleCaches() {
     if (dir.empty()) return 0;
     // A temporary left by a write that never finished is never valid.
     DeleteMatching(dir, L"*.spincache.tmp");
+    DeleteMatching(dir, L"settings.txt.tmp");
 
     std::vector<wchar_t> cached;
     WIN32_FIND_DATAW fd{};
@@ -2042,75 +2104,232 @@ ForceRemoveResult ForceRemove(const std::wstring& path,
 
 std::wstring CacheDirPath() { return CacheDir(); }
 
+// The reparse data of a link, read from the link itself: what it points
+// at, as a string, without following it. Windows stores the target of a
+// symbolic link or junction in the link; reading it is a local operation
+// whatever the target is. Returns false for anything that is not one of
+// those two kinds of link.
+namespace {
+struct LinkTarget {
+    std::wstring path;      // \??\C:\dir, \??\UNC\srv\share\dir, or relative
+    bool         relative = false;
+};
+#ifndef IO_REPARSE_TAG_SYMLINK
+#define IO_REPARSE_TAG_SYMLINK 0xA000000CL
+#endif
+struct ReparseData {
+    ULONG  tag;
+    USHORT length;
+    USHORT reserved;
+    union {
+        struct {
+            USHORT substOffset, substLength, printOffset, printLength;
+            ULONG  flags;
+            WCHAR  buffer[1];
+        } symlink;
+        struct {
+            USHORT substOffset, substLength, printOffset, printLength;
+            WCHAR  buffer[1];
+        } mount;
+    };
+};
+}  // namespace
+
+static bool ReadLinkTarget(const std::wstring& extended, LinkTarget& out) {
+    const HANDLE h = CreateFileW(
+        extended.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    bool isLink = false;
+    if (GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag,
+                                     sizeof(tag)) &&
+        (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
+        (tag.ReparseTag == IO_REPARSE_TAG_SYMLINK ||
+         tag.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)) {
+        isLink = true;
+    }
+    if (!isLink) {
+        CloseHandle(h);
+        return false;
+    }
+    std::vector<uint8_t> buf(16 * 1024);
+    DWORD got = 0;
+    const BOOL ok = DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, nullptr, 0,
+                                    buf.data(),
+                                    static_cast<DWORD>(buf.size()), &got,
+                                    nullptr);
+    CloseHandle(h);
+    if (!ok || got < 8) return false;
+    const auto* rd = reinterpret_cast<const ReparseData*>(buf.data());
+    const wchar_t* base = nullptr;
+    size_t off = 0, len = 0;
+    if (rd->tag == IO_REPARSE_TAG_SYMLINK) {
+        base = rd->symlink.buffer;
+        off  = rd->symlink.substOffset;
+        len  = rd->symlink.substLength;
+        out.relative = (rd->symlink.flags & 1u) != 0;   // SYMLINK_FLAG_RELATIVE
+        if (reinterpret_cast<const uint8_t*>(base) + off + len >
+            buf.data() + got) {
+            return false;
+        }
+    } else {
+        base = rd->mount.buffer;
+        off  = rd->mount.substOffset;
+        len  = rd->mount.substLength;
+        out.relative = false;
+        if (reinterpret_cast<const uint8_t*>(base) + off + len >
+            buf.data() + got) {
+            return false;
+        }
+    }
+    out.path.assign(reinterpret_cast<const wchar_t*>(
+                        reinterpret_cast<const uint8_t*>(base) + off),
+                    len / sizeof(wchar_t));
+    return true;
+}
+
+// Where a path physically lives, decided from local tables only: the
+// spelling, the device table for its letter, and the stored targets of
+// any links along it. Nothing here opens a share, and anything that
+// cannot be judged is called a network location with no identity, which
+// asks every time and can never be remembered. `resolve` walks the
+// links along the path; it is false at launch, where even a local open
+// is not wanted, and true at the moment of a click.
 NetPlace ClassifyPath(const std::wstring& path, bool resolve) {
     NetPlace r;
     std::wstring p = path;
-    if (p.size() >= 8 && _wcsnicmp(p.c_str(), L"\\\\?\\UNC\\", 8) == 0) {
-        p = L"\\\\" + p.substr(8);
-    }
-    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') {
-        r.network = true;
-        r.key     = ShareRootOf(p);   // empty for \\?\ and \\.\ spellings
-        return r;
-    }
-    if (p.size() < 2 || p[1] != L':') return r;
-
-    const wchar_t root3[4] = {p[0], L':', L'\\', 0};
-    if (GetDriveTypeW(root3) == DRIVE_REMOTE) {
-        r.network = true;
-        // The mapping's own name, from the local redirector table: no
-        // server is contacted to learn it. A mapping with no name has no
-        // identity, and is asked about every time.
-        const wchar_t local[3] = {p[0], L':', 0};
-        wchar_t remote[1024] = {};
-        DWORD len = 1024;
-        if (WNetGetConnectionW(local, remote, &len) == NO_ERROR &&
-            remote[0] != 0) {
-            r.key = ShareRootOf(remote);
+    for (int hop = 0; hop < 16; ++hop) {
+        if (p.size() >= 8 && _wcsnicmp(p.c_str(), L"\\\\?\\UNC\\", 8) == 0) {
+            p = L"\\\\" + p.substr(8);
+        } else if (p.size() >= 4 && p.compare(0, 4, L"\\\\?\\") == 0) {
+            p = p.substr(4);
+        } else if (p.size() >= 4 && p.compare(0, 4, L"\\??\\") == 0) {
+            p = p.substr(4);
+            if (p.size() >= 4 && _wcsnicmp(p.c_str(), L"UNC\\", 4) == 0) {
+                p = L"\\\\" + p.substr(4);
+            }
         }
-        return r;
-    }
-
-    // A local letter can still be a doorway into a share: a SUBST of a
-    // UNC path shows in the device table, without touching anything.
-    const wchar_t dev[3] = {p[0], L':', 0};
-    wchar_t target[1024] = {};
-    if (QueryDosDeviceW(dev, target, 1024) != 0) {
-        std::wstring t = target;
-        if (t.compare(0, 4, L"\\??\\") == 0) t = t.substr(4);
-        if (t.size() >= 4 && _wcsnicmp(t.c_str(), L"UNC\\", 4) == 0) {
+        if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') {
             r.network = true;
-            r.key     = ShareRootOf(L"\\\\" + t.substr(4));
+            r.key     = ShareRootOf(p);   // empty for \\.\ and other odd forms
             return r;
         }
-    }
-    if (!resolve) return r;
+        // Not a lettered path either: a relative path or a bare object
+        // spelling. Fail closed rather than guess.
+        if (p.size() < 2 || p[1] != L':' ||
+            !((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z'))) {
+            r.network = true;
+            r.key.clear();
+            return r;
+        }
 
-    // A folder that is a symbolic link or junction into a share, or a
-    // SUBST of one: open it once, following links, and ask where the
-    // handle ended up. Local for a local folder; for a link into a share
-    // this single open is the least that can establish the fact.
-    const HANDLE h = CreateFileW(
-        p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return r;   // unopenable: the scan fails too
-    wchar_t fin[2048] = {};
-    const DWORD n = GetFinalPathNameByHandleW(
-        h, fin, 2047, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    CloseHandle(h);
-    if (n == 0 || n >= 2047) return r;
-    std::wstring f = fin;
-    if (f.size() >= 8 && _wcsnicmp(f.c_str(), L"\\\\?\\UNC\\", 8) == 0) {
-        r.network = true;
-        r.key     = ShareRootOf(L"\\\\" + f.substr(8));
-        return r;
+        std::wstring target;
+        const LetterKind kind = KindOfLetter(p[0], &target);
+        if (kind == LetterKind::Network || kind == LetterKind::SubstUnc) {
+            r.network = true;
+            if (kind == LetterKind::SubstUnc) {
+                r.key = ShareRootOf(L"\\\\" + target.substr(8));   // \??\UNC\...
+            } else {
+                // The mapping's own name, from the local redirector
+                // table. A mapping with no name has no identity.
+                const wchar_t local[3] = {p[0], L':', 0};
+                wchar_t remote[1024] = {};
+                DWORD len = 1024;
+                if (WNetGetConnectionW(local, remote, &len) == NO_ERROR &&
+                    remote[0] != 0) {
+                    r.key = ShareRootOf(remote);
+                }
+            }
+            return r;
+        }
+        if (kind == LetterKind::Unknown) {
+            // A letter the table does not know is not vouched for.
+            r.network = true;
+            r.key.clear();
+            return r;
+        }
+        if (kind == LetterKind::SubstLocal) {
+            // X: stands for a local folder: judge that folder with the
+            // rest of the path appended.
+            std::wstring rest = p.substr(2);
+            std::wstring base = target.substr(4);   // \??\C:\dir -> C:\dir
+            while (!base.empty() && base.back() == L'\\') base.pop_back();
+            if (!rest.empty() && rest[0] != L'\\') rest = L"\\" + rest;
+            p = base + rest;
+            continue;
+        }
+        // The table calls it a volume. Windows may still know it as a
+        // network drive through a redirector the table did not name; for
+        // a real volume this question is answered locally.
+        {
+            const wchar_t r3[4] = {p[0], L':', L'\\', 0};
+            if (GetDriveTypeW(r3) == DRIVE_REMOTE) {
+                r.network = true;
+                const wchar_t local[3] = {p[0], L':', 0};
+                wchar_t remote[1024] = {};
+                DWORD len = 1024;
+                if (WNetGetConnectionW(local, remote, &len) == NO_ERROR &&
+                    remote[0] != 0) {
+                    r.key = ShareRootOf(remote);
+                }
+                return r;
+            }
+        }
+        // A real local volume. Without resolving, that is the answer.
+        if (!resolve) return r;
+
+        // Walk the components; a symbolic link or junction along the way
+        // is read (never followed) and judged by its stored target.
+        bool restarted = false;
+        size_t pos = 3;   // past "X:\"
+        while (pos <= p.size()) {
+            const size_t sep = p.find(L'\\', pos);
+            const size_t end = (sep == std::wstring::npos) ? p.size() : sep;
+            if (end > pos) {
+                const std::wstring prefix = p.substr(0, end);
+                LinkTarget lt;
+                if (ReadLinkTarget(L"\\\\?\\" + prefix, lt)) {
+                    std::wstring rest = p.substr(end);
+                    std::wstring dest;
+                    if (lt.relative) {
+                        std::wstring parent = prefix;
+                        const size_t ps = parent.find_last_of(L'\\');
+                        parent = (ps == std::wstring::npos) ? parent
+                                                            : parent.substr(0, ps);
+                        dest = parent + L"\\" + lt.path;
+                    } else {
+                        dest = lt.path;   // \??\..., \\?\..., or a plain path
+                    }
+                    p = dest + rest;
+                    restarted = true;
+                    break;
+                }
+                // Not a link: it must at least exist and be openable, or
+                // the judgement is not one to trust.
+                const HANDLE h = CreateFileW(
+                    (L"\\\\?\\" + prefix).c_str(), FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    nullptr);
+                if (h == INVALID_HANDLE_VALUE) {
+                    r.network = true;
+                    r.key.clear();
+                    return r;
+                }
+                CloseHandle(h);
+            }
+            if (sep == std::wstring::npos) break;
+            pos = end + 1;
+        }
+        if (!restarted) return r;   // every component local and openable
     }
-    if (f.compare(0, 4, L"\\\\?\\") == 0) f = f.substr(4);
-    if (f.size() >= 2 && f[1] == L':' && towupper(f[0]) != towupper(p[0])) {
-        // Landed on another letter (a SUBST of a local folder, say): judge
-        // that letter, without following anything further.
-        return ClassifyPath(f.substr(0, 3), false);
-    }
+    // Too many hops: not a chain to trust.
+    r.network = true;
+    r.key.clear();
     return r;
 }
 
@@ -2125,7 +2344,7 @@ std::wstring ShareIdentityForRoot(const std::wstring& root) {
 // ----------------------------------------------------- shell integration
 //
 // HKCU\Software\Classes\Directory\shell\Spindle. Per-user, so it needs no
-// elevation and cannot affect anyone else on the machine; three keys, all
+// elevation and cannot affect anyone else on the machine; two keys, all
 // of which Unregister deletes.
 
 static const wchar_t* const kVerbKey =

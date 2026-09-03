@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <atomic>
 
 namespace spindle {
@@ -508,8 +509,12 @@ struct Settings {
     // Network shares the person has agreed to read, remembered by their
     // own identity (\\server\share, normalised) rather than by drive
     // letter, so a letter mapped somewhere else later asks afresh. A
-    // mapping with no name falls back to letter plus volume serial.
+    // mapping with no name has no identity and is asked every time.
     std::vector<std::string> trustedShares;   // UTF-8, normalised
+    // An update was staged: the previous binary sits beside the running
+    // one as spindle.exe.old until the next launch removes it. Only then
+    // is the executable's folder touched at launch at all.
+    bool cleanupOld = false;
     // Highest signed manifest serial ever accepted. Anti-replay: a
     // genuine but superseded release carries a lower serial and is
     // refused, so nobody can be pinned on an old signed version.
@@ -540,6 +545,14 @@ std::wstring NormalizeShareKey(std::wstring s);
 // \\server\share, since permission is granted per share, not per folder.
 // A lettered fallback key is returned as it is; anything else, empty.
 std::wstring ShareRootOf(const std::wstring& key);
+// Whether a location may be read without asking: not a network location,
+// or a share whose identity is remembered in the settings or was agreed
+// to this run. A network location with no identity is never allowed
+// silently. Portable, host-tested; the interface wraps it.
+struct NetPlace;
+bool ShareAllowedFor(const Settings& s,
+                     const std::unordered_set<std::wstring>& session,
+                     const NetPlace& np);
 bool ShareTrusted(const Settings& s, const std::wstring& key);
 // Adds a normalised key; false when invalid or the list is at its cap.
 bool TrustShare(Settings& s, const std::wstring& key);

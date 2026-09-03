@@ -37,11 +37,11 @@ from the extension, so you can tell what a drive is full of before reading
 any labels.
 
 Scanning reads directory entries, never file contents. Sizes come from
-`WIN32_FIND_DATA` and no handle is opened on anything being scanned, so
+`WIN32_FIND_DATA` and no handle is opened on any file being scanned, so
 nothing gets locked, and files held under an exclusive kernel lock such as
 `pagefile.sys` and `hiberfil.sys` still report their real size.
 
-Reparse points are recorded but not traversed. Junctions and symlinks
+Reparse points are never traversed. Junctions and directory symlinks
 cannot cause loops or double counting.
 
 At launch, the fixed drives are walked once in the background, one at a
@@ -50,13 +50,16 @@ drive answers a click instantly. Finished scans are cached under
 `%LOCALAPPDATA%\Spindle`. A cache under five minutes old is served as-is;
 an older one is shown immediately while a rescan revalidates behind it, and
 the status bar reads `cached 2h ago · rescanning` until it finishes. F5
-always forces a fresh walk. Removable and network drives are never read
+always forces a fresh walk, whatever the view. Removable and network drives are never read
 unprompted, the background walk stops the moment you ask for anything
 else, and the whole thing can be turned off in the `···` menu.
 
 What a cache holds, for anyone who has to sign off on it: the folder
-tree of one drive, each entry as a name, a size, a kind and three flags.
-No file contents, no hashes, no dates, no owners. It is a listing of the
+tree of one drive, each entry as a name, a size, a file count, a kind
+and three flags (folder, hardlink, cloud placeholder), under one header
+carrying the time the scan finished, the volume serial number and the
+drive's totals. No file contents, no hashes, no per-file dates, no
+owners. It is a listing of the
 drive, so it is treated as one: only an internal fixed disk ever gets a
 cache. Removable media, disks on a USB, FireWire or card-reader bus, and
 network shares are never cached, so no listing outlives its media. At
@@ -67,10 +70,13 @@ external disk rescans each time it is opened.
 
 Each cache is sealed with Windows data protection (DPAPI) before it
 touches the disk. The key belongs to your Windows account, Windows
-manages it, and Spindle never stores one. A cache that is copied, backed
-up, imaged or read from another account is unreadable; for a local
-account that holds on any other machine too, while a domain account's
-key follows the account.
+manages it, and Spindle never stores one. The cache can be read only by
+a process holding that Windows account's DPAPI key: the same account on
+the same machine, or, for a domain account, the same account on another
+machine where Windows has made its key available. A copy, backup or disk
+image of the cache cannot be read without that account's credentials.
+Anyone holding the account's password and profile, or the domain's DPAPI
+backup key, can read it, and can read the drive anyway.
 It is not a defence against the account itself or code running as it,
 which can read the drive anyway. Caches from earlier builds were plain;
 they are deleted rather than read, so each drive rescans once.
@@ -79,14 +85,19 @@ Network drives are handled the way a company policy would want by
 default. A mapped share is listed, marked `network` on its card, and read
 only after you click it and answer a question that names the share and
 says what a scan involves. Tick "remember" and that share never asks
-again; leave it unticked and the answer lasts for this run. The memory is
+again, up to 32 remembered shares; past that the status bar says so and
+the answer lasts for this run. Leave it unticked and the answer lasts
+for this run. The memory is
 the share itself, `\\server\share`, not the drive letter, so a letter
 mapped somewhere else later asks afresh, and a mapping with no name is
 asked every time and never remembered. A folder that is a symbolic link,
 junction or SUBST into a share counts as that share, wherever the path
-started. Nothing at launch reaches a share: a network letter is listed by
-its letter alone, without asking the server for a label or free space,
-until you allow it. "Forget remembered network drives" in the `···` menu
+started. Nothing at launch reaches a share: a network letter is
+recognised from the local device table and listed by its letter alone,
+without asking the server for a label or free space, until you allow it;
+a path given on the command line or by the Explorer entry is judged from
+the local link and device tables before the question is asked, and a
+path that cannot be judged is treated as a network location. "Forget remembered network drives" in the `···` menu
 clears every saved answer. The scan reads names and sizes; finding
 duplicates on a share reads file contents too, and the permission text
 says so. The cache
@@ -136,8 +147,9 @@ and descends into folders across the machine; the list shows the drives
 as rows; and Find, Kinds and Largest all span every drive, so a search
 there covers the whole computer rather than one volume. Cached drives
 appear at once, a fixed drive with no cache yet is walked in the
-background, removable drives join only when already cached, and a network
-drive joins only if you have already allowed that share.
+background, removable drives are left out, an external disk that Windows
+reports as fixed is walked but never cached, and a network drive joins
+only if you have already allowed that share.
 
 Filenames are treated as untrusted input; see the Security section.
 
@@ -150,10 +162,10 @@ them. No injection, no handle-table tricks.
 
 Force applies to locks and permissions, not to the confirmations. It is a
 separate menu item below the reversible delete, it is never the default,
-and it has no keyboard shortcut. It asks three times: for the
-protected-path check, for the permanent deletion (with size and file
-count), and for the processes it would end, listed by name. No is the
-default answer each time. Drive roots, `\Windows`, `System Volume
+and it has no keyboard shortcut. It refuses protected paths outright,
+then asks before the permanent deletion, stating size and file count,
+and asks a second time, naming the processes it would end, whenever
+something has the target open. No is the default answer each time. Drive roots, `\Windows`, `System Volume
 Information`, the boot files and the `Program Files`, `ProgramData` and
 `Users` roots are refused in the removal code itself, not just in the
 dialog. It never terminates a system process and never touches the
@@ -165,6 +177,8 @@ registry.
 
 Finding duplicates means reading file contents, which the scanner
 otherwise never does, so it only happens when you press the button in the
+Dupes panel, when a duplicate is verified before recycling, or when
+`--duplicates` is given on the command line. That is, from the button in the
 Dupes panel. The search runs in tiers so that very little is read in full:
 
 1. Same size. Files of different lengths cannot be identical, so this
@@ -259,14 +273,14 @@ address bar or by giving it here.
 spindle.exe [path]                 open the window on a volume, folder or
                                      \\server\share
 spindle.exe --csv <file> <path>    scan, write CSV, exit; no window
-spindle.exe --duplicates [bytes] <path>   include a duplicate report
+spindle.exe --duplicates [bytes] <path>   also find duplicates; prints a one-line summary
 spindle.exe --version | --help
 ```
 
-With `--csv` nothing is shown and the exit code is 0 on success, 1 on
-failure, so a scheduled task can act on the result. Anything beginning
-with a dash is treated as a mistyped option rather than a path, so a typo
-cannot start a scan by accident.
+With `--csv` nothing is shown and the exit code is 0 on success, 1 when
+the scan found nothing or the file could not be written, 2 for a command
+line that could not be parsed, and 3 for a network location it may not
+read. The path must be a full one: a drive letter or `\\server\share`.
 
 The `···` menu can remember where you were: turn on "Remember
 where I was" and the next launch reopens the same drive and folder in the
@@ -495,24 +509,31 @@ written verbatim into a CSV and carry the spoof into whatever opens it.
 
 ### Import audit
 
-About 256 functions across 14 DLLs, all Microsoft. What is absent
+Every import comes from a Windows system DLL; at the time of writing 261
+functions across 17 DLLs, easy to recheck with `objdump -p`. What is absent
 matters as much as what is present:
 
-- Networking exists for exactly one purpose: the auto-updater, over
+- Networking code exists for exactly one purpose: the auto-updater, over
   WinHTTP, HTTPS, to the GitHub release API for this repository and the
-  release assets it names. Nothing else in the program reaches the
-  network, and there is no Winsock, WinINet or DNS use anywhere. The
-  maintainer's public key is embedded in the source, so the check runs
-  at launch and can be turned off in the menu; a build with the key
-  constant emptied compiles the same code but never opens a socket. An
-  update is accepted only when a manifest signed by the maintainer's
-  offline ECDSA P-256 key, verified through CNG, vouches for the exact
-  SHA-256 and size of the file and carries a serial newer than the last
-  one accepted; it is offered rather than installed, and every failure
-  leaves the current install untouched.
-- No process creation. No `CreateProcess`, no `WinExec`. `ShellExecuteW`
-  is used to open Explorer at a path and, from browse mode, to open a
-  file with its default application; nothing else.
+  release assets it names. Nothing else in the program opens a connection
+  of its own, and there is no Winsock, WinINet or DNS use anywhere.
+  Network shares are read through the same Windows file APIs as local
+  drives, after permission, and a mapping's name is read from the local
+  redirector table. The maintainer's public key is embedded in the
+  source, so the check runs at launch and can be turned off in the menu;
+  a build with the key constant emptied compiles the same code but never
+  opens a socket. An update is accepted only when a manifest signed by
+  the maintainer's ECDSA P-256 release key, held as a GitHub environment
+  secret that only an approved signing run can use (see SECURITY.md),
+  verified through CNG, vouches for the exact SHA-256 and size of the
+  file and carries a serial newer than the last one accepted; it is
+  offered rather than installed, and every failure leaves the current
+  install untouched.
+- No process creation of its own. No `CreateProcess`, no `WinExec`.
+  `ShellExecuteW` hands a path to the shell in three places: to show a
+  file in Explorer, to open the cache folder, and, from the list view, to
+  open a double-clicked file with its default application, which starts
+  whatever program Windows associates with it.
 - No injection primitives. No `CreateRemoteThread`, `WriteProcessMemory`,
   `VirtualAllocEx` or `SetWindowsHookEx`.
 - Registry writes happen in exactly one feature: the opt-in "Scan with
@@ -522,18 +543,28 @@ matters as much as what is present:
 
 Some imports deserve an explanation:
 
-- `OpenProcessToken` is called on `GetCurrentProcess()` with
-  `TOKEN_QUERY`, solely to ask whether the process is elevated before
-  attempting MFT access.
+- `OpenProcessToken` is called on `GetCurrentProcess()` in two places:
+  with `TOKEN_QUERY` to ask whether the process is elevated before
+  attempting MFT access, and, during force removal only, with
+  `TOKEN_ADJUST_PRIVILEGES` to enable the take-ownership, backup and
+  restore privileges.
 - `TerminateProcess` is reached only from Force remove, on the processes
   the Restart Manager reports as holding the target, after they are
   listed to the user by name and confirmed. System processes are refused.
 - `LoadLibraryW`, `VirtualProtect` and `CryptGenRandom` are not called by
   any line of Spindle. They come from the MinGW C runtime's startup and
   exception unwinding; grep the sources and you will not find them.
-- Write handles are opened for the scan cache, the CSV file picked in the
-  save dialog, and the crash report. Deletion happens only through the
-  two delete commands, both confirmed.
+- Files Spindle writes: the scan caches, `settings.txt` and, after a
+  crash, `spindle-crash.txt`, all under `%LOCALAPPDATA%\Spindle`, each
+  data file through a `.tmp` sibling and a rename; the CSV files you
+  choose; and, only when you accept an update, `spindle.exe.new` beside
+  the executable, which takes its name while the previous version becomes
+  `spindle.exe.old` until the next launch removes it. The release-signing
+  modes write `update-key.txt`, `manifest.json`, `manifest.sig` and
+  `sign-error.txt` where they are run. Spindle deletes files only through
+  the recycle and force-remove commands, all confirmed, and its own
+  caches, temporary files and `spindle.exe.old`; rename moves a file
+  within its folder.
 
 Everything is verifiable from the source, which is included. Nothing is
 downloaded, and nothing is generated at build time except the icon.
@@ -546,7 +577,10 @@ as a fixed disk (some cloud and archive mounts) is treated as one. A disk
 in a Thunderbolt enclosure may report as internal and be cached.
 
 Sizes are logical file length, so compressed and sparse files read larger
-than their footprint on disk. Hardlinked and cloud-only bytes are the two
+than their footprint on disk. Hardlinked bytes are measured on the MFT
+path and cloud-only bytes on the directory walk, so an elevated NTFS scan
+reports hardlinks but not placeholders and an unelevated or non-NTFS
+scan the reverse. Hardlinked and cloud-only bytes are the two
 cases large enough to matter and both are measured and reported;
 compression is not.
 

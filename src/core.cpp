@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <unordered_set>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1322,16 +1323,17 @@ const wchar_t* CommandLineHelp() {
         L"\n"
         L"  path                  volume, folder or \\\\server\\share to open\n"
         L"  --csv <file>          scan, write CSV, exit (no window)\n"
-        L"  --duplicates [bytes]  include duplicates, minimum size\n"
+        L"  --duplicates [bytes]  also find duplicates; prints a one-line summary\n"
         L"  --allow-network       let --csv read a network location\n"
         L"  --version             print the version and exit\n"
         L"  --help                this text\n"
         L"\n"
-        L"With --csv nothing is shown and the exit code is 0 on success, 1\n"
-        L"on failure, so Task Scheduler can run it on whatever schedule you\n"
-        L"like rather than Spindle keeping a service alive to do it. Nothing\n"
-        L"can ask for permission there, so a network location exits with 3\n"
-        L"unless it was remembered in the window or --allow-network is given.\n";
+        L"With --csv nothing is shown. Exit codes: 0 success, 1 nothing\n"
+        L"scanned or file not writable, 2 command line not understood, 3 a\n"
+        L"network location it may not read: nothing can ask for permission\n"
+        L"there, so a share is read only if it was remembered in the window\n"
+        L"or --allow-network is given. Task Scheduler can run it on whatever\n"
+        L"schedule you like rather than Spindle keeping a service alive.\n";
 }
 
 CommandLine ParseCommandLine(const std::vector<std::wstring>& args) {
@@ -1384,7 +1386,9 @@ CommandLine ParseCommandLine(const std::vector<std::wstring>& args) {
                 return cl;
             }
             if (flag == L"csv") {
-                if (i + 1 >= args.size() || args[i + 1].empty()) {
+                if (i + 1 >= args.size() || args[i + 1].empty() ||
+                    (args[i + 1].size() > 1 && args[i + 1][0] == L'-' &&
+                     args[i + 1][1] == L'-')) {
                     cl.valid = false;
                     cl.error = L"--csv needs a file to write to";
                     return cl;
@@ -1429,6 +1433,21 @@ CommandLine ParseCommandLine(const std::vector<std::wstring>& args) {
             }
             cl.valid = false;
             cl.error = L"unknown option: " + a;
+            return cl;
+        }
+
+        // A path is a drive letter or \\server\share, spelled out. A
+        // relative or bare object-manager spelling (UNC\srv\share,
+        // GLOBALROOT\...) is refused rather than guessed at: the walker
+        // would otherwise reach it through the long-path prefix without
+        // it ever having been judged.
+        if (!(a.size() >= 2 &&
+              ((a[1] == L':' && ((a[0] >= L'A' && a[0] <= L'Z') ||
+                                 (a[0] >= L'a' && a[0] <= L'z'))) ||
+               (a[0] == L'\\' && a[1] == L'\\') ||
+               (a[0] == L'/' && a[1] == L'/')))) {
+            cl.valid = false;
+            cl.error = L"give a full path: a drive letter or \\\\server\\share";
             return cl;
         }
 
@@ -1839,8 +1858,14 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
 
     // key=value per line. Unknown keys are ignored, so an older build reads
     // a newer file without drama; anything malformed just keeps a default.
+    // A UTF-8 byte order mark, should an editor have added one, is not
+    // part of the first key.
+    size_t start = 0;
+    if (len >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) {
+        start = 3;
+    }
     std::string line;
-    for (size_t i = 0; i <= len; ++i) {
+    for (size_t i = start; i <= len; ++i) {
         const char c = (i < len) ? static_cast<char>(data[i]) : '\n';
         if (c != '\n' && c != '\r') {
             if (line.size() < 1024) line.push_back(c);
@@ -1862,6 +1887,8 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 s.rememberView = value;
             } else if (key == "last_browse") {
                 s.lastBrowse = value;
+            } else if (key == "cleanup_old") {
+                s.cleanupOld = value;
             } else if (key == "last_panel") {
                 const std::string v = line.substr(eq + 1);
                 if (v.size() == 1 && v[0] >= '0' && v[0] <= '3') {
@@ -1925,12 +1952,20 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
         "\nremember_view=" + (s.rememberView ? "1" : "0") +
         "\nlast_browse=" + (s.lastBrowse ? "1" : "0") +
         "\nlast_panel=" + std::to_string(s.lastPanel) +
+        "\ncleanup_old=" + (s.cleanupOld ? "1" : "0") +
         "\nupdate_serial=" + std::to_string(s.updateSerial) + "\n";
     size_t shares = 0;
     for (const std::string& share : s.trustedShares) {
-        if (shares++ >= kMaxTrustedShares) break;
-        if (share.empty() || share.size() > kMaxShareKeyChars * 3) continue;
-        all += "trusted_share=" + share + "\n";
+        if (shares >= kMaxTrustedShares) break;
+        // Written only as the canonical key it should already be: an
+        // entry that is not (nothing in the program makes one, but a
+        // string is a string) cannot smuggle a line into the file.
+        const std::wstring w = Utf8ToWide(share);
+        if (w.empty() || NormalizeShareKey(w) != w) continue;
+        const std::string canon = WideToUtf8(w);
+        if (canon.size() > kMaxShareKeyChars * 3) continue;
+        all += "trusted_share=" + canon + "\n";
+        ++shares;
     }
     if (s.rememberView && !s.lastPath.empty() && s.lastPath.size() <= 1000) {
         bool clean = true;
@@ -2084,6 +2119,14 @@ std::vector<wchar_t> CachesToDrop(
     return drop;
 }
 
+// Case folds ASCII only, on purpose: a share identity must not depend on
+// the C runtime's locale, and Windows itself compares names that way for
+// these purposes. Non-ASCII spellings that differ only in case become
+// different keys, which fails safe (asks again) rather than merging.
+static wchar_t AsciiLower(wchar_t c) {
+    return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + 32) : c;
+}
+
 std::wstring NormalizeShareKey(std::wstring s) {
     for (wchar_t& c : s) {
         if (c == L'/') c = L'\\';
@@ -2107,7 +2150,7 @@ std::wstring NormalizeShareKey(std::wstring s) {
     if (s.size() >= 8) {
         bool match = true;
         for (size_t i = 0; i < 8; ++i) {
-            if (static_cast<wchar_t>(towlower(s[i])) != kLong[i]) {
+            if (AsciiLower(s[i]) != kLong[i]) {
                 match = false;
                 break;
             }
@@ -2115,7 +2158,7 @@ std::wstring NormalizeShareKey(std::wstring s) {
         if (match) s = L"\\\\" + s.substr(8);
     }
     if (s.size() > kMaxShareKeyChars) return {};
-    for (wchar_t& c : s) c = static_cast<wchar_t>(towlower(c));
+    for (wchar_t& c : s) c = AsciiLower(c);
 
     if (!(s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\')) return {};
     while (!s.empty() && s.back() == L'\\') s.pop_back();
@@ -2145,13 +2188,43 @@ std::wstring NormalizeShareKey(std::wstring s) {
 }
 
 std::wstring ShareRootOf(const std::wstring& key) {
-    const std::wstring k = NormalizeShareKey(key);
-    if (k.empty()) return {};
-    // Keep \\server\share: the third separator, if any, ends it.
-    const size_t s1 = k.find(L'\\', 2);
+    // Only the server and share name decide the identity, so only they
+    // are judged: a folder deeper in the share may carry a name the share
+    // itself never could (a colon on a Samba share, a very long path)
+    // without costing the share its identity.
+    std::wstring s = key;
+    for (wchar_t& c : s) {
+        if (c == L'/') c = L'\\';
+    }
+    size_t b = 0;
+    while (b < s.size() && (s[b] == L' ' || s[b] == L'\t')) ++b;
+    s.erase(0, b);
+    if (s.size() >= 8) {
+        static const wchar_t kLong[] = L"\\\\?\\unc\\";
+        bool match = true;
+        for (size_t i = 0; i < 8; ++i) {
+            if (AsciiLower(s[i]) != kLong[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) s = L"\\\\" + s.substr(8);
+    }
+    if (!(s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\')) return {};
+    const size_t s1 = s.find(L'\\', 2);
     if (s1 == std::wstring::npos) return {};
-    const size_t s2 = k.find(L'\\', s1 + 1);
-    return (s2 == std::wstring::npos) ? k : k.substr(0, s2);
+    const size_t s2 = s.find(L'\\', s1 + 1);
+    const std::wstring root =
+        (s2 == std::wstring::npos) ? s : s.substr(0, s2);
+    return NormalizeShareKey(root);
+}
+
+bool ShareAllowedFor(const Settings& s,
+                     const std::unordered_set<std::wstring>& session,
+                     const NetPlace& np) {
+    if (!np.network) return true;
+    if (np.key.empty()) return false;
+    return ShareTrusted(s, np.key) || session.count(np.key) != 0;
 }
 
 bool ShareTrusted(const Settings& s, const std::wstring& key) {

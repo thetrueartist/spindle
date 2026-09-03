@@ -31,11 +31,34 @@ jobs:
           sudo apt-get install -y g++-mingw-w64-x86-64
       - name: Cross-compile spindle.exe
         run: make
+      - name: Cross-compile the Windows-side tests
+        run: make test-win
       - uses: actions/upload-artifact@v4
         with:
           name: spindle-exe
           path: build/spindle.exe
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindle-test-win
+          path: build/test_win.exe
+          retention-days: 14
+
+  # The Windows-only pieces, run on real Windows: where a path is judged to
+  # live (a share, an odd spelling, an absent letter), what may be cached,
+  # and the DPAPI-sealed cache round trip with no name readable on disk.
+  windows-tests:
+    runs-on: windows-latest
+    needs: cross-build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: spindle-test-win
+      - name: Classification and sealed cache
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\test_win.exe -Wait -NoNewWindow -PassThru
+          if ($p.ExitCode -ne 0) { throw "test_win failed with exit $($p.ExitCode)" }
 
   # Windows on ARM. llvm-mingw is the only toolchain that targets it, and it
   # is not packaged, so CI fetches a pinned release. Marked non-blocking:

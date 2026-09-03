@@ -223,7 +223,8 @@ two things this program already has. Design decisions:
   imitation: the control brings the caret, selection and IME for free.
   Commit order is disk first (MoveFileW after IsSafeNodeName), then the
   tree patched in place by walking to the parent by name, then the
-  cache re-saved from the patched tree. A walk that misses patches
+  cache of that drive deleted, so the next launch rescans rather than
+  serving a name one edit out of date. A walk that misses patches
   nothing and the next scan shows the truth.
 
 ## Launch prefetch
@@ -248,7 +249,7 @@ key says so, and producing that signature takes a human approval. The
 updater fails closed on anything unsigned, malformed, mismatched,
 replayed or unreachable.
 
-Mechanics: at launch (and from the menu), a worker fetches the latest
+Mechanics: at launch, when the launch check is on, a worker fetches the latest
 release metadata from the GitHub API over WinHTTP, finds manifest.json
 and manifest.sig among the assets, verifies the signature (ECDSA P-256
 via CNG), requires the manifest to name the release's own tag and to
@@ -349,7 +350,7 @@ the size and file count, and a named list of the processes that would be
 ended. No is the default on every one.
 
 What force removal may never touch lives in `core.cpp`, not in the dialog.
-`IsProtectedSystemPath` covers drive roots, UNC roots, `\Windows`,
+`IsProtectedSystemPath` covers drive roots, every UNC path, `\Windows`,
 `System Volume Information`, `$Recycle.Bin`, `Recovery`, `Boot` and the
 boot files at and below, plus the `Program Files`, `ProgramData`, `Users`
 and `PerfLogs` roots themselves (their contents are allowed).
@@ -387,7 +388,7 @@ a junction mid-walk is refused rather than followed.
 
 **The registry.** The Explorer folder-menu entry is the one registry write
 in the program. It is off by default, ticked on from the menu, writes
-three keys under `HKCU\Software\Classes\Directory\shell\Spindle`
+two keys under `HKCU\Software\Classes\Directory\shell\Spindle`
 (per-user, no elevation, nothing machine-wide), and unticking deletes
 exactly what it created. The command is written with `"%1"` quoted,
 because a folder name with a space otherwise arrives as several
@@ -411,7 +412,7 @@ import table but are not called by any line of Spindle; they come from
 the MinGW runtime. Force removal adds exactly two capabilities:
 `OpenProcess`/`TerminateProcess` to end a process holding a file open
 (found via the documented Restart Manager, `RmStartSession`, with no
-handle-table walking and no injection), and `SetNamedSecurityInfoW` with
+handle-table walking and no injection), and `SetSecurityInfo` on a handle with
 `AdjustTokenPrivileges` to take ownership.
 
 **Hardening.** DEP, ASLR, high-entropy ASLR and NO_SEH are on. Control

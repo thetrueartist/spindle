@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <unordered_set>
 #include <cwctype>
 #include <cstring>
 #include <string>
@@ -545,7 +546,10 @@ static void FuzzShareKeys() {
         for (size_t i = 0; i < len; ++i) in.push_back(alphabet[rng() % n]);
         const std::wstring k = NormalizeShareKey(in);
         if (k.empty()) {
-            if (!ShareRootOf(in).empty()) allGood = false;
+            // A path refused for a folder deep inside may still name a
+            // share; whatever root comes back must itself be canonical.
+            const std::wstring r = ShareRootOf(in);
+            if (!r.empty() && NormalizeShareKey(r) != r) allGood = false;
             continue;
         }
         ++accepted;
@@ -558,8 +562,8 @@ static void FuzzShareKeys() {
         for (wchar_t c : k) {
             if (c < 0x20 || c == 0x7F || c == L':' || c == L'*' ||
                 c == L'?' || c == L'"' || c == L'<' || c == L'>' ||
-                c == L'|' || c != static_cast<wchar_t>(towlower(c))) {
-                good = false;
+                c == L'|' || (c >= L'A' && c <= L'Z')) {
+                good = false;   // ASCII case is folded; nothing else is
             }
         }
         Settings s;
@@ -1959,6 +1963,20 @@ static void TestCommandLine() {
               "--allow-network is parsed and the path kept");
         CHECK(!Parse({L"--csv", L"o.csv", L"\\\\srv\\share"}).allowNetwork,
               "network is not allowed unless asked for");
+        CHECK(!Parse({L"--csv", L"--allow-network", L"\\\\srv\\share"}).valid,
+              "a flag is never taken as the CSV file name");
+        CHECK(!Parse({L"UNC\\srv\\share"}).valid,
+              "a bare object-manager spelling is refused as a path");
+        CHECK(!Parse({L"GLOBALROOT\\Device\\Mup\\srv\\share"}).valid,
+              "GLOBALROOT without a prefix is refused as a path");
+        CHECK(!Parse({L"folder"}).valid, "a relative path is refused");
+        CHECK(Parse({L"\\\\?\\UNC\\srv\\share"}).valid,
+              "the long-path UNC spelling is a full path");
+        CHECK(Parse({L"//srv/share"}).valid, "forward slashes are accepted");
+        const CommandLine gui = Parse({L"--allow-network", L"D:\\"});
+        CHECK(gui.valid && gui.mode == CommandLine::Mode::Gui &&
+                  gui.allowNetwork,
+              "the flag parses in window mode too");
     }
     CHECK(!Parse({L"--csv", L"out.csv"}).valid,
           "--csv with no path to scan is refused");
@@ -2395,6 +2413,49 @@ static void TestShareKeys() {
     CHECK(ShareRootOf(L"C:\\Users").empty(), "a local path is not a share");
     CHECK(ShareRootOf(L"\\\\?\\GLOBALROOT\\Device\\Mup\\a\\b").empty(),
           "GLOBALROOT has no share root to remember");
+    CHECK(ShareRootOf(L"\\\\srv\\share\\" + std::wstring(300, L'd')) ==
+              L"\\\\srv\\share",
+          "a long path within a share still names the share");
+    CHECK(ShareRootOf(L"\\\\srv\\share\\deep\\x:y") == L"\\\\srv\\share",
+          "an odd folder name deeper in does not cost the share its identity");
+    CHECK(ShareRootOf(L"//?/unc/S/T") == L"\\\\s\\t",
+          "the long-path fold is case-insensitive and slash-tolerant");
+    CHECK(NormalizeShareKey(L"\\\\\u00C4\\S") == L"\\\\\u00C4\\s",
+          "case folding is ASCII only, so a non-ASCII letter keeps its case");
+    CHECK(NormalizeShareKey(L"\\\\\u0130X\\s") == L"\\\\\u0130x\\s",
+          "no Turkish dotted-I surprise: non-ASCII is left alone");
+    CHECK(NormalizeShareKey(L"\\\\\uFF21\\s") == L"\\\\\uFF21\\s",
+          "fullwidth letters are not folded to ASCII");
+    {
+        Settings nf;
+        CHECK(TrustShare(nf, L"\\\\caf\u00e9\\s"), "NFC spelling trusted");
+        CHECK(!ShareTrusted(nf, L"\\\\cafe\u0301\\s"),
+              "NFD spelling is a different key, which fails safe");
+        CHECK(TrustShare(nf, L"\\\\a\\b"), "share trusted");
+        CHECK(!ShareTrusted(nf, L"\\\\a\\b\\deep"),
+              "a deeper path is not itself a trusted key");
+        CHECK(ShareTrusted(nf, ShareRootOf(L"\\\\?\\UNC\\A\\B\\deep")),
+              "but its share root is");
+    }
+    {
+        NetPlace local;
+        NetPlace anon; anon.network = true;
+        NetPlace named; named.network = true; named.key = L"\\\\srv\\s";
+        Settings st;
+        std::unordered_set<std::wstring> session;
+        CHECK(ShareAllowedFor(st, session, local), "a local place is allowed");
+        session.insert(L"");
+        CHECK(!ShareAllowedFor(st, session, anon),
+              "a network place with no identity is never allowed silently");
+        CHECK(!ShareAllowedFor(st, session, named), "unknown share refused");
+        session.insert(L"\\\\srv\\s");
+        CHECK(ShareAllowedFor(st, session, named), "session consent allows");
+        session.clear();
+        CHECK(TrustShare(st, L"\\\\SRV\\S"), "remembered");
+        CHECK(ShareAllowedFor(st, session, named), "remembered consent allows");
+        st.trustedShares.clear();
+        CHECK(!ShareAllowedFor(st, session, named), "forgotten means refused");
+    }
 
     Settings s;
     CHECK(!ShareTrusted(s, L"\\\\a\\b"), "nothing trusted by default");
@@ -2506,6 +2567,103 @@ static void TestSettings() {
         CHECK(ParseSettings(buf.data(), buf.size()).lastPath.empty(),
               "a path is not written while remembering is off");
 
+        {
+            // The serializer writes only canonical keys, whatever was
+            // pushed into the list.
+            Settings raw;
+            raw.keepCaches = false;
+            raw.trustedShares.push_back("\\\\a\\b\nkeep_caches=1\ncheck_updates=1");
+            SerializeSettings(raw, buf);
+            const Settings rr = ParseSettings(buf.data(), buf.size());
+            CHECK(!rr.keepCaches && rr.trustedShares.empty(),
+                  "a non-canonical entry is dropped, not written");
+        }
+        {
+            // Three spellings of one share are one entry; the cap keeps
+            // the first thirty-two in file order.
+            std::string many = "trusted_share=\\\\A\\B\ntrusted_share=//a/b/\n"
+                               "trusted_share=\\\\?\\UNC\\a\\b\n";
+            Settings three = ParseSettings(
+                reinterpret_cast<const uint8_t*>(many.data()), many.size());
+            CHECK(three.trustedShares.size() == 1, "three spellings, one entry");
+            std::string forty;
+            for (int i = 0; i < 40; ++i) {
+                forty += "trusted_share=\\\\srv\\s" + std::to_string(i) + "\n";
+            }
+            const Settings capped = ParseSettings(
+                reinterpret_cast<const uint8_t*>(forty.data()), forty.size());
+            CHECK(capped.trustedShares.size() == kMaxTrustedShares &&
+                      capped.trustedShares.front() == "\\\\srv\\s0" &&
+                      capped.trustedShares.back() == "\\\\srv\\s31",
+                  "the cap keeps the first entries in file order");
+        }
+        {
+            // Exactly the limit parses whole; one byte over is refused whole.
+            std::string atLimit = "keep_caches=0\n";
+            const std::string tail = "trusted_share=\\\\end\\share\n";
+            while (atLimit.size() + tail.size() < kMaxSettingsBytes) {
+                atLimit += "x=y\n";
+            }
+            while (atLimit.size() + tail.size() > kMaxSettingsBytes) atLimit.pop_back();
+            atLimit += tail;
+            CHECK(atLimit.size() == kMaxSettingsBytes, "built to the byte");
+            const Settings edge = ParseSettings(
+                reinterpret_cast<const uint8_t*>(atLimit.data()), atLimit.size());
+            CHECK(edge.trustedShares.size() == 1 && !edge.keepCaches,
+                  "a file of exactly the limit is read whole");
+            atLimit += "\n";
+            const Settings over = ParseSettings(
+                reinterpret_cast<const uint8_t*>(atLimit.data()), atLimit.size());
+            CHECK(over.trustedShares.empty() && over.keepCaches,
+                  "one byte over is refused whole");
+        }
+        {
+            const std::string longJunk =
+                "x=" + std::string(3000, 'y') + "\ntrusted_share=\\\\ok\\s\n";
+            CHECK(ParseSettings(reinterpret_cast<const uint8_t*>(longJunk.data()),
+                                longJunk.size()).trustedShares.size() == 1,
+                  "an over-long line does not swallow the next");
+            const std::string longKey =
+                "trusted_share=\\\\s\\" + std::string(1010, 'a') + "\n";
+            CHECK(ParseSettings(reinterpret_cast<const uint8_t*>(longKey.data()),
+                                longKey.size()).trustedShares.empty(),
+                  "a key cut by the line cap is refused, never truncated");
+            const std::string bom = "\xEF\xBB\xBFkeep_caches=0\n";
+            CHECK(!ParseSettings(reinterpret_cast<const uint8_t*>(bom.data()),
+                                 bom.size()).keepCaches,
+                  "a byte order mark does not hide the first key");
+            const std::string nul("trusted_share=\\\\a\\b\0\n", 22);
+            CHECK(ParseSettings(reinterpret_cast<const uint8_t*>(nul.data()),
+                                nul.size()).trustedShares.empty(),
+                  "a NUL inside a key is refused");
+        }
+        {
+            Settings worst;
+            for (size_t i = 0; i < kMaxTrustedShares; ++i) {
+                std::wstring k = L"\\\\" + std::to_wstring(i) +
+                                 std::wstring(200, L'\u20ac') + L"\\" +
+                                 std::wstring(kMaxShareKeyChars, L'\u20ac');
+                k.resize(kMaxShareKeyChars);
+                CHECK(TrustShare(worst, k), "a three-byte-per-char key is accepted");
+            }
+            worst.rememberView = true;
+            worst.lastPath     = std::string(1000, 'p');
+            worst.updateSerial = UINT64_MAX;
+            SerializeSettings(worst, buf);
+            CHECK(buf.size() < kMaxSettingsBytes / 2,
+                  "the true worst case leaves half the limit spare");
+            CHECK(ParseSettings(buf.data(), buf.size()).trustedShares.size() ==
+                      kMaxTrustedShares,
+                  "and round-trips whole");
+        }
+        {
+            Settings cu;
+            cu.cleanupOld = true;
+            SerializeSettings(cu, buf);
+            CHECK(ParseSettings(buf.data(), buf.size()).cleanupOld,
+                  "the staged-update flag round-trips");
+            CHECK(!ParseSettings(nullptr, 0).cleanupOld, "and defaults off");
+        }
         const char* ctl = "remember_view=1\nlast_path=D:\\a\tb\n";
         CHECK(ParseSettings(reinterpret_cast<const uint8_t*>(ctl), strlen(ctl))
                   .lastPath.empty(),

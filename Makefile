@@ -47,7 +47,7 @@ LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
             -ladvapi32 -lrstrtmgr \
             -lcomdlg32 -lwinhttp -lbcrypt -luuid -lmpr -lcomctl32 -lcrypt32
 
-.PHONY: all test stress analyze clean dirs icon
+.PHONY: all test test-win stress analyze clean dirs icon
 
 all: dirs $(OUT)
 
@@ -80,6 +80,13 @@ hooks:
 
 hygiene:
 	tools/hygiene.sh
+
+# Windows-side checks, built with the cross compiler. Run natively on the
+# Windows CI job; on a developer box, `wine build/test_win.exe`.
+test-win: dirs
+	$(CXX_WIN) $(CXXFLAGS) -Isrc tests/test_win.cpp src/scan.cpp src/core.cpp \
+	    src/mft.cpp src/ntfs.cpp -o build/test_win.exe \
+	    -static -static-libgcc -static-libstdc++ $(HARDEN_L) $(LIBS)
 
 test:
 	@mkdir -p build

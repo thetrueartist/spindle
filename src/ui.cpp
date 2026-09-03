@@ -165,7 +165,7 @@ constexpr UINT WM_CACHE_READY   = WM_APP + 9;
 
 // A cache this young is served without a revalidating rescan: the launch
 // prefetch (or a scan moments ago) already walked the drive, and walking it
-// again on every click buys nothing but disk noise. F5 always forces one.
+// again on every click buys nothing but disk noise. F5 forces a fresh walk.
 constexpr uint64_t kFreshCacheMs = 5u * 60u * 1000u;
 constexpr UINT_PTR kTimerId = 1;
 constexpr UINT_PTR kSearchTimer = 2;   // debounces the Find results
@@ -180,7 +180,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.9";
+constexpr const wchar_t* kAppVersion = L"2.5.10";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -1138,12 +1138,18 @@ static void ShowStatusNote(const std::wstring& text, uint64_t ms) {
 
 // The launch update check: network and crypto both happen here, off the
 // interface thread, and only a fully verified newer tag is ever posted.
+struct UpdateCheckArgs {
+    HWND     hwnd;
+    uint64_t serial;
+};
+
 unsigned __stdcall UpdateCheckThread(void* param) {
-    HWND hwnd = static_cast<HWND>(param);
+    std::unique_ptr<UpdateCheckArgs> args(
+        static_cast<UpdateCheckArgs*>(param));
+    HWND hwnd = args->hwnd;
     try {
         std::wstring tag;
-        if (CheckForUpdate(kAppVersion, g_app.settings.updateSerial, tag) &&
-            !tag.empty()) {
+        if (CheckForUpdate(kAppVersion, args->serial, tag) && !tag.empty()) {
             auto copy = std::make_unique<std::wstring>(tag);
             if (PostMessageW(hwnd, WM_UPDATE_FOUND, 0,
                              reinterpret_cast<LPARAM>(copy.get()))) {
@@ -1251,10 +1257,7 @@ static bool YieldScanToHunt() {
 // location at all, or a share that is remembered or was agreed to this
 // run. Anything without an identity is never allowed silently.
 static bool ShareAllowed(const NetPlace& np) {
-    if (!np.network) return true;
-    if (np.key.empty()) return false;
-    return ShareTrusted(g_app.settings, np.key) ||
-           g_app.sessionShares.count(np.key) != 0;
+    return ShareAllowedFor(g_app.settings, g_app.sessionShares, np);
 }
 
 static void StartPrefetchNext() {
@@ -1267,11 +1270,15 @@ static void StartPrefetchNext() {
 
     // A queued root is re-checked at the moment it would be read: consent
     // that existed when it was queued may have been forgotten since.
+    // Only an internal disk is ever read in the background: a share or an
+    // external disk that reached the queue is dropped here, whatever
+    // consent it had when queued.
     std::wstring root;
     while (!g_app.prefetchQueue.empty()) {
         std::wstring next = g_app.prefetchQueue.front();
         g_app.prefetchQueue.erase(g_app.prefetchQueue.begin());
-        if (ShareAllowed(ClassifyPath(next, false))) {
+        if (VolumeCacheable(next) &&
+            ShareAllowed(ClassifyPath(next, false))) {
             root = std::move(next);
             break;
         }
@@ -1363,14 +1370,14 @@ static bool ConfirmNetworkScan(const std::wstring& root) {
     cfg.dwFlags    = TDF_ALLOW_DIALOG_CANCELLATION |
                      TDF_POSITION_RELATIVE_TO_WINDOW;
     cfg.pszWindowTitle      = L"Spindle";
-    cfg.pszMainInstruction  = L"Scan a network drive?";
+    cfg.pszMainInstruction  = L"Scan a network location?";
     cfg.pszContent          = content.c_str();
     const TASKDIALOG_BUTTON buttons[] = {{100, L"Scan"}, {101, L"Don't scan"}};
     cfg.pButtons       = buttons;
     cfg.cButtons       = 2;
     cfg.nDefaultButton = 101;
     if (!key.empty()) {
-        cfg.pszVerificationText = L"Remember this drive and don't ask again";
+        cfg.pszVerificationText = L"Remember this share and don't ask again";
     }
     int  pressed  = 0;
     BOOL remember = FALSE;
@@ -1378,7 +1385,7 @@ static bool ConfirmNetworkScan(const std::wstring& root) {
         // No task dialogs here (very old common controls): plain question,
         // nothing remembered.
         pressed = (MessageBoxW(g_app.hwnd, content.c_str(),
-                               L"Scan a network drive?",
+                               L"Scan a network location?",
                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) ==
                    IDYES) ? 100 : 101;
         remember = FALSE;
@@ -1386,8 +1393,15 @@ static bool ConfirmNetworkScan(const std::wstring& root) {
     if (pressed != 100) return false;
     if (!key.empty()) {
         g_app.sessionShares.insert(key);
-        if (remember && TrustShare(g_app.settings, key)) {
-            SaveSettings(g_app.settings);
+        if (remember) {
+            if (TrustShare(g_app.settings, key)) {
+                SaveSettings(g_app.settings);
+            } else {
+                ShowStatusNote(L"Remembered shares are full at " +
+                                   std::to_wstring(kMaxTrustedShares) +
+                                   L"; this answer lasts for this run",
+                               6000);
+            }
         }
     }
     return true;
@@ -4092,6 +4106,10 @@ static void ShowAppMenu(POINT screenPt) {
         case 14:
             g_app.settings.trustedShares.clear();
             g_app.sessionShares.clear();
+            if (g_app.prefetching &&
+                ClassifyPath(g_app.prefetchRoot, false).network) {
+                CancelPrefetch(false);
+            }
             g_app.prefetchQueue.erase(
                 std::remove_if(g_app.prefetchQueue.begin(),
                                g_app.prefetchQueue.end(),
@@ -4160,8 +4178,9 @@ static void ShowAppMenu(POINT screenPt) {
             if (said.empty()) {
                 if (serial > g_app.settings.updateSerial) {
                     g_app.settings.updateSerial = serial;
-                    SaveSettings(g_app.settings);
                 }
+                g_app.settings.cleanupOld = true;   // remove .old next launch
+                SaveSettings(g_app.settings);
                 g_app.updateTag.clear();
                 MessageBoxW(g_app.hwnd,
                             L"Staged. Restart Spindle to finish; the "
@@ -4420,7 +4439,11 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
     }
 
     const std::wstring prompt =
-        L"Recycle this copy?\n\n" + SanitizeForDisplay(path) +
+        (ClassifyPath(path, false).network
+             ? std::wstring(L"Delete this copy permanently? A network "
+                            L"drive has no Recycle Bin.\n\n")
+             : std::wstring(L"Recycle this copy?\n\n")) +
+        SanitizeForDisplay(path) +
         L"\n\nA verified identical copy remains:\n" +
         SanitizeForDisplay(twin);
     if (MessageBoxW(g_app.hwnd, prompt.c_str(), L"Spindle",
@@ -4650,8 +4673,13 @@ static void ShowNodeMenu(const std::wstring& path, uint64_t nodeSize,
             return;
         }
 
+        // A network drive has no Recycle Bin: the shell deletes outright.
+        // The question says which it will be.
+        const bool noBin = ClassifyPath(path, false).network;
         const std::wstring prompt =
-            L"Move this to the Recycle Bin?\n\n" +
+            (noBin ? std::wstring(L"Delete this permanently? A network "
+                                  L"drive has no Recycle Bin.\n\n")
+                   : std::wstring(L"Move this to the Recycle Bin?\n\n")) +
             SanitizeForDisplay(path) + L"\n\n" + FormatSize(nodeSize) +
             (nodeDir ? L" across " + FormatCount(nodeFiles) + L" files"
                      : L"");
@@ -4666,8 +4694,9 @@ static void ShowNodeMenu(const std::wstring& path, uint64_t nodeSize,
         if (nodeDir) {
             const std::wstring again =
                 L"That folder holds " + FormatCount(nodeFiles) +
-                L" files (" + FormatSize(nodeSize) +
-                L").\n\nMove all of it to the Recycle Bin?";
+                L" files (" + FormatSize(nodeSize) + L").\n\n" +
+                (noBin ? L"Delete all of it permanently?"
+                       : L"Move all of it to the Recycle Bin?");
             if (MessageBoxW(g_app.hwnd, again.c_str(), L"Spindle",
                             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) !=
                 IDYES) {
@@ -4793,7 +4822,9 @@ static void OnLeftClick(int x, int y) {
             L".\n\nThe first copy of each set is kept. Every extra is "
             L"verified byte for byte against the kept copy immediately "
             L"before it is recycled; a set that no longer matches is "
-            L"skipped.\n\nEverything goes to the Recycle Bin.";
+            L"skipped.\n\nEverything goes to the Recycle Bin, except a "
+            L"copy on a network drive, which has none and is deleted "
+            L"outright.";
         if (MessageBoxW(g_app.hwnd, ask.c_str(), L"Spindle",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) !=
             IDYES) {
@@ -5250,14 +5281,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.editBrush = CreateSolidBrush(ToColorRef(theme::kSlabHi));
             CreateEditFonts();
 
-            // Finish any staged update, then (only when the feature is
-            // keyed and wanted) ask about a newer one, quietly.
-            CleanupOldUpdate();
+            // Finish a staged update, but only when one was staged: the
+            // executable's folder is otherwise never touched at launch,
+            // which matters when the program runs from a share. Then
+            // (only when the feature is keyed and wanted) ask about a
+            // newer release, quietly.
+            if (g_app.settings.cleanupOld) {
+                CleanupOldUpdate();
+                g_app.settings.cleanupOld = false;
+                SaveSettings(g_app.settings);
+            }
             if (UpdateFeatureEnabled() && g_app.settings.checkUpdates) {
-                const uintptr_t uh = _beginthreadex(
-                    nullptr, 0, UpdateCheckThread, hwnd, 0, nullptr);
+                // The serial travels with the thread rather than being
+                // read from settings the interface thread may be writing.
+                auto* arg = new (std::nothrow) UpdateCheckArgs{
+                    hwnd, g_app.settings.updateSerial};
+                const uintptr_t uh = arg ? _beginthreadex(
+                    nullptr, 0, UpdateCheckThread, arg, 0, nullptr) : 0;
                 if (uh != 0) {
                     g_app.updateWorker = reinterpret_cast<HANDLE>(uh);
+                } else {
+                    delete arg;
                 }
             }
 
@@ -5761,7 +5805,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (static_cast<int>(i) == g_app.selected) {
                     currentAffected = true;
-                } else if (std::find(g_app.prefetchQueue.begin(),
+                } else if (g_app.volumes[i].cacheable &&
+                           std::find(g_app.prefetchQueue.begin(),
                                      g_app.prefetchQueue.end(),
                                      vp) == g_app.prefetchQueue.end()) {
                     g_app.prefetchQueue.insert(g_app.prefetchQueue.begin(),
@@ -6009,9 +6054,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             }
                             CopyTextToClipboard(all);
                         } else if (cmd == 2) {
+                            bool anyNet = false;
+                            for (const std::wstring& p2 : paths) {
+                                if (ClassifyPath(p2, false).network) {
+                                    anyNet = true;
+                                    break;
+                                }
+                            }
                             const std::wstring ask =
-                                L"Move " + FormatCount(paths.size()) +
-                                L" items to the Recycle Bin?\n\n" +
+                                (anyNet ? L"Delete " : L"Move ") +
+                                FormatCount(paths.size()) +
+                                (anyNet ? L" items permanently? A network "
+                                          L"drive has no Recycle Bin.\n\n"
+                                        : L" items to the Recycle Bin?\n\n") +
                                 FormatFiles(files) + L", " +
                                 FormatSize(bytes) + L" in total.";
                             if (MessageBoxW(g_app.hwnd, ask.c_str(),
@@ -6166,7 +6221,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     break;
                 case VK_F5:
-                    if (g_app.selected >= 0) StartScan(g_app.selected);
+                    // A rescan means a walk, not the cache served again;
+                    // and it works wherever the view is.
+                    if (g_app.allDrives) {
+                        StartAllDrives();
+                    } else if (g_app.selected >= 0) {
+                        StartScan(g_app.selected, false);
+                    } else if (g_app.result) {
+                        StartScanPath(g_app.result->root.name, -1, false);
+                    }
                     break;
                 default: break;
             }
@@ -6273,10 +6336,25 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_EXECUTE_HANDLER;
     }
 
-    std::wstring report(path);
-    const size_t slash = report.find_last_of(L'\\');
-    if (slash != std::wstring::npos) report.resize(slash + 1);
-    report += L"spindle-crash.txt";
+    // Under the user's own Local AppData, beside the settings, so the
+    // executable's folder (which may be a share, or read-only) is never
+    // written to; next to the executable only if that folder is missing.
+    std::wstring report;
+    {
+        wchar_t lad[MAX_PATH] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", lad,
+                                                MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            report = std::wstring(lad) + L"\\Spindle";
+            CreateDirectoryW(report.c_str(), nullptr);
+            report += L"\\spindle-crash.txt";
+        } else {
+            report = path;
+            const size_t slash = report.find_last_of(L'\\');
+            if (slash != std::wstring::npos) report.resize(slash + 1);
+            report += L"spindle-crash.txt";
+        }
+    }
 
     const HANDLE f = CreateFileW(report.c_str(), GENERIC_WRITE, 0, nullptr,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
@@ -6332,12 +6410,11 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     }
     CloseHandle(f);
 
-    MessageBoxW(nullptr,
-                L"Spindle hit a fault and has to close.\n\n"
-                L"A report was written to spindle-crash.txt next to the "
-                L"executable. It holds fault addresses only, no file names "
-                L"or paths. Nothing else on disk was changed.",
-                L"Spindle", MB_OK | MB_ICONERROR);
+    const std::wstring told =
+        L"Spindle hit a fault and has to close.\n\nA report was written "
+        L"to:\n" + report + L"\n\nIt holds fault addresses only, no file "
+        L"names or paths. Nothing else on disk was changed.";
+    MessageBoxW(nullptr, told.c_str(), L"Spindle", MB_OK | MB_ICONERROR);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 

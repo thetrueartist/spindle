@@ -5,9 +5,9 @@
 # fixed drive with content, and a folder under dosdevices/unc/nas/share
 # (see HACKING.md). Prints PASS/FAIL per check and exits non-zero on any
 # failure. Dialog button offsets are measured from the dialog's client
-# origin: the Scan and Don't scan buttons sit at (314,127) and (314,160)
-# when the remember box is present and at (230,130) and (314,130) when
-# it is not; the box itself is at (14,127).
+# origin: the Scan and Don't scan buttons sit side by side at (230,127)
+# and (314,127) when the remember box is present, with the box itself at
+# (14,127), and at (230,130) and (314,130) when it is not.
 set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=wine-ui-test.sh
@@ -55,7 +55,7 @@ ui_click 700 400; sleep 0.3; ui_key ctrl+l; sleep 0.5; ui_key ctrl+a; ui_type '\
 echo "9) a UNC path in the address bar asks; tick remember; Scan"
 ui_click 700 400; sleep 0.3; ui_key ctrl+l; sleep 0.5; ui_key ctrl+a; ui_type '\\nas\share\deep'; ui_key Return; sleep 2
 [ "$(windows)" = "2" ] && ok "dialog shown" || bad "no dialog"
-ui_dialog >/dev/null && { dlg_click 14 127; sleep 0.3; dlg_click 314 127; }; sleep 3
+ui_dialog >/dev/null && { dlg_click 14 127; sleep 0.3; dlg_click 230 127; }; sleep 3
 [ "$(windows)" = "1" ] && ok "answered" || bad "dialog still open"
 echo "10) the share is remembered by its own name"
 grep -q 'trusted_share=\\\\nas\\share$' <(tr -d '\r' < "$C/settings.txt") && ok "trusted_share=\\\\nas\\share" || bad "not remembered"
@@ -64,6 +64,11 @@ wine build/spindle.exe --csv "$TMP/o.csv" '\\nas\share' >/dev/null 2>&1; r=$?
 [ $r -ne 3 ] && ok "remembered share not refused" || bad "refused"; rm -f "$TMP/o.csv"
 wine build/spindle.exe --csv "$TMP/o.csv" '\\nas\other' >/dev/null 2>&1; r=$?
 [ $r -eq 3 ] && ok "sibling share refused" || bad "exit=$r"
+echo "11b) a bare object-manager spelling is refused as a path (exit 2)"
+wine build/spindle.exe --csv "$TMP/o.csv" 'UNC\nas\share' >/dev/null 2>&1; r=$?
+[ $r -eq 2 ] && [ ! -f "$TMP/o.csv" ] && ok "refused as a path, nothing written" || bad "exit=$r"
+wine build/spindle.exe --csv "$TMP/o.csv" 'GLOBALROOT\Device\Mup\nas\share' >/dev/null 2>&1; r=$?
+[ $r -eq 2 ] && ok "GLOBALROOT without a prefix refused as a path" || bad "exit=$r"
 echo "12) Forget remembered network drives"
 menu 151; grep -q trusted_share "$C/settings.txt" && bad "still remembered" || ok "cleared"
 echo "13) Keep scan caches off deletes every cache"

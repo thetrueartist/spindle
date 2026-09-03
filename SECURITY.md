@@ -19,8 +19,14 @@ is worth more than a description of it.
 
 - **Scanning never opens the files it scans.** Sizes come from directory
   entries, or from the NTFS Master File Table when the process is
-  elevated. Reparse points are recorded but never traversed.
+  elevated. Reparse points are never traversed: the directory walker
+  leaves junctions and directory symbolic links out of the tree, the MFT
+  path lists them as empty folders, and a file that is a reparse point,
+  such as a cloud placeholder, is listed with its size.
 - **Reading file contents happens in exactly one feature**, the duplicate
+  finder: from the Dupes panel when its button is pressed, in the
+  verification that precedes every recycle of a duplicate, and from the
+  command line when `--duplicates` is given. That is, the duplicate
   finder, and only when the button is pressed. Cloud placeholders are
   excluded and the handle is opened so that a placeholder cannot be
   silently downloaded.
@@ -33,7 +39,9 @@ is worth more than a description of it.
   deletion, taking ownership when an ACL refuses, and ending processes
   that hold the target open through the documented Restart Manager. It
   never touches the registry, never terminates a system process, and
-  asks three separate times.
+  refuses protected paths outright, warns before the permanent deletion,
+  and asks again, naming the processes, before ending anything that holds
+  the target open.
 - **The registry is written by one optional feature**, the Explorer
   folder-menu entry, per user under `HKCU`, and unticking it removes
   exactly the keys ticking it created.
@@ -43,7 +51,8 @@ is worth more than a description of it.
 Every byte that comes off a disk or a network: filenames, sizes, NTFS
 structures, the scan cache, and the update manifest. Parsers validate
 every length, offset and count, bound their allocations and their tree
-depth, and are fuzzed as part of `make test`. Filenames are sanitised
+depth, and the NTFS, cache, settings and share-key parsers are fuzzed as
+part of `make test`. Filenames are sanitised
 before display and before CSV export, and are refused as path components
 if they contain separators, reserved characters or trailing dots and
 spaces.
@@ -51,21 +60,91 @@ spaces.
 Data at rest is kept small and short-lived. Besides settings, the program
 writes the scan cache under `%LOCALAPPDATA%\Spindle`, one file per
 internal fixed disk holding names, sizes and kinds, never file contents.
-Removable media, externally attached disks and network shares are never
-cached, stale caches are removed at launch, and turning caching off
-deletes what exists. Every cache is sealed with DPAPI to the account that
-wrote it, so a copied or imaged cache is unreadable elsewhere; this is not
-a defence against that account or code running as it. Two other files can
-appear next to the executable: a crash report holding fault addresses
-only, never names or paths, and the previous binary for one launch after
-an update you approved. Exports go where you choose. The settings file is
-plain text and holds the remembered shares and, if asked for, the last
-folder. A network share is read only after an explicit
+Removable media, disks on a USB or FireWire bus and network shares are
+never cached; a disk in a Thunderbolt or eSATA enclosure reports as
+internal and is cached like one. Stale caches are removed at launch, and
+turning caching off deletes what exists. Every cache is sealed with DPAPI
+in user scope, so a copied or imaged cache cannot be read without that
+account's Windows credentials; this is not a defence against that
+account, code running as it, or anyone holding its password or the
+domain's DPAPI backup key. A crash writes `spindle-crash.txt` to the same
+folder, holding the exception code, module-relative addresses and the
+names of the Windows DLLs they fall in, never a file name or path from
+any scan. Only an update you approved writes next to the executable: the
+staged download as `spindle.exe.new` while it is applied, and the
+previous binary as `spindle.exe.old` until the next launch. Exports go
+where you choose. The settings file, `%LOCALAPPDATA%\Spindle\settings.txt`,
+is plain text and holds the menu toggles, the highest update serial
+accepted, the remembered shares and, if asked for, the last folder, view
+and panel. A network share is read only after an explicit
 per-share permission, remembered only if asked to be.
+
+## For a deployment reviewer
+
+Behaviour worth knowing before rolling the program out, stated plainly.
+
+- The update check is on by default and runs at every window launch,
+  never in headless mode. It is one HTTPS GET of the latest-release
+  record from `api.github.com`, then the manifest and its signature from
+  the GitHub release hosts, with `User-Agent: Spindle` and nothing else:
+  no version, machine or user identifier. System proxy settings are
+  honoured. To turn it off for a user, untick it in the menu or write
+  `check_updates=0` into their `settings.txt`; there is no registry or
+  Group Policy control. A build with the public key constant emptied
+  never opens a connection.
+- A scheduled `spindle.exe --csv out.csv \\server\share --allow-network`
+  reads the share unattended, and `--duplicates` reads file contents on
+  it. Without the flag, a share is read headlessly only if that user's
+  window already remembers it. Exit codes: 0 success, 1 nothing scanned
+  or file not writable, 2 command line not understood, 3 network location
+  refused. A fault in headless mode still shows a message box.
+- `%LOCALAPPDATA%\Spindle` is created at every window launch, caching on
+  or off, because the settings live there. If that folder is a junction
+  or link rather than a folder, nothing is read from or written to it.
+- A network letter is recognised from the local device table, so a
+  disconnected mapping is still a network location and is never probed
+  to find out. A SUBST letter is never cached and never read unasked; a
+  SUBST of a UNC path is treated as that share. A locked encrypted
+  volume keeps its cache across the launch sweep.
+- Every UNC path is refused by the protected-path check, so recycle,
+  force remove and rename cannot act on a share opened by its UNC path;
+  on a mapped letter all three work, and a network drive has no Recycle
+  Bin, so a recycle there is a permanent delete and the prompt says so.
+- Remembered shares are capped at 32. The list is plain text, so a
+  `trusted_share=` line written by anything running as the user
+  pre-authorises that share; that is the same account that could read
+  the share directly.
+- The duplicate finder opens files with `FILE_FLAG_OPEN_NO_RECALL` and
+  refuses placeholders, links and hardlinks on the handle before reading.
+  Cloud placeholders are recognised at scan time only on the directory
+  walk; hardlinks only on the MFT path.
+- The MFT path is taken only for a whole volume; a folder scan always
+  walks. It opens the volume read-only and reads the raw table, which
+  physically contains the resident data of very small files; nothing
+  beyond names, sizes, flags and parent links is kept or written.
+- Force removal, when elevated, changes the owner to Administrators and
+  adds a full-control entry for Administrators; those changes remain if
+  the delete still fails. Each process it ends is waited on briefly.
+- Double-clicking a file in the list view opens it with its associated
+  program, which for an executable means running it.
+- CSV exports are UTF-8 with a byte order mark; a field beginning with
+  `=`, `+`, `-` or `@` is prefixed with an apostrophe against spreadsheet
+  formula injection, so such a path differs from the real one by that
+  character.
+- The Explorer entry stores the executable's full path in the registry
+  under the current user only, for folders only, and is removed by
+  unticking it. Moving the executable leaves a stale entry until then.
+- CI fetches the ARM64 toolchain by URL without a checksum for a job that
+  is not part of a release. The release workflow is started by hand for a
+  typed tag; the signing job checks the asset byte for byte against the
+  same run's build, while a signing run started by hand for an existing
+  tag signs the asset as published.
 
 ## Updates
 
-Release builds check for updates at launch, which the menu can turn off.
+Every build with the public key embedded, which is every release, checks
+for updates at launch; the check is on by default and the menu turns it
+off for that user.
 An update is accepted only if a manifest signed with the maintainer's
 ECDSA P-256 key vouches for the exact SHA-256 and size of the downloaded
 file, names the release's own tag, and carries a serial newer than the
@@ -99,7 +178,8 @@ write permission in CI, the signing job refuses an asset that is not byte
 for byte what the same run built, and the third-party action the
 workflow uses is pinned to a commit rather than a movable tag.
 
-CodeQL scans the C++ on every push and weekly, building it with the
+CodeQL scans the C++ on every push and pull request to main, and weekly,
+building it with the
 project's own MinGW cross-compile so the analysis sees exactly what
 ships. Secret scanning with push protection is on, so a key can never be
 committed, and the repository accepts private vulnerability reports
