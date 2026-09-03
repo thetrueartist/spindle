@@ -179,7 +179,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.2";
+constexpr const wchar_t* kAppVersion = L"2.5.3";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -390,6 +390,11 @@ struct App {
     std::atomic<uint64_t> prefetchGen{0};
     std::vector<Rect>     panelTabs;
     std::vector<Rect>     rowHits;
+    // The sidebar results list scrolls (Find returns up to 200 hits). The
+    // hit rectangles are only the drawn rows, so this records which result
+    // rowHits[0] refers to; every consumer adds it.
+    size_t                rowHitFirst = 0;
+    float                 panelScroll = 0.0f;
     bool                  panelDirty = true;
 
     std::wstring          query;
@@ -713,6 +718,7 @@ static void DropTreeReferences() {
     g_app.extStats.clear();
     g_app.fileList.clear();
     g_app.rowHits.clear();
+    g_app.rowHitFirst = 0;
     g_app.flashNode = nullptr;   // points into the tree being dropped
     g_app.cellDupe.clear();
     g_app.browseOrder.clear();
@@ -1559,6 +1565,7 @@ static void RebuildTreemap() {
 static void RefreshPanel() {
     g_app.extStats.clear();
     g_app.fileList.clear();
+    g_app.panelScroll = 0.0f;   // new content starts at the top
     if (g_app.trail.empty()) {
         g_app.panelDirty = false;
         return;
@@ -1775,6 +1782,7 @@ static void DrawSidebar(const Rect& area) {
 
     const float rowW = area.w - layout::kPad * 2.0f;
     g_app.rowHits.clear();
+    g_app.rowHitFirst = 0;
     // Cleared every frame and repopulated only by the panel that owns them,
     // or a stale rect from the Dupes tab would keep catching clicks after
     // the user moved to another one.
@@ -2086,10 +2094,46 @@ static void DrawSidebar(const Rect& area) {
         return;
     }
 
-    for (const FileHit& hit : g_app.fileList) {
-        if (y + 34.0f > area.bottom() - layout::kPad) break;
+    // The list scrolls. Find returns up to 200 hits and Largest 40, and
+    // only what fits was reachable before; now the wheel over the sidebar
+    // moves it, a new query or navigation resets it (RefreshPanel), and
+    // the hit rectangles carry the index of the first drawn row so a click
+    // lands on the row it shows. Rows are clipped to the list, so a row
+    // straddling either edge is cut rather than painted over the tabs or
+    // under the panel's edge.
+    constexpr float kRowPitch = 34.0f;
+    const float listTop = y;
+    const float listH   = (area.bottom() - layout::kPad) - listTop;
+    if (listH <= 0.0f) return;
+    const float total =
+        static_cast<float>(g_app.fileList.size()) * kRowPitch;
+    const float maxScroll = std::max(0.0f, total - listH);
+    if (g_app.panelScroll > maxScroll) g_app.panelScroll = maxScroll;
+    if (g_app.panelScroll < 0.0f) g_app.panelScroll = 0.0f;
 
-        const Rect row{area.x + layout::kPad - 4.0f, y, rowW + 8.0f, 32.0f};
+    struct ClipScope {
+        explicit ClipScope(const Rect& r) {
+            g_app.rt->PushAxisAlignedClip(ToD2D(r),
+                                          D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        ~ClipScope() { g_app.rt->PopAxisAlignedClip(); }
+        ClipScope(const ClipScope&) = delete;
+        ClipScope& operator=(const ClipScope&) = delete;
+    } clip(Rect{area.x, listTop, area.w, listH});
+
+    const size_t first =
+        static_cast<size_t>(g_app.panelScroll / kRowPitch);
+    g_app.rowHitFirst = first;
+    for (size_t i = first; i < g_app.fileList.size(); ++i) {
+        const FileHit& hit = g_app.fileList[i];
+        y = listTop + static_cast<float>(i) * kRowPitch - g_app.panelScroll;
+        if (y >= listTop + listH) break;
+
+        Rect row{area.x + layout::kPad - 4.0f, y, rowW + 8.0f, 32.0f};
+        // Clamp the hit rectangle to the visible list on both edges.
+        if (row.y < listTop) { row.h -= (listTop - row.y); row.y = listTop; }
+        if (row.bottom() > listTop + listH) row.h = listTop + listH - row.y;
+        if (row.h < 0.0f) row.h = 0.0f;
         const bool hot = (hit.node == g_app.hoverNode);
         if (hot) FillRound(row, 3.0f, theme::kSlabHi);
         g_app.rowHits.push_back(row);
@@ -2117,7 +2161,15 @@ static void DrawSidebar(const Rect& area) {
                  Rect{area.x + layout::kPad + 11.0f, y + 15.0f,
                       rowW - 11.0f, layout::kLineSmall},
                  theme::kMute, 0.9f, true);
-        y += 34.0f;
+    }
+
+    // A slim thumb when there is more than fits, in the panel's own idiom.
+    if (total > listH) {
+        const float thumbH = std::max(18.0f, listH * (listH / total));
+        const float thumbY =
+            listTop + (listH - thumbH) * (g_app.panelScroll / maxScroll);
+        FillRound(Rect{area.right() - 6.0f, thumbY, 3.0f, thumbH}, 1.5f,
+                  theme::kRule);
     }
 }
 
@@ -4495,8 +4547,9 @@ static void OnMouseMove(int x, int y) {
     g_app.hoverIndex = -1;
 
     for (size_t i = 0; i < g_app.rowHits.size(); ++i) {
-        if (g_app.rowHits[i].contains(fx, fy) && i < g_app.fileList.size()) {
-            g_app.hoverNode = g_app.fileList[i].node;
+        const size_t fi = g_app.rowHitFirst + i;
+        if (g_app.rowHits[i].contains(fx, fy) && fi < g_app.fileList.size()) {
+            g_app.hoverNode = g_app.fileList[fi].node;
             g_app.hoverIndex = -1;
             InvalidateRect(g_app.hwnd, nullptr, FALSE);
             return;
@@ -4824,10 +4877,11 @@ static void OnLeftClick(int x, int y) {
         // trail path already ends in a backslash, and Explorer's /select
         // quietly opens the default folder when handed the doubled
         // separator that produced.
-        if (i >= g_app.fileList.size()) return;
+        const size_t fi = g_app.rowHitFirst + i;
+        if (fi >= g_app.fileList.size()) return;
         {
             std::wstring full = g_app.fileListBase;
-            AppendComponent(full, g_app.fileList[i].path);
+            AppendComponent(full, g_app.fileList[fi].path);
             RevealInExplorer(full);
         }
         return;
@@ -5666,8 +5720,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_MOUSEWHEEL: {
-            if (!g_app.browse) break;
             const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            // The wheel scrolls whatever list is under the pointer: the
+            // sidebar's results when it is over the panel, the browse list
+            // otherwise. Wheel coordinates arrive in screen space.
+            {
+                POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                ScreenToClient(hwnd, &pt);
+                const float inv =
+                    (g_app.dpiScale > 0.0f) ? 1.0f / g_app.dpiScale : 1.0f;
+                const float fx = static_cast<float>(pt.x) * inv;
+                if (fx < layout::kSidebar &&
+                    (g_app.panel == App::Panel::Search ||
+                     g_app.panel == App::Panel::Largest) &&
+                    !g_app.fileList.empty()) {
+                    g_app.panelScroll -= static_cast<float>(delta) /
+                                         WHEEL_DELTA * 34.0f * 3.0f;
+                    if (g_app.panelScroll < 0.0f) g_app.panelScroll = 0.0f;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            if (!g_app.browse) break;
             g_app.browseScroll -=
                 static_cast<float>(delta) / WHEEL_DELTA * browse::kRowH *
                 3.0f;
@@ -5782,7 +5856,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_app.rowHits[i].contains(fx, fy)) {
                     POINT rp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
                     ClientToScreen(hwnd, &rp);
-                    ShowRowMenu(static_cast<int>(i), rp);
+                    ShowRowMenu(static_cast<int>(g_app.rowHitFirst + i), rp);
                     return 0;
                 }
             }

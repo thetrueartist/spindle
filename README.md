@@ -375,7 +375,9 @@ finds the directories worth opening. Kind tokens accept several spellings
 people type what they mean rather than what the enum is called.
 
 Clicking a row in the Kinds panel searches for that extension, so the
-breakdown doubles as a way into the results. An unrecognised token
+breakdown doubles as a way into the results. The Find and Largest lists
+scroll with the mouse wheel when there is more than fits, with a slim
+thumb marking the position. An unrecognised token
 becomes a name term rather than an error.
 
 ## Text rendering
