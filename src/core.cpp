@@ -2154,6 +2154,52 @@ Query ParseQuery(const std::wstring& text) {
     return q;
 }
 
+
+// ---- path completion (pure; the disk enumeration lives in ui.cpp) --------
+
+PathPrefix SplitPathForCompletion(std::wstring text) {
+    PathPrefix p;
+    for (wchar_t& c : text) if (c == L'/') c = L'\\';
+    // "E:Stea" -> "E:\Stea": a drive-relative path names a real place only
+    // once it is rooted.
+    if (text.size() >= 2 && text[1] == L':' &&
+        (text.size() == 2 || text[2] != L'\\')) {
+        text.insert(2, 1, L'\\');
+    }
+    if (text.size() < 3 || text[1] != L':') return p;   // need "X:\..."
+    const size_t slash = text.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return p;
+    p.dir     = text.substr(0, slash + 1);   // keeps the trailing separator
+    p.partial = text.substr(slash + 1);
+    p.ok      = true;
+    return p;
+}
+
+std::wstring ApplyPathCompletion(const std::wstring& dir,
+                                 const std::wstring& partial,
+                                 const std::vector<std::wstring>& dirs,
+                                 const std::vector<std::wstring>& files) {
+    const std::vector<std::wstring>& pool = dirs.empty() ? files : dirs;
+    if (pool.empty()) return std::wstring();
+    if (pool.size() == 1) {
+        std::wstring out = dir + pool[0];
+        if (!dirs.empty()) out += L'\\';   // a folder: ready to tab deeper
+        return out;
+    }
+    // The longest shared prefix, keeping the first match's casing.
+    std::wstring common = pool[0];
+    for (size_t i = 1; i < pool.size(); ++i) {
+        size_t j = 0;
+        while (j < common.size() && j < pool[i].size() &&
+               LowerAscii(common[j]) == LowerAscii(pool[i][j])) {
+            ++j;
+        }
+        common.resize(j);
+    }
+    if (common.size() <= partial.size()) return std::wstring();
+    return dir + common;
+}
+
 bool QueryMatches(const Query& q, const Node& n) {
     if (q.only == Query::Only::Files && n.dir) return false;
     if (q.only == Query::Only::Folders && !n.dir) return false;

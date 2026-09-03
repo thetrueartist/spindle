@@ -704,6 +704,26 @@ struct Query {
 // guesses.
 Query ParseQuery(const std::wstring& text);
 
+// Path completion, split so the pure logic is testable off Windows. Split
+// normalises slashes and the drive-relative form, then divides into the
+// parent directory (with its trailing separator) and the partial leaf.
+struct PathPrefix {
+    std::wstring dir;       // e.g. "E:\" or "E:\Games\"
+    std::wstring partial;   // the leaf being typed, may be empty
+    bool         ok = false;
+};
+PathPrefix SplitPathForCompletion(std::wstring text);
+
+// Given the parent's directory and file names that matched the partial,
+// return the completed full path: a lone match completed whole (a folder
+// gets a trailing separator so the next Tab goes deeper), otherwise the
+// longest shared prefix. Empty when there is nothing to add. Folders are
+// preferred over files, since this drives navigation.
+std::wstring ApplyPathCompletion(const std::wstring& dir,
+                                 const std::wstring& partial,
+                                 const std::vector<std::wstring>& dirs,
+                                 const std::vector<std::wstring>& files);
+
 // Maps a kind: token to a category. Returns false if it names nothing.
 bool CatFromToken(const std::wstring& token, Cat& out);
 

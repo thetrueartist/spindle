@@ -68,7 +68,9 @@ sums what is selected, and a right-click on the selection copies every
 path or recycles the lot behind one confirmation. The breadcrumb doubles
 as an address bar: click the folder you are in, or press Ctrl+L, and type
 or paste a path; Enter goes there on any drive, and a path that names a
-file outlines that file's cell.
+file outlines that file's cell. Tab completes the path against the real
+filesystem, folders first, so "E:\Stea" and Tab becomes "E:\SteamLibrary\"
+ready to keep going.
 
 ![the breadcrumb as an address bar](docs/addressbar.png)
 

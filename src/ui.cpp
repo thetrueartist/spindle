@@ -3638,6 +3638,36 @@ static void EndAddressEdit(bool commit) {
     UpdateWindow(g_app.hwnd);   // the control's pixels must not outlive it
 }
 
+// Tab-completes a typed path against the real filesystem, the way an
+// address bar should: it works for any drive whether or not it has been
+// scanned, and it reflects what is on disk now rather than a cached tree.
+// One directory listing, bounded, on the key press. Returns the completed
+// text when it grew, folders preferred and left ready to tab deeper.
+static bool CompleteAddressPath(std::wstring text, std::wstring& out) {
+    const PathPrefix pfx = SplitPathForCompletion(text);
+    if (!pfx.ok) return false;
+
+    // One directory listing, bounded, matching "partial*". The pure choice
+    // of what to complete to lives in ApplyPathCompletion, host-tested.
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = pfx.dir + pfx.partial + L"*";
+    const HANDLE hf = FindFirstFileW(pattern.c_str(), &fd);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    std::vector<std::wstring> dirs, files;
+    int guard = 0;
+    do {
+        const std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) dirs.push_back(name);
+        else files.push_back(name);
+        if (++guard > 4096) break;   // bound a wildcard over a huge folder
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+
+    out = ApplyPathCompletion(pfx.dir, pfx.partial, dirs, files);
+    return !out.empty() && out != (pfx.dir + pfx.partial);
+}
+
 static LRESULT CALLBACK AddressEditProc(HWND h, UINT msg, WPARAM wp,
                                         LPARAM lp) {
     const WNDPROC prev = reinterpret_cast<WNDPROC>(
@@ -3646,11 +3676,26 @@ static LRESULT CALLBACK AddressEditProc(HWND h, UINT msg, WPARAM wp,
         case WM_KEYDOWN:
             if (wp == VK_RETURN) { EndAddressEdit(true); return 0; }
             if (wp == VK_ESCAPE) { EndAddressEdit(false); return 0; }
+            if (wp == VK_TAB) {
+                wchar_t buf[2048] = {};
+                GetWindowTextW(h, buf, 2047);
+                std::wstring done;
+                if (CompleteAddressPath(buf, done)) {
+                    SetWindowTextW(h, done.c_str());
+                    const int n = static_cast<int>(done.size());
+                    SendMessageW(h, EM_SETSEL, n, n);   // caret to the end
+                } else {
+                    MessageBeep(MB_OK);   // nothing to complete
+                }
+                return 0;
+            }
             break;
         case WM_CHAR:
-            // The control beeps at Enter and Esc otherwise.
-            if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
-            break;
+            // The control beeps at Enter, Esc and Tab otherwise.
+            if (wp == VK_RETURN || wp == VK_ESCAPE || wp == L'\t' ||
+                wp == 9) {
+                return 0;
+            }
         case WM_KILLFOCUS:
             // An address bar abandoned is cancelled, unlike a rename.
             EndAddressEdit(false);

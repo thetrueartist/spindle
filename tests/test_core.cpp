@@ -1134,6 +1134,46 @@ static void TestQueryParsing() {
     CHECK(q.minSize == 0, "overflowing size rejected");
 }
 
+static void TestPathCompletion() {
+    std::printf("path completion\n");
+    using V = std::vector<std::wstring>;
+
+    // Drive-relative input is rooted, then split at the last separator.
+    PathPrefix p = SplitPathForCompletion(L"E:Stea");
+    CHECK(p.ok && p.dir == L"E:\\" && p.partial == L"Stea",
+          "E:Stea splits to E:\\ + Stea");
+    p = SplitPathForCompletion(L"E:/Games/wit");
+    CHECK(p.ok && p.dir == L"E:\\Games\\" && p.partial == L"wit",
+          "forward slashes normalise and split");
+    CHECK(!SplitPathForCompletion(L"just text").ok,
+          "text that is not a path does not split");
+
+    // One folder match completes whole with a trailing separator.
+    CHECK(ApplyPathCompletion(L"E:\\", L"Stea", V{L"SteamLibrary"}, V{}) ==
+              L"E:\\SteamLibrary\\",
+          "a lone folder completes and is ready to tab deeper");
+    // A lone file completes without a trailing separator.
+    CHECK(ApplyPathCompletion(L"E:\\", L"re", V{}, V{L"report.txt"}) ==
+              L"E:\\report.txt",
+          "a lone file completes with no trailing separator");
+    // Folders win over files when both match.
+    CHECK(ApplyPathCompletion(L"E:\\", L"a", V{L"apps"}, V{L"archive.zip"}) ==
+              L"E:\\apps\\",
+          "a folder is preferred over a file");
+    // Several matches complete to the longest shared prefix, case-folded.
+    CHECK(ApplyPathCompletion(L"E:\\", L"Stea",
+                              V{L"SteamLibrary", L"SteamCache", L"steamtmp"},
+                              V{}) == L"E:\\Steam",
+          "many matches complete to the common prefix");
+    // Nothing to add when the partial already is the common prefix.
+    CHECK(ApplyPathCompletion(L"E:\\", L"Steam",
+                              V{L"SteamLibrary", L"SteamCache"}, V{}).empty(),
+          "no growth past the shared prefix returns empty");
+    // No matches, nothing to complete.
+    CHECK(ApplyPathCompletion(L"E:\\", L"zzz", V{}, V{}).empty(),
+          "no matches completes to nothing");
+}
+
 static void TestPathQueries() {
     std::printf("FindMatching: path terms\n");
 
@@ -2263,6 +2303,7 @@ int main() {
     TestQueryParsing();
     TestQueryMatching();
     TestPathQueries();
+    TestPathCompletion();
     FuzzQueries();
     TestCsvExport();
     TestReportsOnHostileTrees();
