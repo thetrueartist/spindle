@@ -1220,13 +1220,15 @@ static void JoinDupeWorker() {
 // and dropped. `requeue` puts the interrupted drive back at the head of the
 // queue - false when whoever is cancelling is about to cover that drive
 // itself.
+// The walk is told to stop and left to finish stopping on its own: the
+// interface thread never waits for it. Its completion note arrives with
+// a stale generation, and that is where the thread is joined and the
+// next background read, if any, is started. Until then no new walk
+// starts, because the handle is still held.
 static void CancelPrefetch(bool requeue) {
     if (g_app.prefetchWorker) {
         g_app.prefetchGen.fetch_add(1);
         g_app.prefetchProgress.cancel.store(true, std::memory_order_relaxed);
-        WaitForSingleObject(g_app.prefetchWorker, INFINITE);
-        CloseHandle(g_app.prefetchWorker);
-        g_app.prefetchWorker = nullptr;
         if (requeue && !g_app.prefetchRoot.empty()) {
             g_app.prefetchQueue.insert(g_app.prefetchQueue.begin(),
                                        g_app.prefetchRoot);
@@ -5709,10 +5711,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_PREFETCH_DONE: {
-            // A cancelled walk was already joined - and its generation
-            // bumped - by whoever cancelled it, so a stale note means
-            // nothing is ours to clean up.
+            // A cancelled walk reports in with a stale generation: it was
+            // not waited for when it was cancelled, so it is joined here,
+            // which costs nothing now that it has finished, and whatever
+            // was queued behind it may start.
             if (static_cast<uint64_t>(wp) != g_app.prefetchGen.load()) {
+                if (g_app.prefetchWorker) {
+                    WaitForSingleObject(g_app.prefetchWorker, INFINITE);
+                    CloseHandle(g_app.prefetchWorker);
+                    g_app.prefetchWorker = nullptr;
+                }
+                StartPrefetchNext();
                 return 0;
             }
             if (g_app.prefetchWorker) {
