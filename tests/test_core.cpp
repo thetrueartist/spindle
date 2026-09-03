@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <cwctype>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -509,6 +510,97 @@ static void FuzzSanitize() {
     std::printf("    20000 random names, %d leaked a filtered codepoint\n",
                 escaped);
     CHECK(escaped == 0, "no filtered codepoint survives sanitisation");
+}
+
+// Random spellings thrown at the share-key code. Every accepted key must
+// be a canonical \\server\share[\deeper]: nothing else may ever be
+// remembered as a share, whatever was typed, and the settings file it
+// lands in must stay within its limit and give it back unchanged.
+static void FuzzShareKeys() {
+    std::printf("Fuzz: NormalizeShareKey\n");
+    std::mt19937_64 rng(20260903);
+    const wchar_t alphabet[] =
+        L"\\/?.:*\"<>| \t\r\n\x7f\x01aAzZ09-_$@#~\u00e4\u0130\u00df";
+    const size_t n = sizeof(alphabet) / sizeof(alphabet[0]) - 1;
+    const std::wstring seeds[] = {
+        L"\\\\?\\UNC\\", L"\\\\?\\GLOBALROOT\\Device\\Mup\\", L"\\\\.\\UNC\\",
+        L"\\\\?\\C:\\", L"\\\\server\\share\\", L"//srv/sh/", L"C:\\", L"Y:#"};
+    auto components = [](const std::wstring& k) {
+        size_t count = 0, pos = 2;
+        while (pos < k.size()) {
+            const size_t sep = k.find(L'\\', pos);
+            const size_t end = (sep == std::wstring::npos) ? k.size() : sep;
+            if (end == pos) return size_t{999};
+            ++count;
+            pos = end + 1;
+        }
+        return count;
+    };
+    size_t accepted = 0;
+    bool   allGood  = true;
+    for (int it = 0; it < 20000; ++it) {
+        std::wstring in;
+        if (rng() % 2) in = seeds[rng() % 8];
+        const size_t len = rng() % 300;
+        for (size_t i = 0; i < len; ++i) in.push_back(alphabet[rng() % n]);
+        const std::wstring k = NormalizeShareKey(in);
+        if (k.empty()) {
+            if (!ShareRootOf(in).empty()) allGood = false;
+            continue;
+        }
+        ++accepted;
+        bool good = k.size() >= 2 && k[0] == L'\\' && k[1] == L'\\' &&
+                    k.size() <= kMaxShareKeyChars && k.back() != L'\\' &&
+                    components(k) >= 2 && components(k) != 999 &&
+                    NormalizeShareKey(k) == k &&
+                    components(ShareRootOf(k)) == 2 &&
+                    k.compare(0, ShareRootOf(k).size(), ShareRootOf(k)) == 0;
+        for (wchar_t c : k) {
+            if (c < 0x20 || c == 0x7F || c == L':' || c == L'*' ||
+                c == L'?' || c == L'"' || c == L'<' || c == L'>' ||
+                c == L'|' || c != static_cast<wchar_t>(towlower(c))) {
+                good = false;
+            }
+        }
+        Settings s;
+        std::vector<uint8_t> buf;
+        if (!TrustShare(s, in)) good = false;
+        SerializeSettings(s, buf);
+        if (buf.size() > kMaxSettingsBytes) good = false;
+        const Settings back = ParseSettings(buf.data(), buf.size());
+        if (back.trustedShares.size() != 1 || !ShareTrusted(back, in) ||
+            ShareTrusted(back, k + L"x")) {
+            good = false;
+        }
+        if (!good) allGood = false;
+    }
+    CHECK(allGood, "every accepted key is canonical and round-trips");
+    CHECK(accepted > 0, "the fuzz reached accepted keys at all");
+
+    // Random settings files: never a crash, never a non-canonical trust.
+    bool parsedGood = true;
+    const char* frag[] = {"trusted_share=", "\\\\", "last_path=",
+                          "keep_caches=", "\n", "\r\n", "=", "?", "\xff",
+                          "\xc3\xa4", "srv\\share", "\\\\?\\GLOBALROOT\\"};
+    for (int it = 0; it < 5000; ++it) {
+        std::string f;
+        const size_t len = rng() % 3000;
+        while (f.size() < len) {
+            if (rng() % 3) f += frag[rng() % 12];
+            else f.push_back(static_cast<char>(rng() % 256));
+        }
+        const Settings s = ParseSettings(
+            reinterpret_cast<const uint8_t*>(f.data()), f.size());
+        if (s.trustedShares.size() > kMaxTrustedShares) parsedGood = false;
+        for (const std::string& t : s.trustedShares) {
+            const std::wstring w = Utf8ToWide(t);
+            if (NormalizeShareKey(w) != w) parsedGood = false;
+        }
+        std::vector<uint8_t> buf;
+        SerializeSettings(s, buf);
+        if (buf.size() > kMaxSettingsBytes) parsedGood = false;
+    }
+    CHECK(parsedGood, "random settings files never yield a non-canonical trust");
 }
 
 static void FuzzTreemap() {
@@ -2598,6 +2690,7 @@ int main() {
     TestExpandedFlagConsistency();
     FuzzSanitize();
     FuzzTreemap();
+    FuzzShareKeys();
     TestScanCache();
     TestSettings();
     TestShareKeys();

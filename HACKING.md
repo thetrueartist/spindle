@@ -462,6 +462,14 @@ trustworthy through that harness, never from an undecorated headless X.
 Where a feature has pure logic behind it, that logic is split into the
 portable files and host-tested; the interface then only wires it up.
 
+`tools/wine-corpo-check.sh` runs the network-permission and cache-policy
+acceptance checks end to end under Wine and prints a PASS/FAIL line per
+check. It wants a prefix with Y: registered as a `network` drive and E:
+as `floppy` under `HKLM\Software\Wine\Drives`, a fixed D: with content,
+and a folder at `dosdevices/unc/nas/share`, which is how Wine spells
+`\\nas\share`. Wine gives a mapped letter no share name, so the checks
+that need a remembered identity use the UNC path.
+
 ## Conventions
 
 - Comments explain why, not what. If a line needs a comment to say what
