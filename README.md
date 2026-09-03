@@ -65,6 +65,14 @@ have had one, is deleted, and turning Keep scan caches off deletes every
 cache rather than merely stopping new ones. The trade-off is that an
 external disk rescans each time it is opened.
 
+Each cache is sealed with Windows data protection (DPAPI) before it
+touches the disk. The key belongs to your Windows account on this
+machine, Windows manages it, and Spindle never stores one. A cache that
+is copied, backed up, imaged or read from another account is unreadable.
+It is not a defence against the account itself or code running as it,
+which can read the drive anyway. Caches from earlier builds were plain;
+they are deleted rather than read, so each drive rescans once.
+
 Network drives are handled the way a company policy would want by
 default. A mapped share is listed, marked `network` on its card, and read
 only after you click it and answer a question that names the share and

@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <winnetwk.h>
 #include <winioctl.h>   // IOCTL_STORAGE_QUERY_PROPERTY: which bus a disk hangs off
+#include <wincrypt.h>   // CryptProtectData: the cache sealed to this account
 #include <process.h>
 #include <shlobj.h>    // SHGetFolderPathW, for the cache directory
 #include <shellapi.h> // SHFileOperationW, for the Recycle Bin
@@ -652,12 +653,37 @@ size_t PruneStaleCaches() {
     SetErrorMode(oldMode);
 
     size_t removed = 0;
-    for (wchar_t letter : CachesToDrop(present, cached)) {
+    const std::vector<wchar_t> drop = CachesToDrop(present, cached);
+    for (wchar_t letter : cached) {
         std::wstring p = dir;
         p += L'\\';
         p += letter;
         p += L".spincache";
-        if (DeleteFileW(p.c_str())) ++removed;
+        bool gone = false;
+        for (wchar_t d : drop) {
+            if (d == letter) { gone = true; break; }
+        }
+        if (!gone) {
+            // Kept, so it must be sealed: a plain listing from an older
+            // build is removed rather than left readable.
+            uint8_t head[kCacheSealHeader] = {};
+            DWORD got = 0;
+            const HANDLE f = CreateFileW(p.c_str(), GENERIC_READ,
+                                         FILE_SHARE_READ, nullptr,
+                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                                         nullptr);
+            if (f == INVALID_HANDLE_VALUE) continue;
+            const bool readOk = ReadFile(f, head, sizeof(head), &got, nullptr);
+            CloseHandle(f);
+            size_t off = 0;
+            // The check needs at least one byte past the header to pass,
+            // so hand it the header plus a stand-in byte.
+            uint8_t probe[kCacheSealHeader + 1] = {};
+            memcpy(probe, head, sizeof(head));
+            gone = !readOk || got < sizeof(head) ||
+                   !SealedCachePayload(probe, sizeof(probe), off);
+        }
+        if (gone && DeleteFileW(p.c_str())) ++removed;
     }
     return removed;
 }
@@ -667,6 +693,51 @@ static uint32_t VolumeSerial(const std::wstring& volumePath) {
     GetVolumeInformationW(volumePath.c_str(), nullptr, 0, &serial, nullptr,
                           nullptr, nullptr, 0);
     return serial;
+}
+
+// The cache sealed to this Windows account with DPAPI. No key of our own:
+// Windows derives it from the account's credentials and keeps it. What
+// this defends against is the file being read anywhere else - a backup,
+// a disk image, another account on the machine, a copied profile. It is
+// no defence against the account itself, which can read the drive anyway.
+static bool SealCache(const std::vector<uint8_t>& plain,
+                      std::vector<uint8_t>& out) {
+    if (plain.empty() || plain.size() > kMaxCacheBytes) return false;
+    DATA_BLOB in{static_cast<DWORD>(plain.size()),
+                 const_cast<BYTE*>(plain.data())};
+    DATA_BLOB enc{};
+    if (!CryptProtectData(&in, L"Spindle scan cache", nullptr, nullptr,
+                          nullptr, CRYPTPROTECT_UI_FORBIDDEN, &enc)) {
+        return false;
+    }
+    out.clear();
+    out.reserve(kCacheSealHeader + enc.cbData);
+    for (uint32_t v : {kCacheSealMagic, kCacheSealVersion}) {
+        out.push_back(static_cast<uint8_t>(v));
+        out.push_back(static_cast<uint8_t>(v >> 8));
+        out.push_back(static_cast<uint8_t>(v >> 16));
+        out.push_back(static_cast<uint8_t>(v >> 24));
+    }
+    out.insert(out.end(), enc.pbData, enc.pbData + enc.cbData);
+    LocalFree(enc.pbData);
+    return true;
+}
+
+static bool UnsealCache(const std::vector<uint8_t>& file,
+                        std::vector<uint8_t>& plain) {
+    size_t off = 0;
+    if (!SealedCachePayload(file.data(), file.size(), off)) return false;
+    DATA_BLOB in{static_cast<DWORD>(file.size() - off),
+                 const_cast<BYTE*>(file.data() + off)};
+    DATA_BLOB dec{};
+    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &dec)) {
+        return false;
+    }
+    plain.assign(dec.pbData, dec.pbData + dec.cbData);
+    SecureZeroMemory(dec.pbData, dec.cbData);
+    LocalFree(dec.pbData);
+    return !plain.empty() && plain.size() <= kMaxCacheBytes;
 }
 
 bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
@@ -713,6 +784,16 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
     }
     CloseHandle(h);
     if (!ok) return false;
+
+    // Sealed to this account, or it is not read: a plain cache from an
+    // older build, or one sealed by another account or machine, goes.
+    std::vector<uint8_t> plain;
+    if (!UnsealCache(bytes, plain)) {
+        DeleteFileW(path.c_str());
+        return false;
+    }
+    bytes.swap(plain);
+    SecureZeroMemory(plain.data(), plain.size());
 
     if (!DeserializeScan(bytes.data(), bytes.size(), out, meta, cancel)) {
         // A cancelled load is not a bad file: leave the cache in place.
@@ -761,8 +842,14 @@ bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
     meta.volumeSerial = VolumeSerial(volumePath);
 
     std::vector<uint8_t> bytes;
-    SerializeScan(res, meta, bytes);
-    if (bytes.empty() || bytes.size() > kMaxCacheBytes) return false;
+    {
+        std::vector<uint8_t> plain;
+        SerializeScan(res, meta, plain);
+        if (plain.empty() || plain.size() > kMaxCacheBytes) return false;
+        if (!SealCache(plain, bytes)) return false;
+        SecureZeroMemory(plain.data(), plain.size());
+    }
+    if (bytes.size() > kMaxCacheBytes) return false;
 
     // Write to a sibling and swap, so a crash mid-write leaves either the
     // old cache or none - never a torn file for the next launch to read.

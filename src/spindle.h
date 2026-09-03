@@ -588,6 +588,18 @@ std::vector<Volume> EnumerateVolumes();
 bool RootIsNetwork(const std::wstring& root);
 std::wstring ShareIdentityForRoot(const std::wstring& root);
 
+// A cache file on disk is a small frame around a Windows data-protection
+// (DPAPI) blob: this magic, a version, then the sealed bytes. The key is
+// the account's own, managed by Windows and never stored by the program,
+// so a copied or imaged cache is unreadable anywhere but this account on
+// this machine. SealedCachePayload checks the frame and returns where the
+// blob starts; a plain cache from an older build fails it and is deleted
+// rather than read.
+inline constexpr uint32_t kCacheSealMagic   = 0x454E5053;   // "SPNE"
+inline constexpr uint32_t kCacheSealVersion = 1;
+inline constexpr size_t   kCacheSealHeader  = 8;
+bool SealedCachePayload(const uint8_t* data, size_t len, size_t& offset);
+
 // Windows-only, scan.cpp. Whether a lettered root may be cached at all
 // (see Volume::cacheable), and the launch sweep that removes any cache
 // file whose drive is gone or should never have had one. Returns how

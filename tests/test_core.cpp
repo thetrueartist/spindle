@@ -2148,6 +2148,38 @@ static void TestUtf8() {
     CHECK(WideToUtf8(L"a\\\\b") == "a\\\\b", "backslashes untouched");
 }
 
+static void TestCacheSeal() {
+    std::printf("Cache seal\n");
+
+    auto frame = [](uint32_t magic, uint32_t version, size_t payload) {
+        std::vector<uint8_t> v;
+        for (uint32_t x : {magic, version}) {
+            v.push_back(static_cast<uint8_t>(x));
+            v.push_back(static_cast<uint8_t>(x >> 8));
+            v.push_back(static_cast<uint8_t>(x >> 16));
+            v.push_back(static_cast<uint8_t>(x >> 24));
+        }
+        v.insert(v.end(), payload, 0xAB);
+        return v;
+    };
+    size_t off = 99;
+    std::vector<uint8_t> good = frame(kCacheSealMagic, kCacheSealVersion, 16);
+    CHECK(SealedCachePayload(good.data(), good.size(), off) &&
+              off == kCacheSealHeader,
+          "a sealed frame is recognised and the blob starts after it");
+    std::vector<uint8_t> empty = frame(kCacheSealMagic, kCacheSealVersion, 0);
+    CHECK(!SealedCachePayload(empty.data(), empty.size(), off),
+          "a frame with no blob is refused");
+    std::vector<uint8_t> plain = frame(0x434E5053u, 2, 16);   // "SPNC", old
+    CHECK(!SealedCachePayload(plain.data(), plain.size(), off),
+          "an older plain cache is not a sealed one");
+    std::vector<uint8_t> future = frame(kCacheSealMagic, 2, 16);
+    CHECK(!SealedCachePayload(future.data(), future.size(), off),
+          "a later seal version is refused rather than guessed at");
+    CHECK(!SealedCachePayload(nullptr, 0, off), "null is refused");
+    CHECK(!SealedCachePayload(good.data(), 7, off), "a short read is refused");
+}
+
 static void TestCachePolicy() {
     std::printf("Cache policy\n");
 
@@ -2450,6 +2482,7 @@ int main() {
     TestSettings();
     TestShareKeys();
     TestCachePolicy();
+    TestCacheSeal();
     TestUtf8();
     TestForceRemovalGuards();
     TestHasher();

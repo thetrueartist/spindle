@@ -2015,6 +2015,21 @@ std::wstring Utf8ToWide(const std::string& u) {
     return out;
 }
 
+bool SealedCachePayload(const uint8_t* data, size_t len, size_t& offset) {
+    offset = 0;
+    if (data == nullptr || len <= kCacheSealHeader) return false;
+    auto u32 = [data](size_t at) {
+        return static_cast<uint32_t>(data[at]) |
+               (static_cast<uint32_t>(data[at + 1]) << 8) |
+               (static_cast<uint32_t>(data[at + 2]) << 16) |
+               (static_cast<uint32_t>(data[at + 3]) << 24);
+    };
+    if (u32(0) != kCacheSealMagic) return false;
+    if (u32(4) != kCacheSealVersion) return false;
+    offset = kCacheSealHeader;
+    return true;
+}
+
 std::vector<wchar_t> CachesToDrop(
     const std::vector<std::pair<wchar_t, int>>& present,
     const std::vector<wchar_t>& cached) {

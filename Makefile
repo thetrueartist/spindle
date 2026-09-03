@@ -45,7 +45,7 @@ LDFLAGS  := -mwindows -static -static-libgcc -static-libstdc++ \
             -Wl,--gc-sections $(HARDEN_L)
 LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
             -ladvapi32 -lrstrtmgr \
-            -lcomdlg32 -lwinhttp -lbcrypt -luuid -lmpr -lcomctl32
+            -lcomdlg32 -lwinhttp -lbcrypt -luuid -lmpr -lcomctl32 -lcrypt32
 
 .PHONY: all test stress analyze clean dirs icon
 
