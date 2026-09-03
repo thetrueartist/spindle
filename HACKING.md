@@ -450,6 +450,18 @@ module-base offset, because a raw address is meaningless under ASLR.
   focus model beyond the search box. That is a real accessibility gap,
   not an oversight to rediscover later.
 
+## Testing the interface under Wine
+
+Logic lives in the portable files and is covered by `make test`. The Win32
+interface is exercised by hand under Wine with `tools/wine-ui-test.sh`,
+which runs a window manager so text boxes receive keyboard focus and reads
+the client origin from xwininfo so clicks land where intended. Both are
+easy to get wrong, and a bare Xvfb silently gets both wrong, so any visual
+claim about a control (does it accept typing, does the font match) is only
+trustworthy through that harness, never from an undecorated headless X.
+Where a feature has pure logic behind it, that logic is split into the
+portable files and host-tested; the interface then only wires it up.
+
 ## Conventions
 
 - Comments explain why, not what. If a line needs a comment to say what

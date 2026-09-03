@@ -179,7 +179,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.3";
+constexpr const wchar_t* kAppVersion = L"2.5.4";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -3696,6 +3696,7 @@ static LRESULT CALLBACK AddressEditProc(HWND h, UINT msg, WPARAM wp,
                 wp == 9) {
                 return 0;
             }
+            break;   // every other character goes to the EDIT to be typed
         case WM_KILLFOCUS:
             // An address bar abandoned is cancelled, unlike a rename.
             EndAddressEdit(false);
