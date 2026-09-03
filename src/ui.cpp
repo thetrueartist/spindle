@@ -181,7 +181,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.13";
+constexpr const wchar_t* kAppVersion = L"2.5.14";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -5186,6 +5186,17 @@ static void OnLeftClick(int x, int y) {
 
     for (const DriveHit& d : g_app.driveHits) {
         if (d.rect.contains(fx, fy)) {
+            // The drive already on screen: back to its root, not a reload
+            // of what is already in memory. F5 is the rescan.
+            if (d.index == g_app.selected && !g_app.allDrives &&
+                g_app.result && !g_app.scanning && !g_app.trail.empty()) {
+                g_app.trail.resize(1);
+                ResetBrowseView();
+                g_app.hoverNode  = nullptr;
+                g_app.hoverIndex = -1;
+                NavigateTo(g_app.trail.back(), g_app.mapBounds);
+                return;
+            }
             StartScan(d.index);
             InvalidateRect(g_app.hwnd, nullptr, FALSE);
             return;

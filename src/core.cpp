@@ -2082,19 +2082,47 @@ std::wstring Utf8ToWide(const std::string& u) {
     return out;
 }
 
+static uint32_t FrameU32(const uint8_t* data, size_t at) {
+    return static_cast<uint32_t>(data[at]) |
+           (static_cast<uint32_t>(data[at + 1]) << 8) |
+           (static_cast<uint32_t>(data[at + 2]) << 16) |
+           (static_cast<uint32_t>(data[at + 3]) << 24);
+}
+
 bool SealedCachePayload(const uint8_t* data, size_t len, size_t& offset) {
     offset = 0;
     if (data == nullptr || len <= kCacheSealHeader) return false;
-    auto u32 = [data](size_t at) {
-        return static_cast<uint32_t>(data[at]) |
-               (static_cast<uint32_t>(data[at + 1]) << 8) |
-               (static_cast<uint32_t>(data[at + 2]) << 16) |
-               (static_cast<uint32_t>(data[at + 3]) << 24);
-    };
-    if (u32(0) != kCacheSealMagic) return false;
-    if (u32(4) != kCacheSealVersion) return false;
+    if (FrameU32(data, 0) != kCacheSealMagic) return false;
+    const uint32_t version = FrameU32(data, 4);
+    if (version != kCacheSealVersion && version != kCacheSealVersionLegacy) {
+        return false;
+    }
     offset = kCacheSealHeader;
     return true;
+}
+
+bool SealedCacheFrame(const uint8_t* data, size_t len, SealedFrame& f) {
+    f = SealedFrame{};
+    size_t off = 0;
+    if (!SealedCachePayload(data, len, off)) return false;
+    if (FrameU32(data, 4) != kCacheSealVersion) return false;
+    if (len < off + 4) return false;
+    const size_t keyLen = FrameU32(data, off);
+    if (keyLen == 0 || keyLen > kCacheSealKeyMax) return false;
+    off += 4;
+    // Every field must fit with at least one byte of ciphertext after it;
+    // sizes are checked before the additions so nothing can wrap.
+    if (len - off <= keyLen) return false;
+    f.keyOff = off;
+    f.keyLen = keyLen;
+    off += keyLen;
+    if (len - off <= kCacheSealNonce + kCacheSealTag) return false;
+    f.nonceOff  = off;
+    off += kCacheSealNonce;
+    f.tagOff    = off;
+    off += kCacheSealTag;
+    f.cipherOff = off;
+    return off < len;
 }
 
 std::vector<wchar_t> CachesToDrop(

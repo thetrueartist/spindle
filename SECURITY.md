@@ -63,9 +63,11 @@ internal fixed disk holding names, sizes and kinds, never file contents.
 Removable media, disks on a USB or FireWire bus and network shares are
 never cached; a disk in a Thunderbolt or eSATA enclosure reports as
 internal and is cached like one. Stale caches are removed at launch, and
-turning caching off deletes what exists. Every cache is sealed with DPAPI
-in user scope, so a copied or imaged cache cannot be read without that
-account's Windows credentials; this is not a defence against that
+turning caching off deletes what exists. Every cache is sealed with a
+per-file random key that DPAPI protects in user scope, the tree itself
+under AES-256-GCM with that key, so a copied or imaged cache cannot be
+read without that account's Windows credentials and any tampering is
+detected; this is not a defence against that
 account, code running as it, or anyone holding its password or the
 domain's DPAPI backup key. A crash writes `spindle-crash.txt` to the same
 folder, holding the exception code, module-relative addresses and the

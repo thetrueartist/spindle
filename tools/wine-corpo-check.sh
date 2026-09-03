@@ -54,9 +54,9 @@ ui_dialog >/dev/null && dlg_click 314 130; sleep 1
 [ "$(windows)" = "1" ] && ok "declined" || bad "dialog still open"
 echo "8) a GLOBALROOT spelling is refused without a dialog"
 ui_click 700 400; sleep 0.3; ui_key ctrl+l; sleep 0.5; ui_key ctrl+a; ui_type '\\?\GLOBALROOT\Device\Mup\s\s'; ui_key Return; sleep 1.5
-[ "$(windows)" = "1" ] && ok "no dialog" || bad "dialog appeared"; ui_key Escape; sleep 0.3
+[ "$(windows)" = "1" ] && ok "no dialog" || bad "dialog appeared"; ui_key Escape; sleep 1.2
 echo "9) a UNC path in the address bar asks; tick remember; Scan"
-ui_click 700 400; sleep 0.3; ui_key ctrl+l; sleep 0.5; ui_key ctrl+a; ui_type '\\nas\share\deep'; ui_key Return; sleep 2
+ui_click 700 400; sleep 0.8; ui_key ctrl+l; sleep 0.8; ui_key ctrl+a; ui_type '\\nas\share\deep'; sleep 0.3; ui_key Return; sleep 3
 [ "$(windows)" = "2" ] && ok "dialog shown" || bad "no dialog"
 ui_dialog >/dev/null && { dlg_click 14 127; sleep 0.3; dlg_click 230 127; }; sleep 3
 [ "$(windows)" = "1" ] && ok "answered" || bad "dialog still open"

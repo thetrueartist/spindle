@@ -632,17 +632,34 @@ NetPlace ClassifyPath(const std::wstring& path, bool resolve);
 bool RootIsNetwork(const std::wstring& root);              // ClassifyPath(root, true)
 std::wstring ShareIdentityForRoot(const std::wstring& root);
 
-// A cache file on disk is a small frame around a Windows data-protection
-// (DPAPI) blob: this magic, a version, then the sealed bytes. The key is
-// the account's own, managed by Windows and never stored by the program,
-// so a copied or imaged cache is unreadable anywhere but this account on
-// this machine. SealedCachePayload checks the frame and returns where the
-// blob starts; a plain cache from an older build fails it and is deleted
-// rather than read.
-inline constexpr uint32_t kCacheSealMagic   = 0x454E5053;   // "SPNE"
-inline constexpr uint32_t kCacheSealVersion = 1;
-inline constexpr size_t   kCacheSealHeader  = 8;
+// A cache file on disk is a small frame around sealed bytes: this magic,
+// a version, then the body. Version 2 is an envelope: a fresh random key
+// protected by Windows data protection (DPAPI), which costs milliseconds
+// for 32 bytes, and the tree itself under AES-256-GCM with that key,
+// in-process and fast. Version 1 sealed the whole tree with DPAPI, which
+// hands every byte to the security subsystem and took seconds on a large
+// drive; it is still read, and rewritten as version 2 at the next save.
+// The key is the account's own, managed by Windows and never stored by
+// the program, so a copied or imaged cache is unreadable anywhere but
+// under that account. A plain cache from an older build fails the frame
+// and is deleted rather than read.
+inline constexpr uint32_t kCacheSealMagic         = 0x454E5053;   // "SPNE"
+inline constexpr uint32_t kCacheSealVersion       = 2;
+inline constexpr uint32_t kCacheSealVersionLegacy = 1;
+inline constexpr size_t   kCacheSealHeader        = 8;
+inline constexpr size_t   kCacheSealKeyMax        = 4096;   // a DPAPI blob of 32 bytes is ~300
+inline constexpr size_t   kCacheSealNonce         = 12;
+inline constexpr size_t   kCacheSealTag           = 16;
+// The frame check: magic, a known version, and at least one byte of body.
+// `offset` is where the version-specific body starts.
 bool SealedCachePayload(const uint8_t* data, size_t len, size_t& offset);
+// The version 2 layout, bounds-checked: offsets into `data` of the
+// protected key, the nonce, the tag and the ciphertext. False for any
+// other version or a frame that does not fit.
+struct SealedFrame {
+    size_t keyOff = 0, keyLen = 0, nonceOff = 0, tagOff = 0, cipherOff = 0;
+};
+bool SealedCacheFrame(const uint8_t* data, size_t len, SealedFrame& f);
 
 // Windows-only, scan.cpp. Whether a lettered root may be cached at all
 // (see Volume::cacheable), and the launch sweep that removes any cache

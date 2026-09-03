@@ -68,9 +68,11 @@ have had one, is deleted, and turning Keep scan caches off deletes every
 cache rather than merely stopping new ones. The trade-off is that an
 external disk rescans each time it is opened.
 
-Each cache is sealed with Windows data protection (DPAPI) before it
-touches the disk. The key belongs to your Windows account, Windows
-manages it, and Spindle never stores one. The cache can be read only by
+Each cache is sealed before it touches the disk: a fresh random key per
+file is protected with Windows data protection (DPAPI), and the tree
+itself is encrypted under that key with AES-256-GCM in the same process,
+which is why sealing costs nothing you can see. The key belongs to your
+Windows account, Windows manages it, and Spindle never stores one. The cache can be read only by
 a process holding that Windows account's DPAPI key: the same account on
 the same machine, or, for a domain account, the same account on another
 machine where Windows has made its key available. A copy, backup or disk

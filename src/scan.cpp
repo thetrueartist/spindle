@@ -19,7 +19,8 @@
 #include <windows.h>
 #include <winnetwk.h>
 #include <winioctl.h>   // IOCTL_STORAGE_QUERY_PROPERTY: which bus a disk hangs off
-#include <wincrypt.h>   // CryptProtectData: the cache sealed to this account
+#include <wincrypt.h>   // CryptProtectData: the cache key sealed to this account
+#include <bcrypt.h>     // AES-GCM for the cache itself, in-process
 #include <process.h>
 #include <shlobj.h>    // SHGetFolderPathW, for the cache directory
 #include <shellapi.h> // SHFileOperationW, for the Recycle Bin
@@ -784,31 +785,106 @@ static uint32_t VolumeSerial(const std::wstring& volumePath) {
     return serial;
 }
 
-// The cache sealed to this Windows account with DPAPI. No key of our own:
-// Windows derives it from the account's credentials and keeps it. What
-// this defends against is the file being read anywhere else - a backup,
-// a disk image, another account on the machine, a copied profile. It is
-// no defence against the account itself, which can read the drive anyway.
+// The cache sealed to this Windows account. A fresh random key per file
+// is protected with DPAPI, which is the right size for DPAPI (it hands
+// its input to the security subsystem, fine for 32 bytes, seconds for a
+// large tree), and the tree itself is encrypted in this process under
+// AES-256-GCM with that key, which runs at memory speed and detects any
+// tampering. No key of the program's own: only Windows, for this
+// account, can recover the file key. What this defends against is the
+// file being read anywhere else - a backup, a disk image, another
+// account, a copied profile. It is no defence against the account
+// itself, which can read the drive anyway.
+namespace {
+struct AesGcm {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    bool Open(const uint8_t* keyBytes, size_t keyLen) {
+        if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
+                &alg, BCRYPT_AES_ALGORITHM, nullptr, 0))) {
+            return false;
+        }
+        if (!BCRYPT_SUCCESS(BCryptSetProperty(
+                alg, BCRYPT_CHAINING_MODE,
+                reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+                sizeof(BCRYPT_CHAIN_MODE_GCM), 0))) {
+            return false;
+        }
+        return BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(
+            alg, &key, nullptr, 0, const_cast<PUCHAR>(keyBytes),
+            static_cast<ULONG>(keyLen), 0));
+    }
+    ~AesGcm() {
+        if (key) BCryptDestroyKey(key);
+        if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    }
+};
+struct KeyWipe {
+    uint8_t* k;
+    size_t   n;
+    ~KeyWipe() { SecureZeroMemory(k, n); }
+};
+}  // namespace
+
 static bool SealCache(const std::vector<uint8_t>& plain,
                       std::vector<uint8_t>& out) {
     if (plain.empty() || plain.size() > kMaxCacheBytes) return false;
-    DATA_BLOB in{static_cast<DWORD>(plain.size()),
-                 const_cast<BYTE*>(plain.data())};
+
+    uint8_t key[32]   = {};
+    uint8_t nonce[kCacheSealNonce] = {};
+    KeyWipe wipe{key, sizeof(key)};
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, key, sizeof(key),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG)) ||
+        !BCRYPT_SUCCESS(BCryptGenRandom(nullptr, nonce, sizeof(nonce),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        return false;
+    }
+
+    // The key, and only the key, through DPAPI.
+    DATA_BLOB in{static_cast<DWORD>(sizeof(key)), key};
     DATA_BLOB enc{};
-    if (!CryptProtectData(&in, L"Spindle scan cache", nullptr, nullptr,
+    if (!CryptProtectData(&in, L"Spindle scan cache key", nullptr, nullptr,
                           nullptr, CRYPTPROTECT_UI_FORBIDDEN, &enc)) {
         return false;
     }
+    std::vector<uint8_t> keyBlob(enc.pbData, enc.pbData + enc.cbData);
+    LocalFree(enc.pbData);
+    if (keyBlob.empty() || keyBlob.size() > kCacheSealKeyMax) return false;
+
+    // The tree under AES-GCM, in this process.
+    AesGcm aes;
+    if (!aes.Open(key, sizeof(key))) return false;
+    std::vector<uint8_t> cipher(plain.size());
+    uint8_t tag[kCacheSealTag] = {};
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = nonce;
+    info.cbNonce = static_cast<ULONG>(sizeof(nonce));
+    info.pbTag   = tag;
+    info.cbTag   = static_cast<ULONG>(sizeof(tag));
+    ULONG got = 0;
+    if (!BCRYPT_SUCCESS(BCryptEncrypt(
+            aes.key, const_cast<PUCHAR>(plain.data()),
+            static_cast<ULONG>(plain.size()), &info, nullptr, 0,
+            cipher.data(), static_cast<ULONG>(cipher.size()), &got, 0)) ||
+        got != plain.size()) {
+        return false;
+    }
+
     out.clear();
-    out.reserve(kCacheSealHeader + enc.cbData);
-    for (uint32_t v : {kCacheSealMagic, kCacheSealVersion}) {
+    out.reserve(kCacheSealHeader + 4 + keyBlob.size() + sizeof(nonce) +
+                sizeof(tag) + cipher.size());
+    for (uint32_t v : {kCacheSealMagic, kCacheSealVersion,
+                       static_cast<uint32_t>(keyBlob.size())}) {
         out.push_back(static_cast<uint8_t>(v));
         out.push_back(static_cast<uint8_t>(v >> 8));
         out.push_back(static_cast<uint8_t>(v >> 16));
         out.push_back(static_cast<uint8_t>(v >> 24));
     }
-    out.insert(out.end(), enc.pbData, enc.pbData + enc.cbData);
-    LocalFree(enc.pbData);
+    out.insert(out.end(), keyBlob.begin(), keyBlob.end());
+    out.insert(out.end(), nonce, nonce + sizeof(nonce));
+    out.insert(out.end(), tag, tag + sizeof(tag));
+    out.insert(out.end(), cipher.begin(), cipher.end());
     return true;
 }
 
@@ -816,17 +892,62 @@ static bool UnsealCache(const std::vector<uint8_t>& file,
                         std::vector<uint8_t>& plain) {
     size_t off = 0;
     if (!SealedCachePayload(file.data(), file.size(), off)) return false;
-    DATA_BLOB in{static_cast<DWORD>(file.size() - off),
-                 const_cast<BYTE*>(file.data() + off)};
+
+    SealedFrame f;
+    if (!SealedCacheFrame(file.data(), file.size(), f)) {
+        // Version 1: the whole tree through DPAPI. Read once more, so an
+        // upgrade does not cost a rescan; the next save writes version 2.
+        DATA_BLOB in{static_cast<DWORD>(file.size() - off),
+                     const_cast<BYTE*>(file.data() + off)};
+        DATA_BLOB dec{};
+        if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
+                                CRYPTPROTECT_UI_FORBIDDEN, &dec)) {
+            return false;
+        }
+        plain.assign(dec.pbData, dec.pbData + dec.cbData);
+        SecureZeroMemory(dec.pbData, dec.cbData);
+        LocalFree(dec.pbData);
+        return !plain.empty() && plain.size() <= kMaxCacheBytes;
+    }
+
+    // Version 2: the key back through DPAPI, then the tree in-process.
+    DATA_BLOB in{static_cast<DWORD>(f.keyLen),
+                 const_cast<BYTE*>(file.data() + f.keyOff)};
     DATA_BLOB dec{};
     if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
                             CRYPTPROTECT_UI_FORBIDDEN, &dec)) {
         return false;
     }
-    plain.assign(dec.pbData, dec.pbData + dec.cbData);
+    uint8_t key[32] = {};
+    KeyWipe wipe{key, sizeof(key)};
+    const bool keyOk = dec.cbData == sizeof(key);
+    if (keyOk) memcpy(key, dec.pbData, sizeof(key));
     SecureZeroMemory(dec.pbData, dec.cbData);
     LocalFree(dec.pbData);
-    return !plain.empty() && plain.size() <= kMaxCacheBytes;
+    if (!keyOk) return false;
+
+    const size_t cipherLen = file.size() - f.cipherOff;
+    if (cipherLen == 0 || cipherLen > kMaxCacheBytes) return false;
+    AesGcm aes;
+    if (!aes.Open(key, sizeof(key))) return false;
+    plain.assign(cipherLen, 0);
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = const_cast<PUCHAR>(file.data() + f.nonceOff);
+    info.cbNonce = static_cast<ULONG>(kCacheSealNonce);
+    info.pbTag   = const_cast<PUCHAR>(file.data() + f.tagOff);
+    info.cbTag   = static_cast<ULONG>(kCacheSealTag);
+    ULONG got = 0;
+    if (!BCRYPT_SUCCESS(BCryptDecrypt(
+            aes.key, const_cast<PUCHAR>(file.data() + f.cipherOff),
+            static_cast<ULONG>(cipherLen), &info, nullptr, 0, plain.data(),
+            static_cast<ULONG>(plain.size()), &got, 0)) ||
+        got != cipherLen) {
+        SecureZeroMemory(plain.data(), plain.size());
+        plain.clear();
+        return false;
+    }
+    return true;
 }
 
 bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,

@@ -2286,33 +2286,79 @@ static void TestUtf8() {
 static void TestCacheSeal() {
     std::printf("Cache seal\n");
 
-    auto frame = [](uint32_t magic, uint32_t version, size_t payload) {
+    auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back(static_cast<uint8_t>(x));
+        v.push_back(static_cast<uint8_t>(x >> 8));
+        v.push_back(static_cast<uint8_t>(x >> 16));
+        v.push_back(static_cast<uint8_t>(x >> 24));
+    };
+    auto frame1 = [&put32](uint32_t magic, uint32_t version, size_t payload) {
         std::vector<uint8_t> v;
-        for (uint32_t x : {magic, version}) {
-            v.push_back(static_cast<uint8_t>(x));
-            v.push_back(static_cast<uint8_t>(x >> 8));
-            v.push_back(static_cast<uint8_t>(x >> 16));
-            v.push_back(static_cast<uint8_t>(x >> 24));
-        }
+        put32(v, magic);
+        put32(v, version);
         v.insert(v.end(), payload, 0xAB);
         return v;
     };
+    auto frame2 = [&put32](size_t keyLen, size_t cipher) {
+        std::vector<uint8_t> v;
+        put32(v, kCacheSealMagic);
+        put32(v, kCacheSealVersion);
+        put32(v, static_cast<uint32_t>(keyLen));
+        v.insert(v.end(), keyLen, 0x11);
+        v.insert(v.end(), kCacheSealNonce, 0x22);
+        v.insert(v.end(), kCacheSealTag, 0x33);
+        v.insert(v.end(), cipher, 0x44);
+        return v;
+    };
     size_t off = 99;
-    std::vector<uint8_t> good = frame(kCacheSealMagic, kCacheSealVersion, 16);
-    CHECK(SealedCachePayload(good.data(), good.size(), off) &&
-              off == kCacheSealHeader,
-          "a sealed frame is recognised and the blob starts after it");
-    std::vector<uint8_t> empty = frame(kCacheSealMagic, kCacheSealVersion, 0);
-    CHECK(!SealedCachePayload(empty.data(), empty.size(), off),
-          "a frame with no blob is refused");
-    std::vector<uint8_t> plain = frame(0x434E5053u, 2, 16);   // "SPNC", old
+    const std::vector<uint8_t> legacy = frame1(kCacheSealMagic, kCacheSealVersionLegacy, 16);
+    CHECK(SealedCachePayload(legacy.data(), legacy.size(), off) && off == kCacheSealHeader,
+          "a version 1 frame is still recognised");
+    SealedFrame f;
+    CHECK(!SealedCacheFrame(legacy.data(), legacy.size(), f),
+          "but it has no version 2 layout");
+    const std::vector<uint8_t> good = frame2(300, 64);
+    CHECK(SealedCachePayload(good.data(), good.size(), off) && off == kCacheSealHeader,
+          "a version 2 frame is recognised");
+    CHECK(SealedCacheFrame(good.data(), good.size(), f) && f.keyOff == 12 &&
+              f.keyLen == 300 && f.nonceOff == 312 && f.tagOff == 324 &&
+              f.cipherOff == 340,
+          "and its fields are where they should be");
+    const std::vector<uint8_t> empty1 = frame1(kCacheSealMagic, kCacheSealVersionLegacy, 0);
+    CHECK(!SealedCachePayload(empty1.data(), empty1.size(), off),
+          "a frame with no body is refused");
+    const std::vector<uint8_t> plain = frame1(0x434E5053u, 2, 16);   // "SPNC", old
     CHECK(!SealedCachePayload(plain.data(), plain.size(), off),
           "an older plain cache is not a sealed one");
-    std::vector<uint8_t> future = frame(kCacheSealMagic, 2, 16);
+    const std::vector<uint8_t> future = frame1(kCacheSealMagic, 3, 16);
     CHECK(!SealedCachePayload(future.data(), future.size(), off),
           "a later seal version is refused rather than guessed at");
     CHECK(!SealedCachePayload(nullptr, 0, off), "null is refused");
     CHECK(!SealedCachePayload(good.data(), 7, off), "a short read is refused");
+    const std::vector<uint8_t> noCipher = frame2(300, 0);
+    CHECK(!SealedCacheFrame(noCipher.data(), noCipher.size(), f),
+          "version 2 needs at least one byte of ciphertext");
+    const std::vector<uint8_t> hugeKey = frame2(kCacheSealKeyMax + 1, 64);
+    CHECK(!SealedCacheFrame(hugeKey.data(), hugeKey.size(), f),
+          "an oversize key blob is refused");
+    std::vector<uint8_t> shortKey = frame2(300, 64);
+    shortKey.resize(12 + 100);   // claims 300 key bytes, has 100
+    CHECK(!SealedCacheFrame(shortKey.data(), shortKey.size(), f),
+          "a key length past the end is refused");
+    std::vector<uint8_t> zeroKey = frame2(1, 64);
+    zeroKey[8] = zeroKey[9] = zeroKey[10] = zeroKey[11] = 0;
+    CHECK(!SealedCacheFrame(zeroKey.data(), zeroKey.size(), f),
+          "a zero-length key is refused");
+    // A prefix that ends before the ciphertext begins is refused. A cut
+    // inside the ciphertext still parses, since the frame cannot know the
+    // ciphertext's length; the authentication tag catches that later.
+    bool prefixes = true;
+    for (size_t n = 0; n <= 340; ++n) {
+        if (SealedCacheFrame(good.data(), n, f)) { prefixes = false; break; }
+    }
+    CHECK(prefixes, "no frame cut before its ciphertext parses");
+    CHECK(SealedCacheFrame(good.data(), 341, f) && f.cipherOff == 340,
+          "one byte of ciphertext is enough for the frame");
 }
 
 static void TestCachePolicy() {
