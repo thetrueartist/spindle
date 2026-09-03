@@ -357,6 +357,7 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
     // because the answer is the same either way.
     // The table describes the whole volume, so it answers only for a
     // volume root; a folder scan walks, and sees only that folder.
+    if (progress) progress->phase.store(0, std::memory_order_relaxed);
     if (IsVolumeRootPath(root) && ScanMft(root, progress, result)) {
         if (!(progress && progress->cancel.load(std::memory_order_relaxed))) {
             RollUp(result.root);
@@ -371,6 +372,9 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
         if (progress) progress->done.store(true, std::memory_order_release);
         return result;
     }
+    // The table path may have begun and given up (a read failure, or a
+    // cancel); the walk that follows counts files, so the phase is idle.
+    if (progress) progress->phase.store(0, std::memory_order_relaxed);
 
     // Cancelled during the MFT build: return the partial result, which the
     // caller drops by generation, rather than starting a whole walk.

@@ -181,7 +181,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.12";
+constexpr const wchar_t* kAppVersion = L"2.5.13";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -821,12 +821,14 @@ unsigned __stdcall ScanThread(void* param) {
             auto cached = std::make_unique<ScanResult>();
             CacheMeta cm;
             bool loaded = false;
+            req->progress->phase.store(3, std::memory_order_relaxed);
             try {
                 loaded = LoadScanCache(req->root, *cached, cm,
                                        &req->progress->cancel);
             } catch (...) {
                 loaded = false;
             }
+            req->progress->phase.store(0, std::memory_order_relaxed);
             if (req->progress->cancel.load(std::memory_order_relaxed)) {
                 return 0;   // superseded before it finished; drop silently
             }
@@ -1567,6 +1569,8 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
     g_app.progress.files.store(0);
     g_app.progress.dirs.store(0);
     g_app.progress.bytes.store(0);
+    g_app.progress.phase.store(0);
+    g_app.progress.tableBytes.store(0);
     g_app.progress.cancel.store(false);
     g_app.progress.done.store(false);
     g_app.scanning = true;
@@ -3021,6 +3025,22 @@ static void DrawCell(const Cell& c, const Rect& r, bool hovered,
     }
 }
 
+// The worker's phase in words, for the moments when the counters are
+// silent: the whole file table is read before a file is counted, and a
+// cache is unsealed and parsed before anything can be shown.
+static std::wstring PhaseText(const Progress& p) {
+    switch (p.phase.load(std::memory_order_relaxed)) {
+        case 1: {
+            const uint64_t t = p.tableBytes.load(std::memory_order_relaxed);
+            return t > 0 ? L"Reading the file table  \u00B7  " + FormatSize(t)
+                         : std::wstring(L"Reading the file table");
+        }
+        case 2:  return L"Building the map";
+        case 3:  return L"Loading the cached map";
+        default: return {};
+    }
+}
+
 static void DrawTreemap(const Rect& area) {
     FillRect(area, theme::kInk);
 
@@ -3038,6 +3058,7 @@ static void DrawTreemap(const Rect& area) {
                  g_app.fmtHead.get(), centre, theme::kType, 1.0f, false,
                  DWRITE_TEXT_ALIGNMENT_CENTER);
         std::wstring sub = g_app.scanNote;
+        if (sub.empty()) sub = PhaseText(g_app.progress);
         if (f > 0 || b > 0) {
             if (!sub.empty()) sub += L"  \u00B7  ";
             sub += FormatFiles(f) + L"  \u00B7  " + FormatSize(b);
@@ -3262,9 +3283,10 @@ static void DrawStatus(const Rect& area) {
         const ScanStats& s = g_app.result->stats;
         std::wstring line = L"cached " + FormatAge(g_app.cacheSavedMs);
         if (g_app.scanning) {
-            line += L"  \u00B7  " + (g_app.scanNote.empty()
-                                        ? std::wstring(L"rescanning\u2026")
-                                        : g_app.scanNote);
+            std::wstring doing = g_app.scanNote;
+            if (doing.empty()) doing = PhaseText(g_app.progress);
+            if (doing.empty()) doing = L"rescanning\u2026";
+            line += L"  \u00B7  " + doing;
         }
         line += L"  \u00B7  " + FormatFiles(s.fileCount) + L"  \u00B7  " +
                 FormatSize(s.bytes);

@@ -399,6 +399,13 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
 
     size_t issued = 0;   // segments handed to the disk so far
 
+    // The window can only report what it is told: the table is read whole
+    // before any file is counted, so say so, with the bytes as they land.
+    if (progress) {
+        progress->tableBytes.store(0, std::memory_order_relaxed);
+        progress->phase.store(1, std::memory_order_relaxed);
+    }
+
     for (size_t s = 0; s < segments.size(); ++s) {
         if (progress && progress->cancel.load(std::memory_order_relaxed)) {
             return false;   // AsyncRead destructors drain in-flight I/O
@@ -424,6 +431,10 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         }
 
         const Segment& seg = segments[s];
+        if (ok && progress) {
+            progress->tableBytes.fetch_add(seg.bytes,
+                                           std::memory_order_relaxed);
+        }
         if (!ok) {
             // A bad sector mid-table is not fatal: skip the chunk and keep
             // going. The result is incomplete, not wrong.
@@ -497,6 +508,7 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
             progress->files.store(files, std::memory_order_relaxed);
             progress->dirs.store(dirs, std::memory_order_relaxed);
             progress->bytes.store(bytes, std::memory_order_relaxed);
+            progress->phase.store(2, std::memory_order_relaxed);
         }
     }
 
@@ -647,6 +659,7 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         out.stats = ScanStats{};
         return false;
     }
+    if (progress) progress->phase.store(0, std::memory_order_relaxed);
     return true;
 }
 

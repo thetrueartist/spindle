@@ -572,6 +572,14 @@ struct Progress {
     std::atomic<uint64_t> bytes{0};
     std::atomic<bool>     cancel{false};
     std::atomic<bool>     done{false};
+    // What the worker is doing when the counters cannot say: the file
+    // table is read whole before a single file is counted, and a cache is
+    // unsealed and parsed before anything is shown. Without this the
+    // window said "Scanning" over both, which read as a stuck rescan.
+    // 0 walking or idle, 1 reading the file table, 2 building the tree
+    // from it, 3 loading the cached map.
+    std::atomic<uint32_t> phase{0};
+    std::atomic<uint64_t> tableBytes{0};   // of the file table read so far
 };
 
 // Walk `root` and return the aggregated tree. Reparse points are never
