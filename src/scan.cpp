@@ -17,6 +17,7 @@
 #endif
 
 #include <windows.h>
+#include <winnetwk.h>
 #include <process.h>
 #include <shlobj.h>    // SHGetFolderPathW, for the cache directory
 #include <shellapi.h> // SHFileOperationW, for the Recycle Bin
@@ -455,7 +456,8 @@ std::vector<Volume> EnumerateVolumes() {
         }
 
         Volume v;
-        v.fixed = (type == DRIVE_FIXED);
+        v.fixed  = (type == DRIVE_FIXED);
+        v.remote = (type == DRIVE_REMOTE);
         v.path = rootPath;
 
         wchar_t label[MAX_PATH + 1] = {};
@@ -1816,6 +1818,43 @@ ForceRemoveResult ForceRemove(const std::wstring& path,
 }
 
 std::wstring CacheDirPath() { return CacheDir(); }
+
+bool RootIsNetwork(const std::wstring& root) {
+    if (root.size() >= 2 && root[0] == L'\\' && root[1] == L'\\') return true;
+    if (root.size() < 2 || root[1] != L':') return false;
+    const wchar_t r3[4] = {root[0], L':', L'\\', 0};
+    return GetDriveTypeW(r3) == DRIVE_REMOTE;
+}
+
+std::wstring ShareIdentityForRoot(const std::wstring& root) {
+    if (root.size() >= 2 && root[0] == L'\\' && root[1] == L'\\') {
+        return NormalizeShareKey(root);
+    }
+    if (root.size() < 2 || root[1] != L':') return {};
+
+    // A mapped letter knows the share it points at; remember that, not
+    // the letter, so Y: remapped to a different server asks again.
+    const wchar_t local[3] = {root[0], L':', 0};
+    wchar_t remote[1024] = {};
+    DWORD len = 1024;
+    if (WNetGetConnectionW(local, remote, &len) == NO_ERROR &&
+        remote[0] != 0) {
+        const std::wstring key = NormalizeShareKey(remote);
+        if (!key.empty()) return key;
+    }
+
+    // No name to go by: the letter and the volume's serial together.
+    const wchar_t r3[4] = {root[0], L':', L'\\', 0};
+    DWORD serial = 0;
+    if (!GetVolumeInformationW(r3, nullptr, 0, &serial, nullptr, nullptr,
+                               nullptr, 0)) {
+        return {};
+    }
+    wchar_t buf[24] = {};
+    swprintf(buf, 24, L"%c:#%08lx", static_cast<wchar_t>(towlower(root[0])),
+             static_cast<unsigned long>(serial));
+    return NormalizeShareKey(buf);
+}
 
 // ----------------------------------------------------- shell integration
 //

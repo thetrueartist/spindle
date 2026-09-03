@@ -501,13 +501,36 @@ struct Settings {
     std::string lastPath;         // UTF-8 folder path to reopen
     bool lastBrowse     = false;  // list view rather than the map
     int  lastPanel      = 0;      // which side panel was open
+    // Network shares the person has agreed to read, remembered by their
+    // own identity (\\server\share, normalised) rather than by drive
+    // letter, so a letter mapped somewhere else later asks afresh. A
+    // mapping with no name falls back to letter plus volume serial.
+    std::vector<std::string> trustedShares;   // UTF-8, normalised
     // Highest signed manifest serial ever accepted. Anti-replay: a
     // genuine but superseded release carries a lower serial and is
     // refused, so nobody can be pinned on an old signed version.
     uint64_t updateSerial = 0;
 };
 
-inline constexpr size_t kMaxSettingsBytes = 4096;
+// Room for the trusted share list at its cap; the parser refuses anything
+// larger outright rather than reading a prefix.
+inline constexpr size_t kMaxSettingsBytes  = 16384;
+inline constexpr size_t kMaxTrustedShares  = 32;
+inline constexpr size_t kMaxShareKeyChars  = 260;
+
+// Portable share identity handling, host-tested. A key is either a UNC
+// path (\\server\share[\deeper]) or a lettered fallback (y:#serial).
+// NormalizeShareKey returns the canonical lowercase form, or empty when
+// the input is not a share identity at all.
+// UTF-8 both ways, portable (wchar_t is 16-bit on Windows and 32-bit on
+// the host, so this works in code points and handles surrogate pairs).
+// Malformed input is replaced with U+FFFD rather than dropped or trusted.
+std::string  WideToUtf8(const std::wstring& w);
+std::wstring Utf8ToWide(const std::string& u);
+std::wstring NormalizeShareKey(std::wstring s);
+bool ShareTrusted(const Settings& s, const std::wstring& key);
+// Adds a normalised key; false when invalid or the list is at its cap.
+bool TrustShare(Settings& s, const std::wstring& key);
 
 Settings ParseSettings(const uint8_t* data, size_t len);
 void SerializeSettings(const Settings& s, std::vector<uint8_t>& out);
@@ -551,9 +574,15 @@ struct Volume {
     uint64_t     free     = 0;
     bool         ready    = false;
     bool         fixed    = false;  // DRIVE_FIXED: safe to read unprompted
+    bool         remote   = false;  // DRIVE_REMOTE: read only with permission
 };
 
 std::vector<Volume> EnumerateVolumes();
+
+// Windows-only, scan.cpp. Whether a scan root is a network location, and
+// the identity to remember permission under (empty when unknowable).
+bool RootIsNetwork(const std::wstring& root);
+std::wstring ShareIdentityForRoot(const std::wstring& root);
 
 // ------------------------------------------------------------------ treemap
 

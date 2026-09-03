@@ -14,6 +14,7 @@
 #endif
 
 #include <windows.h>
+#include <commctrl.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
@@ -179,7 +180,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.4";
+constexpr const wchar_t* kAppVersion = L"2.5.5";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -302,6 +303,8 @@ struct App {
     // startup instead of the remembered drive, and the way a UNC share is
     // reached at all, since only lettered volumes are enumerated.
     std::wstring          startPath;
+    // Network shares agreed to for this run only (no remember tick).
+    std::unordered_set<std::wstring> sessionShares;
     size_t                crumbFirst = 0;   // trail index of crumbHits[0]
 
     // Side panel. Every comparable tool carries these two views next to the
@@ -484,30 +487,6 @@ static std::wstring TrailPath(const std::vector<const Node*>& trail) {
 }
 
 static void EndAddressEdit(bool commit);
-
-// The settings file is UTF-8; paths are wide. These convert at that
-// boundary so a remembered folder with non-ASCII characters survives.
-static std::string WideToUtf8(const std::wstring& w) {
-    if (w.empty()) return std::string();
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
-                                      static_cast<int>(w.size()),
-                                      nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return std::string();
-    std::string out(static_cast<size_t>(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
-                        out.data(), n, nullptr, nullptr);
-    return out;
-}
-static std::wstring Utf8ToWide(const std::string& u) {
-    if (u.empty()) return std::wstring();
-    const int n = MultiByteToWideChar(CP_UTF8, 0, u.c_str(),
-                                      static_cast<int>(u.size()), nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring out(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, u.c_str(), static_cast<int>(u.size()),
-                        out.data(), n);
-    return out;
-}
 
 // Capture the current place into settings, for "remember where I was".
 static void RememberCurrentView() {
@@ -1335,9 +1314,71 @@ static void QueueLaunchPrefetch(const std::wstring& excludeRoot) {
     StartPrefetchNext();
 }
 
+// A network drive is read only with permission. Fixed and removable
+// drives are the person's own and a click is consent; a share belongs to
+// someone else and reading every name on it puts load on their server, so
+// it is asked about once, and remembered only when the box is ticked. The
+// identity remembered is the share itself, not the letter, so a letter
+// mapped elsewhere later asks afresh. Nothing at launch ever reaches here
+// for a share: resume and prefetch skip them before asking.
+static bool ConfirmNetworkScan(const std::wstring& root) {
+    if (!RootIsNetwork(root)) return true;
+    const std::wstring key = ShareIdentityForRoot(root);
+    if (!key.empty()) {
+        if (ShareTrusted(g_app.settings, key)) return true;
+        if (g_app.sessionShares.count(key) != 0) return true;
+    }
+
+    std::wstring content = SanitizeForDisplay(root);
+    if (content.size() == 3 && content[1] == L':') content.resize(2);
+    content += L" is a network drive";
+    if (!key.empty() && key.size() > 2 && key[0] == L'\\' && key[1] == L'\\') {
+        content += L" (" + SanitizeForDisplay(key) + L")";
+    }
+    content += L".\n\nSpindle will read every folder and file name on it, "
+               L"which can take a while and puts load on the server. "
+               L"Nothing on the drive is changed.";
+
+    TASKDIALOGCONFIG cfg{};
+    cfg.cbSize     = sizeof(cfg);
+    cfg.hwndParent = g_app.hwnd;
+    cfg.dwFlags    = TDF_ALLOW_DIALOG_CANCELLATION |
+                     TDF_POSITION_RELATIVE_TO_WINDOW;
+    cfg.pszWindowTitle      = L"Spindle";
+    cfg.pszMainInstruction  = L"Scan a network drive?";
+    cfg.pszContent          = content.c_str();
+    const TASKDIALOG_BUTTON buttons[] = {{100, L"Scan"}, {101, L"Don't scan"}};
+    cfg.pButtons       = buttons;
+    cfg.cButtons       = 2;
+    cfg.nDefaultButton = 101;
+    if (!key.empty()) {
+        cfg.pszVerificationText = L"Remember this drive and don't ask again";
+    }
+    int  pressed  = 0;
+    BOOL remember = FALSE;
+    if (FAILED(TaskDialogIndirect(&cfg, &pressed, nullptr, &remember))) {
+        // No task dialogs here (very old common controls): plain question,
+        // nothing remembered.
+        pressed = (MessageBoxW(g_app.hwnd, content.c_str(),
+                               L"Scan a network drive?",
+                               MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) ==
+                   IDYES) ? 100 : 101;
+        remember = FALSE;
+    }
+    if (pressed != 100) return false;
+    if (!key.empty()) {
+        g_app.sessionShares.insert(key);
+        if (remember && TrustShare(g_app.settings, key)) {
+            SaveSettings(g_app.settings);
+        }
+    }
+    return true;
+}
+
 static void StartScanPath(const std::wstring& root, int volumeIndex,
                           bool useCache) {
     if (root.empty()) return;
+    if (!ConfirmNetworkScan(root)) return;
     JoinWorker();
     // A running duplicate hunt deliberately survives this: it holds owned
     // paths only, every row it produces carries its own volume, and the
@@ -1511,7 +1552,20 @@ static void StartAllDrives() {
     req->gen       = g_app.scanGen.fetch_add(1) + 1;
     req->keepCache = g_app.settings.keepCaches;
     req->progress  = &g_app.progress;
-    for (const auto& v : g_app.volumes) req->volumePaths.push_back(v.path);
+    // "All drives" means the drives in this computer. A share joins only
+    // when its owner has already said yes to it, remembered or this run;
+    // otherwise it is left out entirely, cache included, so the master
+    // view never reaches a server nobody asked about.
+    for (const auto& v : g_app.volumes) {
+        if (v.remote) {
+            const std::wstring key = ShareIdentityForRoot(v.path);
+            const bool allowed =
+                !key.empty() && (ShareTrusted(g_app.settings, key) ||
+                                 g_app.sessionShares.count(key) != 0);
+            if (!allowed) continue;
+        }
+        req->volumePaths.push_back(v.path);
+    }
 
     const uintptr_t h =
         _beginthreadex(nullptr, 0, AllDrivesThread, req.get(), 0, nullptr);
@@ -1653,8 +1707,12 @@ static void DrawDriveCard(const Volume& v, const Rect& r, bool active,
              Rect{r.x + pad, r.y + 6.0f, 40.0f, layout::kLineHead},
              active ? theme::kSignal : theme::kType);
 
-    if (!v.label.empty()) {
-        DrawText(SanitizeForDisplay(v.label), g_app.fmtSmall.get(),
+    // A share says so on its card, so the permission question that follows
+    // a click is never a surprise.
+    std::wstring sub = SanitizeForDisplay(v.label);
+    if (v.remote) sub = sub.empty() ? L"network" : sub + L" (network)";
+    if (!sub.empty()) {
+        DrawText(sub, g_app.fmtSmall.get(),
                  Rect{r.x + pad + 34.0f, r.y + 6.0f,
                       r.w - pad * 2 - 34.0f, layout::kLineHead},
                  theme::kMute);
@@ -2505,7 +2563,8 @@ static void DrawBrowse(const Rect& area) {
                  theme::kCat[static_cast<int>(nd->cat)], nd->dir ? 0.35f
                                                                 : 0.9f);
         std::wstring name = SanitizeForDisplay(nd->name);
-        if (nd->dir) name += L"\\";
+        // A drive root under "All drives" already ends in one.
+        if (nd->dir && (name.empty() || name.back() != L'\\')) name += L"\\";
         DrawText(name, g_app.fmtSmall.get(),
                  Rect{colX[0], y + 3.0f, colW[0], layout::kLineSmall},
                  nd->dir ? theme::kType : theme::kMute, 1.0f, true);
@@ -3905,6 +3964,10 @@ static void ShowAppMenu(POINT screenPt) {
     AppendMenuW(menu,
                 MF_STRING | (g_app.settings.rememberView ? MF_CHECKED : 0u),
                 13, L"Remember where I was");
+    AppendMenuW(menu,
+                MF_STRING |
+                    (g_app.settings.trustedShares.empty() ? MF_GRAYED : 0u),
+                14, L"Forget remembered network drives");
     if (UpdateFeatureEnabled()) {
         AppendMenuW(menu,
                     MF_STRING |
@@ -3973,6 +4036,11 @@ static void ShowAppMenu(POINT screenPt) {
             // Capture now, so turning it on then closing hard still lands
             // somewhere sensible next launch.
             if (g_app.settings.rememberView) RememberCurrentView();
+            SaveSettings(g_app.settings);
+            break;
+        case 14:
+            g_app.settings.trustedShares.clear();
+            g_app.sessionShares.clear();
             SaveSettings(g_app.settings);
             break;
         case 9:
@@ -5158,6 +5226,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             break;
                         }
                     }
+                    // A remembered place on a share is not reopened at
+                    // launch: that would read the server before any click.
+                    if (idx >= 0 &&
+                        g_app.volumes[static_cast<size_t>(idx)].remote) {
+                        idx = -1;
+                    }
                     if (idx >= 0) {
                         const std::wstring drive =
                             g_app.volumes[static_cast<size_t>(idx)].path;
@@ -5196,6 +5270,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int      best = -1;
                 FILETIME bestTime{};
                 for (size_t i = 0; i < g_app.volumes.size(); ++i) {
+                    // A share's cache is never the one resumed: resuming
+                    // revalidates, and that reads the server unasked.
+                    if (g_app.volumes[i].remote) continue;
                     const std::wstring cp =
                         CachePathForVolume(g_app.volumes[i].path);
                     if (cp.empty()) continue;

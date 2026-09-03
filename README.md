@@ -52,7 +52,17 @@ an older one is shown immediately while a rescan revalidates behind it, and
 the status bar reads `cached 2h ago · rescanning` until it finishes. F5
 always forces a fresh walk. Removable and network drives are never read
 unprompted, the background walk stops the moment you ask for anything
-else, and the whole thing can be turned off in the `···` menu. The cache
+else, and the whole thing can be turned off in the `···` menu.
+
+Network drives are handled the way a company policy would want by
+default. A mapped share is listed, marked `network` on its card, and read
+only after you click it and answer a question that names the share and
+says what a scan involves. Tick "remember" and that share never asks
+again; leave it unticked and the answer lasts for this run. The memory is
+the share itself, `\\server\share`, not the drive letter, so a letter
+mapped somewhere else later asks afresh. Nothing at launch reaches a
+share, and "Forget remembered network drives" in the `···` menu clears
+every saved answer. The cache
 is keyed to the volume serial and parsed with the same validation as
 everything else read from disk.
 
@@ -96,8 +106,8 @@ and descends into folders across the machine; the list shows the drives
 as rows; and Find, Kinds and Largest all span every drive, so a search
 there covers the whole computer rather than one volume. Cached drives
 appear at once, a fixed drive with no cache yet is walked in the
-background, and removable or network drives are left alone unless you
-have already scanned them.
+background, removable drives join only when already cached, and a network
+drive joins only if you have already allowed that share.
 
 Filenames are treated as untrusted input; see the Security section.
 
@@ -280,8 +290,8 @@ The side panel is the part a treemap alone does not give you. The map
 shows where the space went; the Kinds and Largest panels show what it
 went to, which is usually the question that leads to a decision.
 
-Not implemented: network share discovery. A share is scanned by giving
-its UNC path explicitly.
+Not implemented: network share discovery. A share is scanned by mapping
+it or giving its UNC path explicitly, and either way it asks first.
 
 ## Building
 

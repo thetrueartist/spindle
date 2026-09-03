@@ -44,3 +44,21 @@ ui_shot()  {
   [ -n "${2:-}" ] && convert "$UI_OUT/$1.png" -crop "$2" +repage "$UI_OUT/${1}_c.png"
   echo "ui: shot $1 -> $UI_OUT/$1.png"
 }
+
+# A dialog (task dialog, message box) is its own top-level window and the
+# window manager may place it anywhere, so find it each time rather than
+# assuming a position. ui_dialog sets DLG_X/DLG_Y to its client origin;
+# dlg_click takes coordinates relative to that.
+ui_dialog() {
+  DLG_W=""
+  for w in $(xdotool search --name 'Spindle' 2>/dev/null); do
+    [ "$w" = "$UI_W" ] && continue
+    DLG_W=$w; break
+  done
+  [ -z "$DLG_W" ] && { echo "ui: no dialog"; return 1; }
+  local info; info=$(xwininfo -id "$DLG_W" 2>/dev/null)
+  DLG_X=$(printf '%s' "$info" | awk '/Absolute upper-left X/{print $NF}')
+  DLG_Y=$(printf '%s' "$info" | awk '/Absolute upper-left Y/{print $NF}')
+  echo "ui: dialog $DLG_W at $DLG_X,$DLG_Y"
+}
+dlg_click() { xdotool mousemove $((DLG_X+$1)) $((DLG_Y+$2)) click 1; }

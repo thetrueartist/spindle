@@ -2113,6 +2113,90 @@ static void TestForceRemovalGuards() {
 
 // --------------------------------------------------------------- settings
 
+static void TestUtf8() {
+    std::printf("UTF-8\n");
+
+    CHECK(WideToUtf8(L"plain") == "plain", "ascii passes through");
+    CHECK(Utf8ToWide("plain") == L"plain", "ascii back");
+    CHECK(WideToUtf8(L"") == "" && Utf8ToWide("").empty(), "empty both ways");
+
+    // Two-, three- and four-byte sequences, by code point so the test is
+    // the same on a 16-bit and a 32-bit wchar_t.
+    const std::string two   = "\xC3\xA9";            // e acute
+    const std::string three = "\xE2\x82\xAC";        // euro sign
+    const std::string four  = "\xF0\x9F\x98\x80";    // a face, U+1F600
+    CHECK(WideToUtf8(Utf8ToWide(two)) == two, "two-byte round-trips");
+    CHECK(WideToUtf8(Utf8ToWide(three)) == three, "three-byte round-trips");
+    CHECK(WideToUtf8(Utf8ToWide(four)) == four,
+          "four-byte round-trips through a surrogate pair if need be");
+    CHECK(Utf8ToWide(three).size() == 1, "euro is one unit either width");
+    CHECK(Utf8ToWide(four).size() == (sizeof(wchar_t) == 2 ? 2u : 1u),
+          "supplementary plane takes two units only when wchar_t is 16-bit");
+
+    const std::string bad = WideToUtf8(Utf8ToWide("\xC3"));   // truncated
+    CHECK(bad == "\xEF\xBF\xBD", "truncated sequence becomes U+FFFD");
+    CHECK(WideToUtf8(Utf8ToWide("\xC0\xAF")) == "\xEF\xBF\xBD\xEF\xBF\xBD",
+          "overlong form refused byte by byte");
+    CHECK(WideToUtf8(Utf8ToWide("\xED\xA0\x80")) == "\xEF\xBF\xBD",
+          "encoded surrogate refused");
+    CHECK(WideToUtf8(Utf8ToWide("a\xFFz")) == "a\xEF\xBF\xBDz",
+          "a stray byte is replaced and decoding resumes");
+
+    std::wstring lone;
+    lone.push_back(static_cast<wchar_t>(0xD800));
+    CHECK(WideToUtf8(lone) == "\xEF\xBF\xBD", "lone high surrogate replaced");
+    CHECK(WideToUtf8(L"a\\\\b") == "a\\\\b", "backslashes untouched");
+}
+
+static void TestShareKeys() {
+    std::printf("Share keys\n");
+
+    CHECK(NormalizeShareKey(L"\\\\Server\\Share\\") == L"\\\\server\\share",
+          "lowercased, trailing separator dropped");
+    CHECK(NormalizeShareKey(L"//server/share") == L"\\\\server\\share",
+          "forward slashes fold");
+    CHECK(NormalizeShareKey(L"\\\\?\\UNC\\server\\share\\deep") ==
+              L"\\\\server\\share\\deep",
+          "long-path UNC spelling folds to the plain one");
+    CHECK(NormalizeShareKey(L"  \\\\server\\share  ") == L"\\\\server\\share",
+          "surrounding whitespace trimmed");
+    CHECK(NormalizeShareKey(L"\\\\server").empty(),
+          "a bare server is not a share");
+    CHECK(NormalizeShareKey(L"\\\\server\\\\share").empty(),
+          "an empty component is malformed");
+    CHECK(NormalizeShareKey(L"C:\\Users").empty(),
+          "a local path is not a share key");
+    CHECK(NormalizeShareKey(L"").empty(), "empty is empty");
+    CHECK(NormalizeShareKey(L"Y:#1A2B3C4D") == L"y:#1a2b3c4d",
+          "lettered fallback normalises");
+    CHECK(NormalizeShareKey(L"Y:#xyz").empty(),
+          "fallback serial must be hex");
+    CHECK(NormalizeShareKey(std::wstring(kMaxShareKeyChars + 1, L'a')).empty(),
+          "over-long input rejected");
+
+    Settings s;
+    CHECK(!ShareTrusted(s, L"\\\\a\\b"), "nothing trusted by default");
+    CHECK(!TrustShare(s, L"junk"), "junk cannot be trusted");
+    CHECK(TrustShare(s, L"\\\\a\\b"), "first share added");
+    CHECK(TrustShare(s, L"\\\\A\\B\\"), "same share again is fine");
+    CHECK(s.trustedShares.size() == 1, "and does not duplicate");
+    for (size_t i = 1; i < kMaxTrustedShares; ++i) {
+        CHECK(TrustShare(s, L"\\\\srv\\s" + std::to_wstring(i)),
+              "fills to the cap");
+    }
+    CHECK(s.trustedShares.size() == kMaxTrustedShares, "at the cap");
+    CHECK(!TrustShare(s, L"\\\\one\\more"), "the cap holds");
+    CHECK(TrustShare(s, L"\\\\a\\b"), "an existing one still answers yes");
+
+    // The full list at its cap must survive the settings size limit.
+    std::vector<uint8_t> buf;
+    SerializeSettings(s, buf);
+    CHECK(buf.size() <= kMaxSettingsBytes, "capped list fits the file limit");
+    CHECK(ParseSettings(buf.data(), buf.size()).trustedShares.size() ==
+              kMaxTrustedShares,
+          "capped list round-trips whole");
+}
+
 static void TestSettings() {
     std::printf("Settings\n");
 
@@ -2155,6 +2239,31 @@ static void TestSettings() {
     const std::vector<uint8_t> big(kMaxSettingsBytes + 1, 'x');
     r = ParseSettings(big.data(), big.size());
     CHECK(r.keepCaches, "oversize input keeps defaults");
+
+    {
+        Settings t;
+        CHECK(TrustShare(t, L"\\\\Server\\Share\\"), "share accepted");
+        CHECK(TrustShare(t, L"Y:#1A2B3C4D"), "lettered fallback accepted");
+        SerializeSettings(t, buf);
+        const Settings back = ParseSettings(buf.data(), buf.size());
+        CHECK(back.trustedShares.size() == 2, "trusted shares round-trip");
+        CHECK(ShareTrusted(back, L"\\\\SERVER\\share"),
+              "trusted after reload, case-insensitively");
+        CHECK(ShareTrusted(back, L"y:#1a2b3c4d"),
+              "lettered fallback trusted after reload");
+        CHECK(!ShareTrusted(back, L"\\\\server\\other"),
+              "a different share is not trusted");
+        const char* damaged =
+            "trusted_share=not a share\ntrusted_share=\\\\ok\\share\n"
+            "trusted_share=\n";
+        const Settings d2 = ParseSettings(
+            reinterpret_cast<const uint8_t*>(damaged), strlen(damaged));
+        CHECK(d2.trustedShares.size() == 1 &&
+                  ShareTrusted(d2, L"\\\\ok\\share"),
+              "damaged trusted lines dropped, valid one kept");
+        CHECK(ParseSettings(nullptr, 0).trustedShares.empty(),
+              "old settings file trusts nothing");
+    }
 
     {
         DupReport rep;
@@ -2315,6 +2424,8 @@ int main() {
     FuzzTreemap();
     TestScanCache();
     TestSettings();
+    TestShareKeys();
+    TestUtf8();
     TestForceRemovalGuards();
     TestHasher();
     TestDuplicates();

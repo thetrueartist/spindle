@@ -5,6 +5,7 @@
 #include "spindle.h"
 
 #include <algorithm>
+#include <cwctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1863,6 +1864,14 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 // Stored verbatim as UTF-8; the Windows layer converts it.
                 // A single value, so any '=' inside a path is kept.
                 s.lastPath = line.substr(eq + 1);
+            } else if (key == "trusted_share") {
+                // Repeated key, one share per line. Re-normalised on the
+                // way in, so a hand-edited or damaged line that is not a
+                // share identity is dropped rather than trusted.
+                const std::string v = line.substr(eq + 1);
+                if (!v.empty() && v.size() <= kMaxShareKeyChars * 3) {
+                    TrustShare(s, Utf8ToWide(v));
+                }
             } else if (key == "update_serial") {
                 // Not a flag: parse the number, bounded, refusing junk.
                 const std::string v = line.substr(eq + 1);
@@ -1897,7 +1906,187 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
         "\nlast_panel=" + std::to_string(s.lastPanel) +
         "\nlast_path=" + s.lastPath +
         "\nupdate_serial=" + std::to_string(s.updateSerial) + "\n";
-    out.assign(text.begin(), text.end());
+    std::string all = text;
+    for (const std::string& share : s.trustedShares) {
+        all += "trusted_share=" + share + "\n";
+    }
+    out.assign(all.begin(), all.end());
+}
+
+std::string WideToUtf8(const std::wstring& w) {
+    std::string out;
+    out.reserve(w.size() * 3);
+    for (size_t i = 0; i < w.size(); ++i) {
+        uint32_t cp = static_cast<uint32_t>(w[i]) & 0x1FFFFFu;
+        if (cp >= 0xD800u && cp <= 0xDBFFu) {
+            // High surrogate: pair it, whatever the width of wchar_t.
+            if (i + 1 < w.size()) {
+                const uint32_t lo = static_cast<uint32_t>(w[i + 1]) & 0xFFFFu;
+                if (lo >= 0xDC00u && lo <= 0xDFFFu) {
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                    ++i;
+                } else {
+                    cp = 0xFFFDu;
+                }
+            } else {
+                cp = 0xFFFDu;
+            }
+        } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+            cp = 0xFFFDu;   // stray low surrogate
+        }
+        if (cp > 0x10FFFFu) cp = 0xFFFDu;
+        if (cp < 0x80u) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800u) {
+            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp < 0x10000u) {
+            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else {
+            out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+    }
+    return out;
+}
+
+std::wstring Utf8ToWide(const std::string& u) {
+    std::wstring out;
+    out.reserve(u.size());
+    const size_t n = u.size();
+    size_t i = 0;
+    auto emit = [&out](uint32_t cp) {
+        if (sizeof(wchar_t) == 2 && cp >= 0x10000u) {
+            cp -= 0x10000u;
+            out.push_back(static_cast<wchar_t>(0xD800u + (cp >> 10)));
+            out.push_back(static_cast<wchar_t>(0xDC00u + (cp & 0x3FFu)));
+        } else {
+            out.push_back(static_cast<wchar_t>(cp));
+        }
+    };
+    while (i < n) {
+        const uint8_t b0 = static_cast<uint8_t>(u[i]);
+        uint32_t cp   = 0;
+        size_t   need = 0;
+        uint32_t min  = 0;
+        if (b0 < 0x80u) {
+            out.push_back(static_cast<wchar_t>(b0));
+            ++i;
+            continue;
+        } else if ((b0 & 0xE0u) == 0xC0u && b0 >= 0xC2u) {
+            // C0 and C1 can only ever start an overlong form, so they are
+            // rejected as lead bytes, the same as F5 and above below.
+            cp = b0 & 0x1Fu; need = 1; min = 0x80u;
+        } else if ((b0 & 0xF0u) == 0xE0u) {
+            cp = b0 & 0x0Fu; need = 2; min = 0x800u;
+        } else if ((b0 & 0xF8u) == 0xF0u && b0 <= 0xF4u) {
+            cp = b0 & 0x07u; need = 3; min = 0x10000u;
+        } else {
+            emit(0xFFFDu);
+            ++i;
+            continue;
+        }
+        // Every continuation byte must exist and be 10xxxxxx.
+        bool ok = (i + need < n);
+        if (ok) {
+            for (size_t k = 1; k <= need; ++k) {
+                if (i + k >= n) { ok = false; break; }
+                const uint8_t bk = static_cast<uint8_t>(u[i + k]);
+                if ((bk & 0xC0u) != 0x80u) { ok = false; break; }
+                cp = (cp << 6) | (bk & 0x3Fu);
+            }
+        }
+        if (!ok) {
+            emit(0xFFFDu);
+            ++i;   // resynchronise on the next byte
+            continue;
+        }
+        // Overlong forms, surrogates and out-of-range values are refused.
+        if (cp < min || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+            cp = 0xFFFDu;
+        }
+        emit(cp);
+        i += need + 1;
+    }
+    return out;
+}
+
+std::wstring NormalizeShareKey(std::wstring s) {
+    for (wchar_t& c : s) {
+        if (c == L'/') c = L'\\';
+    }
+    // Trim whitespace either end.
+    size_t b = 0;
+    while (b < s.size() && (s[b] == L' ' || s[b] == L'\t')) ++b;
+    s.erase(0, b);
+    while (!s.empty() && (s.back() == L' ' || s.back() == L'\t')) s.pop_back();
+    if (s.size() > kMaxShareKeyChars) return {};
+
+    // The long-path spelling of a UNC root folds to the plain one.
+    static const wchar_t kLong[] = L"\\\\?\\unc\\";
+    if (s.size() >= 8) {
+        bool match = true;
+        for (size_t i = 0; i < 8; ++i) {
+            if (static_cast<wchar_t>(towlower(s[i])) != kLong[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) s = L"\\\\" + s.substr(8);
+    }
+
+    for (wchar_t& c : s) c = static_cast<wchar_t>(towlower(c));
+
+    if (s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\') {
+        while (!s.empty() && s.back() == L'\\') s.pop_back();
+        // \\server\share at least: a bare server is not a share.
+        size_t comps = 0;
+        size_t pos   = 2;
+        while (pos < s.size()) {
+            const size_t sep = s.find(L'\\', pos);
+            const size_t end = (sep == std::wstring::npos) ? s.size() : sep;
+            if (end == pos) return {};   // empty component: malformed
+            ++comps;
+            pos = end + 1;
+        }
+        return comps >= 2 ? s : std::wstring();
+    }
+
+    // Lettered fallback: y:#hexserial.
+    if (s.size() >= 4 && s[0] >= L'a' && s[0] <= L'z' && s[1] == L':' &&
+        s[2] == L'#') {
+        for (size_t i = 3; i < s.size(); ++i) {
+            const wchar_t c = s[i];
+            const bool hex = (c >= L'0' && c <= L'9') ||
+                             (c >= L'a' && c <= L'f');
+            if (!hex) return {};
+        }
+        return s;
+    }
+    return {};
+}
+
+bool ShareTrusted(const Settings& s, const std::wstring& key) {
+    const std::wstring norm = NormalizeShareKey(key);
+    if (norm.empty()) return false;
+    const std::string want = WideToUtf8(norm);
+    for (const std::string& have : s.trustedShares) {
+        if (have == want) return true;
+    }
+    return false;
+}
+
+bool TrustShare(Settings& s, const std::wstring& key) {
+    const std::wstring norm = NormalizeShareKey(key);
+    if (norm.empty()) return false;
+    if (ShareTrusted(s, norm)) return true;
+    if (s.trustedShares.size() >= kMaxTrustedShares) return false;
+    s.trustedShares.push_back(WideToUtf8(norm));
+    return true;
 }
 
 
