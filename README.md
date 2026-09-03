@@ -100,7 +100,11 @@ the local link and device tables before the question is asked, and a
 path that cannot be judged is treated as a network location. "Forget remembered network drives" in the `···` menu
 clears every saved answer. The scan reads names and sizes; finding
 duplicates on a share reads file contents too, and the permission text
-says so. The cache
+says so.
+
+![the question asked before a network drive is read](docs/network.png)
+
+The cache
 is keyed to the volume serial and parsed with the same validation as
 everything else read from disk.
 
@@ -408,6 +412,8 @@ Layout is the squarified algorithm from Bruls, Huizing and van Wijk
 The Find panel takes a small query language. Bare words match the name,
 prefixed terms narrow by kind, extension, size or type, and every term
 must match.
+
+![Find with a path term, results carrying their folders](docs/find.png)
 
 | | |
 |---|---|
