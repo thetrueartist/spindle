@@ -13,7 +13,10 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=wine-ui-test.sh
 source "$HERE/wine-ui-test.sh"
 C="$HOME/.wine/drive_c/users/$(whoami)/AppData/Local/Spindle"
-TMP=$(mktemp -d)
+# A folder inside the prefix, so the output path is a Windows path whatever
+# drive letters the prefix has (a Linux path needs a Z: drive to be reachable).
+TMP="$HOME/.wine/drive_c/users/$(whoami)/Temp/spindle-check"; mkdir -p "$TMP"
+TMPW="C:\\users\\$(whoami)\\Temp\\spindle-check"
 PASS=0; FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -25,13 +28,13 @@ stop; sleep 1
 [ -f "$C/D.spincache" ] && { cp "$C/D.spincache" "$C/Y.spincache"; cp "$C/D.spincache" "$C/E.spincache"; cp "$C/D.spincache" "$C/Q.spincache"; }
 
 echo "1) headless --csv on a network letter without --allow-network"
-wine build/spindle.exe --csv "$TMP/o.csv" 'Y:\' >/dev/null 2>&1; r=$?
+wine build/spindle.exe --csv "$TMPW\\o.csv" 'Y:\' >/dev/null 2>&1; r=$?
 [ $r -eq 3 ] && [ ! -f "$TMP/o.csv" ] && ok "refused, exit 3, nothing written" || bad "exit=$r"
 echo "2) headless --csv with --allow-network"
-wine build/spindle.exe --csv "$TMP/o.csv" --allow-network 'Y:\' >/dev/null 2>&1; r=$?
+wine build/spindle.exe --csv "$TMPW\\o.csv" --allow-network 'Y:\' >/dev/null 2>&1; r=$?
 [ $r -eq 0 ] && [ -s "$TMP/o.csv" ] && ok "exit 0, csv written" || bad "exit=$r"; rm -f "$TMP/o.csv"
 echo "3) headless --csv on a UNC path without the flag"
-wine build/spindle.exe --csv "$TMP/o.csv" '\\nas\share' >/dev/null 2>&1; r=$?
+wine build/spindle.exe --csv "$TMPW\\o.csv" '\\nas\share' >/dev/null 2>&1; r=$?
 [ $r -eq 3 ] && ok "refused, exit 3" || bad "exit=$r"
 
 ui_start 'D:\' || { echo "no window"; exit 1; }
@@ -60,14 +63,14 @@ ui_dialog >/dev/null && { dlg_click 14 127; sleep 0.3; dlg_click 230 127; }; sle
 echo "10) the share is remembered by its own name"
 grep -q 'trusted_share=\\\\nas\\share$' <(tr -d '\r' < "$C/settings.txt") && ok "trusted_share=\\\\nas\\share" || bad "not remembered"
 echo "11) headless on the remembered share proceeds; a sibling share does not"
-wine build/spindle.exe --csv "$TMP/o.csv" '\\nas\share' >/dev/null 2>&1; r=$?
+wine build/spindle.exe --csv "$TMPW\\o.csv" '\\nas\share' >/dev/null 2>&1; r=$?
 [ $r -ne 3 ] && ok "remembered share not refused" || bad "refused"; rm -f "$TMP/o.csv"
-wine build/spindle.exe --csv "$TMP/o.csv" '\\nas\other' >/dev/null 2>&1; r=$?
+wine build/spindle.exe --csv "$TMPW\\o.csv" '\\nas\other' >/dev/null 2>&1; r=$?
 [ $r -eq 3 ] && ok "sibling share refused" || bad "exit=$r"
 echo "11b) a bare object-manager spelling is refused as a path (exit 2)"
-wine build/spindle.exe --csv "$TMP/o.csv" 'UNC\nas\share' >/dev/null 2>&1; r=$?
+wine build/spindle.exe --csv "$TMPW\\o.csv" 'UNC\nas\share' >/dev/null 2>&1; r=$?
 [ $r -eq 2 ] && [ ! -f "$TMP/o.csv" ] && ok "refused as a path, nothing written" || bad "exit=$r"
-wine build/spindle.exe --csv "$TMP/o.csv" 'GLOBALROOT\Device\Mup\nas\share' >/dev/null 2>&1; r=$?
+wine build/spindle.exe --csv "$TMPW\\o.csv" 'GLOBALROOT\Device\Mup\nas\share' >/dev/null 2>&1; r=$?
 [ $r -eq 2 ] && ok "GLOBALROOT without a prefix refused as a path" || bad "exit=$r"
 echo "12) Forget remembered network drives"
 menu 151; grep -q trusted_share "$C/settings.txt" && bad "still remembered" || ok "cleared"

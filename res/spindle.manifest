@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="Spindle"
-      version="2.5.10.0"
+      version="2.5.11.0"
       processorArchitecture="amd64"/>
 
   <description>Spindle - disk space, mapped</description>

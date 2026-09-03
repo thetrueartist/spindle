@@ -162,6 +162,7 @@ constexpr UINT WM_UPDATE_FOUND  = WM_APP + 6;
 constexpr UINT WM_RECYCLE_DONE  = WM_APP + 7;
 constexpr UINT WM_RECYCLE_FILE  = WM_APP + 8;
 constexpr UINT WM_CACHE_READY   = WM_APP + 9;
+constexpr UINT WM_SCAN_NOTE     = WM_APP + 10;   // owned wstring: what the worker is doing
 
 // A cache this young is served without a revalidating rescan: the launch
 // prefetch (or a scan moments ago) already walked the drive, and walking it
@@ -180,7 +181,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.10";
+constexpr const wchar_t* kAppVersion = L"2.5.11";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -305,6 +306,20 @@ struct App {
     std::wstring          startPath;
     // Network shares agreed to for this run only (no remember tick).
     std::unordered_set<std::wstring> sessionShares;
+    // What the worker is doing right now, in words, for the placeholder
+    // and the status bar: "Loading C: from its cache", "Reading E:".
+    std::wstring          scanNote;
+    // A start asked for while a scan was still stopping. The interface
+    // never waits for a thread; the waiting start runs when the old
+    // worker reports in, and the latest request wins.
+    struct PendingStart {
+        bool         allDrives   = false;
+        std::wstring root;
+        int          volumeIndex = -1;
+        bool         useCache    = true;
+    };
+    bool         pendingStartSet = false;
+    PendingStart pendingStart;
     size_t                crumbFirst = 0;   // trail index of crumbHits[0]
 
     // Side panel. Every comparable tool carries these two views next to the
@@ -1407,11 +1422,35 @@ static bool ConfirmNetworkScan(const std::wstring& root) {
     return true;
 }
 
+static void RunPendingStart();
+
+// A scan still running when another is asked for is told to stop, and
+// the new one starts when it has: the interface thread never waits on a
+// worker, which is what used to read as a freeze when a big walk took a
+// moment to notice its cancel flag.
+static bool DeferUntilWorkerStops(App::PendingStart start) {
+    if (!g_app.worker) return false;
+    g_app.progress.cancel.store(true, std::memory_order_relaxed);
+    g_app.scanGen.fetch_add(1);   // whatever it reports is stale now
+    g_app.pendingStart    = std::move(start);
+    g_app.pendingStartSet = true;
+    g_app.scanNote        = L"Stopping the current scan";
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    return true;
+}
+
 static void StartScanPath(const std::wstring& root, int volumeIndex,
                           bool useCache) {
     if (root.empty()) return;
     if (!ConfirmNetworkScan(root)) return;
-    JoinWorker();
+    {
+        App::PendingStart p;
+        p.root        = root;
+        p.volumeIndex = volumeIndex;
+        p.useCache    = useCache;
+        if (DeferUntilWorkerStops(std::move(p))) return;
+    }
+    g_app.scanNote.clear();
     // A running duplicate hunt deliberately survives this: it holds owned
     // paths only, every row it produces carries its own volume, and the
     // panel can show its progress and its results from any drive. Killing
@@ -1498,14 +1537,28 @@ unsigned __stdcall AllDrivesThread(void* param) {
     agg->root.cat  = Cat::Directory;
     uint64_t aggDirs = 0;
     try {
+        auto note = [&req](const std::wstring& text) {
+            // Best effort, owned string, adopted by the interface.
+            try {
+                auto copy = std::make_unique<std::wstring>(text);
+                if (PostMessageW(req->hwnd, WM_SCAN_NOTE,
+                                 static_cast<WPARAM>(req->gen),
+                                 reinterpret_cast<LPARAM>(copy.get()))) {
+                    static_cast<void>(copy.release());  // NOLINT
+                }
+            } catch (...) {
+            }
+        };
         for (const std::wstring& path : req->volumePaths) {
             if (req->progress->cancel.load(std::memory_order_relaxed)) {
                 return 0;
             }
+            const std::wstring letter = path.substr(0, 2);
             ScanResult one;
             CacheMeta  cm;
             bool ok = false;
             if (req->keepCache) {
+                note(L"Loading " + letter + L" from its cache");
                 try {
                     ok = LoadScanCache(path, one, cm, &req->progress->cancel);
                 } catch (...) {
@@ -1523,6 +1576,7 @@ unsigned __stdcall AllDrivesThread(void* param) {
                                     L'\\', 0};
                 const UINT type = GetDriveTypeW(root3);
                 if (type != DRIVE_FIXED && type != DRIVE_REMOTE) continue;
+                note(L"Reading " + letter);
                 one = Scan(path, 0, req->progress);
                 if (req->progress->cancel.load(std::memory_order_relaxed)) {
                     return 0;
@@ -1563,7 +1617,12 @@ unsigned __stdcall AllDrivesThread(void* param) {
 }
 
 static void StartAllDrives() {
-    JoinWorker();
+    {
+        App::PendingStart p;
+        p.allDrives = true;
+        if (DeferUntilWorkerStops(std::move(p))) return;
+    }
+    g_app.scanNote.clear();
     CancelPrefetch(false);
     g_app.prefetchQueue.clear();
     g_app.pendingReveal.clear();
@@ -1607,6 +1666,17 @@ static void StartAllDrives() {
     static_cast<void>(req.release());  // NOLINT
     g_app.worker = reinterpret_cast<HANDLE>(h);
     SetTimer(g_app.hwnd, kTimerId, 33, nullptr);
+}
+
+static void RunPendingStart() {
+    if (!g_app.pendingStartSet) return;
+    g_app.pendingStartSet = false;
+    const App::PendingStart p = g_app.pendingStart;
+    if (p.allDrives) {
+        StartAllDrives();
+    } else {
+        StartScanPath(p.root, p.volumeIndex, p.useCache);
+    }
 }
 
 // The layout is area-proportional, so scaling every cell by the same factor
@@ -2868,10 +2938,18 @@ static void DrawTreemap(const Rect& area) {
 
         const Rect centre{area.x, area.y + area.h * 0.42f, area.w,
                           layout::kLineHead};
-        DrawText(L"Scanning", g_app.fmtHead.get(), centre, theme::kType, 1.0f,
-                 false, DWRITE_TEXT_ALIGNMENT_CENTER);
-        DrawText(FormatFiles(f) + L"  \u00B7  " + FormatSize(b),
-                 g_app.fmtBody.get(),
+        // The word matches the work: the master view mostly loads caches,
+        // and a note says which drive is being loaded or read.
+        DrawText(g_app.allDrives ? L"Gathering drives" : L"Scanning",
+                 g_app.fmtHead.get(), centre, theme::kType, 1.0f, false,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+        std::wstring sub = g_app.scanNote;
+        if (f > 0 || b > 0) {
+            if (!sub.empty()) sub += L"  \u00B7  ";
+            sub += FormatFiles(f) + L"  \u00B7  " + FormatSize(b);
+        }
+        if (sub.empty()) sub = L"Starting";
+        DrawText(sub, g_app.fmtBody.get(),
                  Rect{area.x, centre.bottom() + 6.0f, area.w,
                       layout::kLineBody},
                  theme::kMute, 1.0f, true, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -3089,7 +3167,11 @@ static void DrawStatus(const Rect& area) {
     if (g_app.result && g_app.showingCache) {
         const ScanStats& s = g_app.result->stats;
         std::wstring line = L"cached " + FormatAge(g_app.cacheSavedMs);
-        if (g_app.scanning) line += L"  \u00B7  rescanning\u2026";
+        if (g_app.scanning) {
+            line += L"  \u00B7  " + (g_app.scanNote.empty()
+                                        ? std::wstring(L"rescanning\u2026")
+                                        : g_app.scanNote);
+        }
         line += L"  \u00B7  " + FormatFiles(s.fileCount) + L"  \u00B7  " +
                 FormatSize(s.bytes);
         AppendPrefetchNote(line);
@@ -5560,9 +5642,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::unique_ptr<ScanResult> res(
                 reinterpret_cast<ScanResult*>(lp));
 
-            // Superseded by a later scan: drop it. Its thread was already
-            // joined by the StartScan that replaced it, so nothing to clean up.
-            if (static_cast<uint64_t>(wp) != g_app.scanGen.load()) return 0;
+            // Superseded by a later request: drop it. If a start has been
+            // waiting for this worker to stop, this is the moment it can
+            // run: the thread has reported in, so joining it costs nothing.
+            if (static_cast<uint64_t>(wp) != g_app.scanGen.load()) {
+                if (g_app.pendingStartSet && g_app.worker) {
+                    WaitForSingleObject(g_app.worker, INFINITE);
+                    CloseHandle(g_app.worker);
+                    g_app.worker   = nullptr;
+                    g_app.scanning = false;
+                    RunPendingStart();
+                }
+                return 0;
+            }
 
             if (g_app.worker) {
                 WaitForSingleObject(g_app.worker, INFINITE);
@@ -5570,6 +5662,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.worker = nullptr;
             }
             g_app.scanning = false;
+            g_app.scanNote.clear();
             StartPrefetchNext();   // the disk is free again
 
             // A null result means the scan thread aborted rather than
@@ -5643,6 +5736,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.updateWorker = nullptr;
             }
             if (tag) g_app.updateTag = std::move(*tag);
+            return 0;
+        }
+
+        case WM_SCAN_NOTE: {
+            std::unique_ptr<std::wstring> text(
+                reinterpret_cast<std::wstring*>(lp));
+            if (static_cast<uint64_t>(wp) != g_app.scanGen.load()) return 0;
+            if (text) g_app.scanNote = std::move(*text);
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
 
