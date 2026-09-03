@@ -2015,6 +2015,28 @@ std::wstring Utf8ToWide(const std::string& u) {
     return out;
 }
 
+std::vector<wchar_t> CachesToDrop(
+    const std::vector<std::pair<wchar_t, int>>& present,
+    const std::vector<wchar_t>& cached) {
+    std::vector<wchar_t> drop;
+    for (wchar_t c : cached) {
+        const wchar_t letter = static_cast<wchar_t>(towupper(c));
+        bool found   = false;
+        int  verdict = -1;
+        for (const auto& p : present) {
+            if (static_cast<wchar_t>(towupper(p.first)) == letter) {
+                found   = true;
+                verdict = p.second;
+                break;
+            }
+        }
+        // Gone entirely, or here and of a kind that is never cached: drop.
+        // Here but unknowable (locked, not ready): leave it alone.
+        if (!found || verdict == 0) drop.push_back(letter);
+    }
+    return drop;
+}
+
 std::wstring NormalizeShareKey(std::wstring s) {
     for (wchar_t& c : s) {
         if (c == L'/') c = L'\\';

@@ -54,6 +54,17 @@ always forces a fresh walk. Removable and network drives are never read
 unprompted, the background walk stops the moment you ask for anything
 else, and the whole thing can be turned off in the `···` menu.
 
+What a cache holds, for anyone who has to sign off on it: the folder
+tree of one drive, each entry as a name, a size, a kind and three flags.
+No file contents, no hashes, no dates, no owners. It is a listing of the
+drive, so it is treated as one: only an internal fixed disk ever gets a
+cache. Removable media, disks on a USB, FireWire or card-reader bus, and
+network shares are never cached, so no listing outlives its media. At
+launch any cache whose drive is gone, or of a kind that should never
+have had one, is deleted, and turning Keep scan caches off deletes every
+cache rather than merely stopping new ones. The trade-off is that an
+external disk rescans each time it is opened.
+
 Network drives are handled the way a company policy would want by
 default. A mapped share is listed, marked `network` on its card, and read
 only after you click it and answer a question that names the share and

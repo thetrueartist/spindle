@@ -180,7 +180,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.5.5";
+constexpr const wchar_t* kAppVersion = L"2.5.6";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -1293,7 +1293,8 @@ static void QueueLaunchPrefetch(const std::wstring& excludeRoot) {
     struct Entry { std::wstring root; uint64_t mtime; };
     std::vector<Entry> entries;
     for (const Volume& v : g_app.volumes) {
-        if (!v.ready || !v.fixed || v.path == excludeRoot) continue;
+        // Internal disks only: an external one is never spun up unasked.
+        if (!v.ready || !v.cacheable || v.path == excludeRoot) continue;
         uint64_t mtime = 0;   // 0 = no cache yet = scan it first
         const std::wstring cp = CachePathForVolume(v.path);
         WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -4026,6 +4027,8 @@ static void ShowAppMenu(POINT screenPt) {
         case 3:
             g_app.settings.keepCaches = !g_app.settings.keepCaches;
             SaveSettings(g_app.settings);
+            // Off means none on disk, not merely none written from now.
+            if (!g_app.settings.keepCaches) ClearScanCaches();
             break;
         case 4:
             g_app.settings.resumeOnLaunch = !g_app.settings.resumeOnLaunch;
@@ -5181,6 +5184,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.dpiScale = QueryDpiScale(hwnd);
             g_app.volumes  = EnumerateVolumes();
             g_app.settings = LoadSettings();
+            // No listing outlives its media: caches for drives that are
+            // gone, or of a kind that is never cached, go now; with
+            // caching off, none stay at all.
+            if (g_app.settings.keepCaches) {
+                PruneStaleCaches();
+            } else {
+                ClearScanCaches();
+            }
             g_app.editBrush = CreateSolidBrush(ToColorRef(theme::kSlabHi));
             CreateEditFonts();
 
@@ -5270,9 +5281,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int      best = -1;
                 FILETIME bestTime{};
                 for (size_t i = 0; i < g_app.volumes.size(); ++i) {
-                    // A share's cache is never the one resumed: resuming
-                    // revalidates, and that reads the server unasked.
-                    if (g_app.volumes[i].remote) continue;
+                    // Only an internal disk is resumed: resuming
+                    // revalidates, and that would read a share or spin up
+                    // an external disk unasked.
+                    if (!g_app.volumes[i].cacheable) continue;
                     const std::wstring cp =
                         CachePathForVolume(g_app.volumes[i].path);
                     if (cp.empty()) continue;

@@ -2148,6 +2148,30 @@ static void TestUtf8() {
     CHECK(WideToUtf8(L"a\\\\b") == "a\\\\b", "backslashes untouched");
 }
 
+static void TestCachePolicy() {
+    std::printf("Cache policy\n");
+
+    // C: internal, D: internal, E: a USB stick, F: locked (unknowable),
+    // Y: a share. Caches exist for C, D, E, F, Y and for a vanished X.
+    const std::vector<std::pair<wchar_t, int>> present = {
+        {L'C', 1}, {L'D', 1}, {L'E', 0}, {L'F', -1}, {L'Y', 0}};
+    const std::vector<wchar_t> cached = {L'C', L'd', L'E', L'F', L'Y', L'X'};
+    const std::vector<wchar_t> drop = CachesToDrop(present, cached);
+    auto has = [&drop](wchar_t c) {
+        for (wchar_t d : drop) if (d == c) return true;
+        return false;
+    };
+    CHECK(drop.size() == 3, "three caches go");
+    CHECK(has(L'E'), "removable media's listing dropped");
+    CHECK(has(L'Y'), "share's listing dropped");
+    CHECK(has(L'X'), "vanished drive's listing dropped");
+    CHECK(!has(L'C') && !has(L'D'), "internal disks keep theirs");
+    CHECK(!has(L'F'), "a locked volume that still has its letter is left alone");
+    CHECK(CachesToDrop(present, {}).empty(), "nothing cached, nothing to drop");
+    CHECK(CachesToDrop({}, {L'C'}).size() == 1,
+          "no drives at all means every cache is stale");
+}
+
 static void TestShareKeys() {
     std::printf("Share keys\n");
 
@@ -2425,6 +2449,7 @@ int main() {
     TestScanCache();
     TestSettings();
     TestShareKeys();
+    TestCachePolicy();
     TestUtf8();
     TestForceRemovalGuards();
     TestHasher();

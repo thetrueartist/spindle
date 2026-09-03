@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <winnetwk.h>
+#include <winioctl.h>   // IOCTL_STORAGE_QUERY_PROPERTY: which bus a disk hangs off
 #include <process.h>
 #include <shlobj.h>    // SHGetFolderPathW, for the cache directory
 #include <shellapi.h> // SHFileOperationW, for the Recycle Bin
@@ -435,6 +436,9 @@ ScanResult Scan(const std::wstring& root, unsigned threads,
 
 // ------------------------------------------------------------------ volumes
 
+// Defined with the cache code below; EnumerateVolumes needs it first.
+static bool VolumeIsHotplug(wchar_t letter);
+
 std::vector<Volume> EnumerateVolumes() {
     std::vector<Volume> out;
 
@@ -459,6 +463,7 @@ std::vector<Volume> EnumerateVolumes() {
         v.fixed  = (type == DRIVE_FIXED);
         v.remote = (type == DRIVE_REMOTE);
         v.path = rootPath;
+        v.cacheable = v.fixed && !VolumeIsHotplug(rootPath[0]);
 
         wchar_t label[MAX_PATH + 1] = {};
         wchar_t fsName[64] = {};
@@ -573,6 +578,90 @@ std::wstring CachePathForVolume(const std::wstring& volumePath) {
     return p;
 }
 
+// A fixed drive that hangs off USB, FireWire or a card reader, or that
+// reports removable media, is external however Windows types it: a USB
+// hard disk says DRIVE_FIXED. Asked of the device without any access
+// right, which a standard user may do. Deliberately not the hotplug
+// capability bit: many desktop boards flag internal SATA ports hotplug,
+// and that would stop caching the very disks caching is for.
+static bool VolumeIsHotplug(wchar_t letter) {
+    const wchar_t dev[8] = {L'\\', L'\\', L'.', L'\\', letter, L':', 0, 0};
+    const HANDLE h = CreateFileW(dev, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    STORAGE_PROPERTY_QUERY q{};
+    q.PropertyId = StorageDeviceProperty;
+    q.QueryType  = PropertyStandardQuery;
+    alignas(8) uint8_t buf[1024] = {};
+    DWORD got = 0;
+    bool hot = false;
+    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), buf,
+                        sizeof(buf), &got, nullptr) &&
+        got >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+        const auto* d = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(buf);
+        hot = d->RemovableMedia != 0 || d->BusType == BusTypeUsb ||
+              d->BusType == BusType1394 || d->BusType == BusTypeSd ||
+              d->BusType == BusTypeMmc;
+    }
+    CloseHandle(h);
+    return hot;
+}
+
+// 1 cacheable, 0 never, -1 unknowable (letter exists, volume not ready).
+static int CacheVerdict(wchar_t letter) {
+    const wchar_t r3[4] = {letter, L':', L'\\', 0};
+    const UINT type = GetDriveTypeW(r3);
+    if (type == DRIVE_REMOVABLE || type == DRIVE_REMOTE ||
+        type == DRIVE_CDROM || type == DRIVE_RAMDISK) {
+        return 0;
+    }
+    if (type != DRIVE_FIXED) return -1;
+    return VolumeIsHotplug(letter) ? 0 : 1;
+}
+
+bool VolumeCacheable(const std::wstring& root) {
+    if (!IsVolumeRootPath(root)) return false;
+    return CacheVerdict(root[0]) == 1;
+}
+
+size_t PruneStaleCaches() {
+    const std::wstring dir = CacheDir();
+    if (dir.empty()) return 0;
+
+    std::vector<wchar_t> cached;
+    WIN32_FIND_DATAW fd{};
+    const HANDLE h = FindFirstFileW((dir + L"\\?.spincache").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+            const wchar_t c = static_cast<wchar_t>(towupper(fd.cFileName[0]));
+            if (c >= L'A' && c <= L'Z') cached.push_back(c);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (cached.empty()) return 0;
+
+    const UINT oldMode = SetErrorMode(SEM_FAILCRITICALERRORS);
+    std::vector<std::pair<wchar_t, int>> present;
+    const DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if ((mask & (1u << i)) == 0) continue;
+        const wchar_t letter = static_cast<wchar_t>(L'A' + i);
+        present.emplace_back(letter, CacheVerdict(letter));
+    }
+    SetErrorMode(oldMode);
+
+    size_t removed = 0;
+    for (wchar_t letter : CachesToDrop(present, cached)) {
+        std::wstring p = dir;
+        p += L'\\';
+        p += letter;
+        p += L".spincache";
+        if (DeleteFileW(p.c_str())) ++removed;
+    }
+    return removed;
+}
+
 static uint32_t VolumeSerial(const std::wstring& volumePath) {
     DWORD serial = 0;
     GetVolumeInformationW(volumePath.c_str(), nullptr, 0, &serial, nullptr,
@@ -585,6 +674,12 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
     if (!IsVolumeRootPath(volumePath)) return false;
     const std::wstring path = CachePathForVolume(volumePath);
     if (path.empty()) return false;
+    // A listing of media that should never have been cached (written by
+    // an older build) is removed on first touch rather than served.
+    if (!VolumeCacheable(volumePath)) {
+        DeleteFileW(path.c_str());
+        return false;
+    }
 
     const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
                                  FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -651,6 +746,8 @@ bool LoadScanCache(const std::wstring& volumePath, ScanResult& out,
 
 bool SaveScanCache(const std::wstring& volumePath, const ScanResult& res) {
     if (!IsVolumeRootPath(volumePath)) return false;
+    // Only an internal fixed disk keeps a listing on this machine.
+    if (!VolumeCacheable(volumePath)) return false;
     const std::wstring path = CachePathForVolume(volumePath);
     if (path.empty()) return false;
 

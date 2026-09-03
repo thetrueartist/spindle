@@ -48,6 +48,14 @@ before display and before CSV export, and are refused as path components
 if they contain separators, reserved characters or trailing dots and
 spaces.
 
+Data at rest is kept small and short-lived. The only thing written
+besides settings is the scan cache under `%LOCALAPPDATA%\Spindle`: one
+file per internal fixed disk holding names, sizes and kinds, never file
+contents. Removable media, externally attached disks and network shares
+are never cached, stale caches are removed at launch, and turning caching
+off deletes what exists. A network share is read only after an explicit
+per-share permission, remembered only if asked to be.
+
 ## Updates
 
 Release builds check for updates at launch, which the menu can turn off.

@@ -575,6 +575,10 @@ struct Volume {
     bool         ready    = false;
     bool         fixed    = false;  // DRIVE_FIXED: safe to read unprompted
     bool         remote   = false;  // DRIVE_REMOTE: read only with permission
+    // An internal fixed disk. Only these are cached or read unprompted:
+    // removable media, disks on a USB, FireWire or card-reader bus, and
+    // network shares come and go, and a listing must not outlive them.
+    bool         cacheable = false;
 };
 
 std::vector<Volume> EnumerateVolumes();
@@ -583,6 +587,24 @@ std::vector<Volume> EnumerateVolumes();
 // the identity to remember permission under (empty when unknowable).
 bool RootIsNetwork(const std::wstring& root);
 std::wstring ShareIdentityForRoot(const std::wstring& root);
+
+// Windows-only, scan.cpp. Whether a lettered root may be cached at all
+// (see Volume::cacheable), and the launch sweep that removes any cache
+// file whose drive is gone or should never have had one. Returns how
+// many were removed.
+bool   VolumeCacheable(const std::wstring& root);
+size_t PruneStaleCaches();
+
+// Portable decision behind PruneStaleCaches, host-tested. `present` lists
+// every drive letter the system currently has, with 1 for cacheable, 0
+// for never-cacheable and -1 for unknowable (a locked encrypted volume
+// keeps its letter but answers nothing, and must keep its cache).
+// `cached` lists the letters that have a cache file. Returns the letters
+// whose cache should be deleted: absent from the system, or present and
+// never-cacheable.
+std::vector<wchar_t> CachesToDrop(
+    const std::vector<std::pair<wchar_t, int>>& present,
+    const std::vector<wchar_t>& cached);
 
 // ------------------------------------------------------------------ treemap
 
