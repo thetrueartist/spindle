@@ -44,9 +44,9 @@ public static class Native {
         public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2;
         public int dmPanningWidth, dmPanningHeight;
     }
-    [DllImport("user32.dll")] public static extern bool EnumDisplaySettingsW(string dev, int mode, ref DEVMODE dm);
-    [DllImport("user32.dll")] public static extern int ChangeDisplaySettingsW(ref DEVMODE dm, int flags);
-    [DllImport("user32.dll")] public static extern IntPtr FindWindowW(string cls, string title);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettingsW(string dev, int mode, ref DEVMODE dm);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsW(ref DEVMODE dm, int flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
@@ -176,10 +176,21 @@ if (-not (Test-Path (Join-Path $root "Games"))) {
     Log ("demo volume filled: {0} files" -f (Get-ChildItem $root -Recurse -File).Count)
 }
 
+function ShotScreen($name) {
+    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)
+    $g.Dispose()
+    $bmp.Save((Join-Path $Out "$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
+
 # ------------------------------------------------------------- the window
 $exePath = (Resolve-Path $Exe).Path
 Log "launching $exePath $root"
 $proc = Start-Process -FilePath $exePath -ArgumentList $root -PassThru
+try {
 $hwnd = [IntPtr]::Zero
 for ($i = 0; $i -lt 60 -and $hwnd -eq [IntPtr]::Zero; $i++) {
     Start-Sleep -Milliseconds 500
@@ -259,7 +270,6 @@ $tabsY = 144 + 74 * $drives.Count + 10
 Log ("{0} fixed drives, demo card at y={1}, panel tabs at y={2}" -f $drives.Count, $cardY, $tabsY)
 function Tab($i) { Click (16 + 59 * $i + 29) ($tabsY + 12) }
 
-try {
 # --- 1. the map, after the scan (the demo card is clicked so the sidebar
 #        shows it selected even if the launch path already opened it)
 Start-Sleep -Seconds 4
@@ -335,10 +345,10 @@ if ($dlg -ne [IntPtr]::Zero) {
 } else { Log "no network dialog appeared" }
 } catch {
     Log "failed: $_"
-    try { ShotWindow "window_failure" } catch { }
+    try { ShotScreen "screen_failure" } catch { Log "no screen capture: $_" }
     throw
 } finally {
-    try { ShotWindow "window_end" } catch { }
+    try { ShotScreen "screen_end" } catch { }
     Log "done: $((Get-ChildItem $Out).Count) files in $Out"
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 }

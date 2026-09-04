@@ -46,12 +46,13 @@ jobs:
         shell: bash
         run: |
           set -e
+          taskkill //IM spindle.exe //F 2>/dev/null || true
           [ -d shots ] || exit 0
           git config user.name "screenshots"
           git config user.email "screenshots@users.noreply.github.com"
           git checkout --orphan screenshots-out
           git rm -rfq --cached . >/dev/null
-          git clean -fdxq -e shots
+          git clean -fdxq -e shots || true
           git add -f shots
           if git diff --cached --quiet; then echo "nothing was captured"; exit 0; fi
           git commit -qm "Captures from run ${{ github.run_id }}"
