@@ -46,6 +46,10 @@ public static class Native {
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettingsW(string dev, int mode, ref DEVMODE dm);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsW(ref DEVMODE dm, int flags);
+    // PowerShell hands a .NET string parameter an empty string for $null,
+    // which as a class filter matches nothing; the no-class form takes a
+    // pointer so that zero really means "any class".
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "FindWindowW")] public static extern IntPtr FindWindowByTitle(IntPtr cls, string title);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
@@ -194,7 +198,7 @@ try {
 $hwnd = [IntPtr]::Zero
 for ($i = 0; $i -lt 60 -and $hwnd -eq [IntPtr]::Zero; $i++) {
     Start-Sleep -Milliseconds 500
-    $hwnd = [Native]::FindWindowW($null, "Spindle")
+    $hwnd = [Native]::FindWindowByTitle([IntPtr]::Zero, "Spindle")
 }
 if ($hwnd -eq [IntPtr]::Zero) { throw "the window never appeared" }
 Start-Sleep -Seconds 2
