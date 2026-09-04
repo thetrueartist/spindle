@@ -28,6 +28,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
+// PowerShell cannot take a struct back from an out or ref parameter, so
+// every call that fills one lives here and hands back plain numbers.
 public static class Native {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
@@ -44,21 +46,51 @@ public static class Native {
         public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2;
         public int dmPanningWidth, dmPanningHeight;
     }
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettingsW(string dev, int mode, ref DEVMODE dm);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsW(ref DEVMODE dm, int flags);
-    // PowerShell hands a .NET string parameter an empty string for $null,
-    // which as a class filter matches nothing; the no-class form takes a
-    // pointer so that zero really means "any class".
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettingsW(string dev, int mode, ref DEVMODE dm);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int ChangeDisplaySettingsW(ref DEVMODE dm, int flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "FindWindowW")] public static extern IntPtr FindWindowByTitle(IntPtr cls, string title);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
-    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+
+    // {width, height} of the current display mode.
+    public static int[] CurrentMode() {
+        DEVMODE dm = new DEVMODE();
+        dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+        if (!EnumDisplaySettingsW(null, -1, ref dm)) return new int[] { 0, 0 };
+        return new int[] { dm.dmPelsWidth, dm.dmPelsHeight };
+    }
+    // Asks for a mode; 0 means the display took it.
+    public static int SetMode(int width, int height) {
+        DEVMODE dm = new DEVMODE();
+        dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+        EnumDisplaySettingsW(null, -1, ref dm);
+        dm.dmPelsWidth = width;
+        dm.dmPelsHeight = height;
+        dm.dmFields = 0x80000 | 0x100000;   // DM_PELSWIDTH | DM_PELSHEIGHT
+        return ChangeDisplaySettingsW(ref dm, 0);
+    }
+    // {left, top, right, bottom} of the window frame on screen.
+    public static int[] WindowRect(IntPtr h) {
+        RECT r; GetWindowRect(h, out r);
+        return new int[] { r.L, r.T, r.R, r.B };
+    }
+    // {width, height} of the client area.
+    public static int[] ClientSize(IntPtr h) {
+        RECT r; GetClientRect(h, out r);
+        return new int[] { r.R - r.L, r.B - r.T };
+    }
+    // {x, y} on screen of the client area's top-left corner.
+    public static int[] ClientOrigin(IntPtr h) {
+        POINT p; p.X = 0; p.Y = 0;
+        ClientToScreen(h, ref p);
+        return new int[] { p.X, p.Y };
+    }
 }
 "@
 
@@ -70,18 +102,13 @@ $Out = (Resolve-Path $Out).Path
 # The hosted runner boots at 1024x768, too small for the window the README
 # shows. Ask for something larger; the synthetic display usually obliges,
 # and if it does not the window is shrunk to fit further down.
-$dm = New-Object Native+DEVMODE
-$dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm)
-[void][Native]::EnumDisplaySettingsW($null, -1, [ref]$dm)
-Log ("display now {0}x{1}" -f $dm.dmPelsWidth, $dm.dmPelsHeight)
-foreach ($mode in @(@(1600, 1000), @(1600, 900), @(1440, 900), @(1920, 1080))) {
-    if ($dm.dmPelsWidth -ge 1300 -and $dm.dmPelsHeight -ge 830) { break }
-    $try = $dm
-    $try.dmPelsWidth = $mode[0]; $try.dmPelsHeight = $mode[1]
-    $try.dmFields = 0x80000 -bor 0x100000        # DM_PELSWIDTH | DM_PELSHEIGHT
-    $r = [Native]::ChangeDisplaySettingsW([ref]$try, 0)
-    Log ("ChangeDisplaySettings {0}x{1} -> {2}" -f $mode[0], $mode[1], $r)
-    if ($r -eq 0) { Start-Sleep -Seconds 2; [void][Native]::EnumDisplaySettingsW($null, -1, [ref]$dm) }
+$mode = [Native]::CurrentMode()
+Log ("display now {0}x{1}" -f $mode[0], $mode[1])
+foreach ($want in @(@(1600, 1000), @(1600, 900), @(1440, 900), @(1920, 1080))) {
+    if ($mode[0] -ge 1300 -and $mode[1] -ge 830) { break }
+    $r = [Native]::SetMode($want[0], $want[1])
+    Log ("ChangeDisplaySettings {0}x{1} -> {2}" -f $want[0], $want[1], $r)
+    if ($r -eq 0) { Start-Sleep -Seconds 2; $mode = [Native]::CurrentMode() }
 }
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 Log ("screen {0}x{1}" -f $screen.Width, $screen.Height)
@@ -205,17 +232,18 @@ Start-Sleep -Seconds 2
 
 # Size the client area exactly, so every position below and every crop
 # matches the layout the README was drawn for.
-$wr = New-Object Native+RECT; $cr = New-Object Native+RECT
-[void][Native]::GetWindowRect($hwnd, [ref]$wr); [void][Native]::GetClientRect($hwnd, [ref]$cr)
-$frameW = ($wr.R - $wr.L) - ($cr.R - $cr.L); $frameH = ($wr.B - $wr.T) - ($cr.B - $cr.T)
+$wr = [Native]::WindowRect($hwnd); $cs = [Native]::ClientSize($hwnd)
+$frameW = ($wr[2] - $wr[0]) - $cs[0]; $frameH = ($wr[3] - $wr[1]) - $cs[1]
+Log ("window {0}x{1}, client {2}x{3}, frame {4}+{5}" -f ($wr[2] - $wr[0]), ($wr[3] - $wr[1]), $cs[0], $cs[1], $frameW, $frameH)
 $W = [Math]::Min($ClientW, $screen.Width - $frameW - 16)
 $H = [Math]::Min($ClientH, $screen.Height - $frameH - 16)
 [void][Native]::SetWindowPos($hwnd, [IntPtr]::Zero, 8, 8, $W + $frameW, $H + $frameH, 0x0040)
 Start-Sleep -Milliseconds 800
 [void][Native]::SetForegroundWindow($hwnd)
-[void][Native]::GetClientRect($hwnd, [ref]$cr)
-$origin = New-Object Native+POINT; [void][Native]::ClientToScreen($hwnd, [ref]$origin)
-$W = $cr.R - $cr.L; $H = $cr.B - $cr.T
+$cs = [Native]::ClientSize($hwnd); $o = [Native]::ClientOrigin($hwnd)
+$W = $cs[0]; $H = $cs[1]
+$origin = New-Object PSObject -Property @{ X = $o[0]; Y = $o[1] }
+if ($W -le 0 -or $H -le 0) { throw "client area is ${W}x${H}" }
 Log ("client {0}x{1} at screen {2},{3}" -f $W, $H, $origin.X, $origin.Y)
 
 function Shot($name, $x = 0, $y = 0, $w = 0, $h = 0) {
@@ -230,10 +258,10 @@ function Shot($name, $x = 0, $y = 0, $w = 0, $h = 0) {
 }
 function ShotWindow($name) {
     # The whole window including its frame, for the record.
-    [void][Native]::GetWindowRect($hwnd, [ref]$wr)
-    $bmp = New-Object System.Drawing.Bitmap ($wr.R - $wr.L), ($wr.B - $wr.T)
+    $r = [Native]::WindowRect($hwnd)
+    $bmp = New-Object System.Drawing.Bitmap ($r[2] - $r[0]), ($r[3] - $r[1])
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($wr.L, $wr.T, 0, 0, $bmp.Size)
+    $g.CopyFromScreen($r[0], $r[1], 0, 0, $bmp.Size)
     $g.Dispose()
     $bmp.Save((Join-Path $Out "$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
@@ -341,9 +369,9 @@ Keys "^a"; TypeText "\\nas\share"; Keys "{ENTER}"
 $dlg = [IntPtr]::Zero
 for ($i = 0; $i -lt 20 -and $dlg -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 300; $dlg = [Native]::FindWindowW("#32770", "Spindle") }
 if ($dlg -ne [IntPtr]::Zero) {
-    $dr = New-Object Native+RECT; [void][Native]::GetWindowRect($dlg, [ref]$dr)
-    $bmp = New-Object System.Drawing.Bitmap ($dr.R - $dr.L), ($dr.B - $dr.T)
-    $g = [System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($dr.L, $dr.T, 0, 0, $bmp.Size); $g.Dispose()
+    $dr = [Native]::WindowRect($dlg)
+    $bmp = New-Object System.Drawing.Bitmap ($dr[2] - $dr[0]), ($dr[3] - $dr[1])
+    $g = [System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($dr[0], $dr[1], 0, 0, $bmp.Size); $g.Dispose()
     $bmp.Save((Join-Path $Out "network.png"), [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
     Keys "{ESC}"
 } else { Log "no network dialog appeared" }
