@@ -24,6 +24,18 @@ ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 stop() { for pid in $(ps -eo pid,cmd | awk '$2 ~ /spindle\.exe$/ {print $1}'); do kill -TERM "$pid" 2>/dev/null; done; }
 windows() { xdotool search --name 'Spindle' 2>/dev/null | wc -l; }
+# Wait until exactly N top-level Spindle windows exist, up to `limit`
+# seconds. A fixed sleep is not enough: a cold Wine on a shared machine
+# can take several seconds to put a dialog up, and the count would then
+# be read before the dialog existed. Proving a dialog does NOT appear
+# still needs a plain sleep, since there is nothing to wait for.
+wait_windows() {
+  local want=$1 limit=${2:-20} i=0
+  while [ "$(windows)" != "$want" ] && [ $i -lt $((limit * 2)) ]; do
+    sleep 0.5; i=$((i + 1))
+  done
+  [ "$(windows)" = "$want" ]
+}
 menu() { ui_focus; ui_click 240 28; sleep 1; xdotool mousemove $((UI_X+260)) $((UI_Y+$1)) click 1; sleep 1.2; }
 stop; sleep 1
 [ -f "$C/settings.txt" ] && sed -i '/^trusted_share=/d' "$C/settings.txt"
@@ -50,18 +62,19 @@ ui_click 700 400; sleep 0.3; ui_key ctrl+l; sleep 0.5; ui_key ctrl+a; ui_type 'Y
 ui_shot corpo_tab "300x30+$((UI_X+280))+$((UI_Y+10))" >/dev/null; ui_key Escape; sleep 0.3
 ok "captured build/uitest/corpo_tab_c.png (expect the text unchanged)"
 echo "7) clicking the network card asks; Don't scan"
-ui_click 137 402; sleep 2
-[ "$(windows)" = "2" ] && ok "dialog shown" || bad "no dialog"
-ui_dialog >/dev/null && dlg_click 314 130; sleep 1
-[ "$(windows)" = "1" ] && ok "declined" || bad "dialog still open"
+ui_click 137 402
+wait_windows 2 && ok "dialog shown" || bad "no dialog"
+ui_dialog >/dev/null && dlg_click 314 130
+wait_windows 1 && ok "declined" || bad "dialog still open"
 echo "8) a GLOBALROOT spelling is refused without a dialog"
 ui_click 700 400; sleep 0.3; ui_key ctrl+l; sleep 0.5; ui_key ctrl+a; ui_type '\\?\GLOBALROOT\Device\Mup\s\s'; ui_key Return; sleep 1.5
 [ "$(windows)" = "1" ] && ok "no dialog" || bad "dialog appeared"; ui_key Escape; sleep 1.2
 echo "9) a UNC path in the address bar asks; tick remember; Scan"
-ui_click 700 400; sleep 0.8; ui_key ctrl+l; sleep 0.8; ui_key ctrl+a; ui_type '\\nas\share\deep'; sleep 0.3; ui_key Return; sleep 3
-[ "$(windows)" = "2" ] && ok "dialog shown" || bad "no dialog"
-ui_dialog >/dev/null && { dlg_click 14 127; sleep 0.3; dlg_click 230 127; }; sleep 3
-[ "$(windows)" = "1" ] && ok "answered" || bad "dialog still open"
+ui_click 700 400; sleep 0.8; ui_key ctrl+l; sleep 0.8; ui_key ctrl+a; ui_type '\\nas\share\deep'; sleep 0.3; ui_key Return
+wait_windows 2 && ok "dialog shown" || bad "no dialog"
+ui_dialog >/dev/null && { dlg_click 14 127; sleep 0.3; dlg_click 230 127; }
+wait_windows 1 && ok "answered" || bad "dialog still open"
+sleep 2   # let the scan the answer started settle before the next check
 echo "10) the share is remembered by its own name"
 grep -q 'trusted_share=\\\\nas\\share$' <(tr -d '\r' < "$C/settings.txt") && ok "trusted_share=\\\\nas\\share" || bad "not remembered"
 echo "11) headless on the remembered share proceeds; a sibling share does not"
