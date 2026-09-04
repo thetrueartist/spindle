@@ -141,6 +141,41 @@ Cat CategoryForFile(const std::wstring& name) {
     return Cat::Other;
 }
 
+// --------------------------------------------------------------------- tree
+
+// Post-order size rollup, done iteratively. A recursive version would risk the
+// stack on a deeply nested tree, and extended-length paths permit far more
+// nesting than MAX_PATH ever did.
+void RollUp(Node& root) {
+    struct Frame { Node* node; size_t next; };
+
+    std::vector<Frame> stack;
+    stack.push_back(Frame{&root, 0});
+
+    while (!stack.empty()) {
+        Frame& f = stack.back();
+        if (f.next < f.node->children.size()) {
+            Node* child = &f.node->children[f.next];
+            ++f.next;
+            if (child->dir) stack.push_back(Frame{child, 0});
+            continue;
+        }
+
+        Node* n = f.node;
+        if (n->dir) {
+            uint64_t total = 0;
+            uint32_t files = 0;
+            for (const Node& c : n->children) {
+                total = SatAdd(total, c.size);
+                files += c.files;
+            }
+            n->size  = total;
+            n->files = files;
+        }
+        stack.pop_back();
+    }
+}
+
 // ------------------------------------------------------------------ treemap
 
 namespace {

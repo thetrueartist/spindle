@@ -9,11 +9,14 @@
 // complaint if any is missing: an NTFS volume, a local disk, and elevation
 // (raw volume access is an administrator privilege).
 //
-// This file does I/O and assembly only. Every byte that comes off the disk is
-// interpreted by src/ntfs.cpp, which is fuzz-tested separately, because the
-// parsing is the part that is dangerous and the part worth isolating.
+// This file does the I/O only. Every byte that comes off the disk is
+// interpreted by src/ntfs.cpp and turned into the tree by src/mfttree.cpp,
+// both of which are tested on the host, against tables built to be hostile
+// and against a real image, because those are the parts that are dangerous
+// and the parts worth isolating.
 
 #include "spindle.h"
+#include "mfttree.h"
 #include "ntfs.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -36,13 +39,6 @@ namespace {
 // hundreds of megabytes, and a single allocation that size is both a needless
 // spike and an easy way for a hostile volume to induce one.
 constexpr uint32_t kChunkBytes = 8u << 20;   // 8 MB
-
-// Refuse absurd MFT sizes outright. A real MFT is roughly 1 KB per file; this
-// bound corresponds to a volume with hundreds of millions of files.
-constexpr uint64_t kMaxMftBytes = 8ull << 30;
-
-// Cap on records, and so on the tree the caller ends up holding.
-constexpr uint64_t kMaxRecords = 64u << 20;
 
 class Handle {
 public:
@@ -161,50 +157,6 @@ bool IsElevated() {
     return elevation.TokenIsElevated != 0;
 }
 
-// One entry per MFT record. Indexed by record number, so the parent reference
-// in a record is a direct index rather than a lookup.
-struct Entry {
-    uint32_t parent   = 0;
-    uint32_t nameOff  = 0;   // into the name pool
-    uint16_t nameLen  = 0;
-    bool     isDir    = false;
-    bool     used     = false;
-    bool     hardlink = false;   // more than one name points at this record
-    uint64_t size     = 0;
-};
-
-// Names live in one contiguous pool rather than a string per entry. A million
-// separate small allocations costs both time and a per-allocation header;
-// this is one buffer and a 6-byte reference per record.
-struct NamePool {
-    std::vector<wchar_t> data;
-
-    // Returns kNoName when the pool has grown past what a 32-bit offset
-    // can address. Truncating instead would hand back a reference to the
-    // wrong part of the buffer, and a name is what paths are built from.
-    static constexpr uint32_t kNoName = 0xFFFFFFFFu;
-
-    uint32_t Add(const std::wstring& s, uint16_t& lenOut) {
-        if (data.size() >= kNoName) {
-            lenOut = 0;
-            return kNoName;
-        }
-        const uint32_t off = static_cast<uint32_t>(data.size());
-        const size_t n = std::min<size_t>(s.size(), 0xFFFF);
-        data.insert(data.end(), s.begin(), s.begin() + static_cast<long>(n));
-        lenOut = static_cast<uint16_t>(n);
-        return off;
-    }
-
-    std::wstring Get(uint32_t off, uint16_t len) const {
-        if (off == kNoName) return std::wstring();
-        if (len == 0 || off > data.size() || data.size() - off < len) {
-            return std::wstring();
-        }
-        return std::wstring(data.begin() + off, data.begin() + off + len);
-    }
-};
-
 // Walk the $MFT record itself to find where the rest of the table lives.
 bool ReadMftRunList(HANDLE vol, const ntfs::BootInfo& bi,
                     std::vector<ntfs::DataRun>& runs, uint64_t& mftBytes) {
@@ -215,53 +167,7 @@ bool ReadMftRunList(HANDLE vol, const ntfs::BootInfo& bi,
     if (!ntfs::ApplyFixups(rec.data(), rec.size(), bi.bytesPerSector)) {
         return false;
     }
-    if (std::memcmp(rec.data(), "FILE", 4) != 0) return false;
-
-    // Walk to the unnamed non-resident $DATA and take its run list. Done here
-    // rather than in ntfs.cpp because only this one record needs it, and the
-    // bounds logic is the same shape as ParseRecord's.
-    const size_t len = rec.size();
-    auto u16 = [&](size_t o) -> uint16_t {
-        return (o + 2 <= len) ? static_cast<uint16_t>(rec[o] | (rec[o + 1] << 8))
-                              : uint16_t{0};
-    };
-    auto u32 = [&](size_t o) -> uint32_t {
-        if (o + 4 > len) return 0;
-        return static_cast<uint32_t>(rec[o]) |
-               (static_cast<uint32_t>(rec[o + 1]) << 8) |
-               (static_cast<uint32_t>(rec[o + 2]) << 16) |
-               (static_cast<uint32_t>(rec[o + 3]) << 24);
-    };
-    auto u64 = [&](size_t o) -> uint64_t {
-        if (o + 8 > len) return 0;
-        uint64_t v = 0;
-        for (int i = 7; i >= 0; --i) v = (v << 8) | rec[o + static_cast<size_t>(i)];
-        return v;
-    };
-
-    const uint32_t used = u32(0x18);
-    const size_t limit = (used >= 48 && used <= len) ? used : len;
-    size_t off = u16(0x14);
-    if (off < 48 || off >= limit) return false;
-
-    for (size_t guard = 0; guard < ntfs::kMaxAttrsPerRec; ++guard) {
-        const uint32_t type = u32(off);
-        if (type == ntfs::kAttrEnd) break;
-        const uint32_t attrLen = u32(off + 4);
-        if (attrLen < 16 || (attrLen % 8) != 0 || attrLen > limit - off) break;
-
-        if (type == ntfs::kAttrData && rec[off + 8] == 1 && rec[off + 9] == 0) {
-            const uint16_t runOff = u16(off + 0x20);
-            if (runOff >= attrLen) return false;
-            mftBytes = u64(off + 0x30);          // real size
-            if (mftBytes == 0 || mftBytes > kMaxMftBytes) return false;
-            return ntfs::ParseRunList(rec.data() + off + runOff,
-                                      attrLen - runOff, runs);
-        }
-        off += attrLen;
-        if (off >= limit) break;
-    }
-    return false;
+    return ntfs::ParseMftDataRuns(rec.data(), rec.size(), runs, mftBytes);
 }
 
 }  // namespace
@@ -312,32 +218,10 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
     }
 
     const uint64_t recordCount = mftBytes / bi.bytesPerRecord;
-    // kRootRecord (5) is indexed unconditionally by the tree build below, so
-    // a table that does not contain it is not merely empty - it would read
-    // past the end of every vector sized from this count. A volume claiming
-    // a handful of records is malformed or hostile either way.
-    if (recordCount <= ntfs::kRootRecord || recordCount > kMaxRecords) {
-        return false;
-    }
+    mft::Assembler assembler;
+    if (!assembler.Begin(recordCount)) return false;
 
-    std::vector<Entry> entries;
-    try {
-        entries.resize(static_cast<size_t>(recordCount));
-    } catch (...) {
-        return false;   // fall back rather than dying on a huge volume
-    }
-
-    NamePool pool;
-    // Inside a try for the same reason `entries` is: this is hundreds of
-    // megabytes on a large volume, and failing to get it should fall back
-    // to the directory walk rather than end the scan.
-    try {
-        pool.data.reserve(static_cast<size_t>(recordCount) * 12);
-    } catch (...) {
-        return false;
-    }
-
-    // ---- pass one: read the MFT and parse every record -------------------
+    // ---- read the table, handing every chunk to the assembler ------------
     //
     // The read plan comes first: every non-sparse run split into
     // record-aligned chunks, each knowing which record number it starts at.
@@ -387,9 +271,6 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         }
     }
 
-    uint64_t files = 0, dirs = 0, bytes = 0;
-    uint64_t hardlinkFiles = 0, hardlinkBytes = 0;
-
     // Declared after `vol` on purpose: destruction runs in reverse, so an
     // in-flight read is drained before the handle it targets closes.
     AsyncRead ioA(vol.get(), kChunkBytes);
@@ -431,232 +312,30 @@ bool ScanMft(const std::wstring& root, Progress* progress, ScanResult& out) {
         }
 
         const Segment& seg = segments[s];
-        if (ok && progress) {
-            progress->tableBytes.fetch_add(seg.bytes,
-                                           std::memory_order_relaxed);
-        }
         if (!ok) {
             // A bad sector mid-table is not fatal: skip the chunk and keep
             // going. The result is incomplete, not wrong.
             continue;
         }
-
-        for (uint32_t p = 0, ri = 0; p + bi.bytesPerRecord <= seg.bytes;
-             p += bi.bytesPerRecord, ++ri) {
-            const uint64_t recordIndex = seg.firstRecord + ri;
-            if (recordIndex >= recordCount) break;
-            const size_t idx = static_cast<size_t>(recordIndex);
-
-            uint8_t* r = cur.Data() + p;
-            if (std::memcmp(r, "FILE", 4) != 0) continue;
-            if (!ntfs::ApplyFixups(r, bi.bytesPerRecord,
-                                   bi.bytesPerSector)) {
-                continue;
-            }
-
-            const ntfs::RecordInfo info =
-                ntfs::ParseRecord(r, bi.bytesPerRecord);
-            if (!info.valid || !info.inUse) continue;
-            if (info.isExtension) continue;
-
-            // The root directory names itself "." in its own $FILE_NAME,
-            // which the name filter rightly refuses as a path component.
-            // The root is not one: its name is the volume, set by the
-            // caller, and this record only has to exist so that every
-            // top-level entry finds its parent in use. Without it the
-            // table is counted in full and the tree comes back empty.
-            if (idx == ntfs::kRootRecord) {
-                if (info.isDir) {
-                    Entry& e = entries[idx];
-                    e.used   = true;
-                    e.isDir  = true;
-                    e.parent = ntfs::kRootRecord;
-                }
-                continue;
-            }
-
-            if (!info.hasName) continue;
-            // Compared at full width, so a 48-bit reference past the
-            // table is rejected instead of wrapping onto a valid index.
-            if (info.parent >= recordCount) continue;   // dangling parent
-
-            Entry& e = entries[idx];
-            e.used   = true;
-            e.parent = static_cast<uint32_t>(info.parent);   // range-checked
-            e.isDir  = info.isDir;
-            e.size   = info.isDir ? 0 : info.size;
-            e.nameOff = pool.Add(info.name, e.nameLen);
-            // One record is one file however many names point at it, so the
-            // totals here are already right - this only records that the
-            // file is reachable from somewhere else too, which is what
-            // decides whether deleting it frees anything.
-            e.hardlink = !info.isDir && info.links > 1;
-
-            if (info.isDir) {
-                ++dirs;
-            } else {
-                ++files;
-                bytes = SatAdd(bytes, info.size);
-                if (e.hardlink) {
-                    ++hardlinkFiles;
-                    hardlinkBytes = SatAdd(hardlinkBytes, info.size);
-                }
-            }
+        if (progress) {
+            progress->tableBytes.fetch_add(seg.bytes,
+                                           std::memory_order_relaxed);
         }
 
+        assembler.FeedChunk(seg.firstRecord, cur.Data(), seg.bytes,
+                            bi.bytesPerRecord, bi.bytesPerSector);
+
         if (progress) {
-            progress->files.store(files, std::memory_order_relaxed);
-            progress->dirs.store(dirs, std::memory_order_relaxed);
-            progress->bytes.store(bytes, std::memory_order_relaxed);
+            progress->files.store(assembler.Files(), std::memory_order_relaxed);
+            progress->dirs.store(assembler.Dirs(), std::memory_order_relaxed);
+            progress->bytes.store(assembler.Bytes(), std::memory_order_relaxed);
             progress->phase.store(2, std::memory_order_relaxed);
         }
     }
 
-    if (files == 0 && dirs == 0) return false;   // nothing usable; fall back
-
-    // Without a usable root record nothing can attach to the tree, and an
-    // empty tree under a full file count is worse than the slow path. This
-    // is checked here, after the reads have drained, rather than inside
-    // the loop where a read may still be in flight.
-    if (recordCount <= ntfs::kRootRecord ||
-        !entries[static_cast<size_t>(ntfs::kRootRecord)].used) {
-        return false;
-    }
-
-    // Everything from here to the end of the tree build is inside one
-    // try: these are the five largest allocations in the function, and
-    // this returns false on failure so the caller falls back to the
-    // directory walk. Without it a crafted volume turned "unavailable
-    // fast path" into a dead process, and the headless export had no
-    // catch above it at all.
-    try {
-
-    // ---- pass two: count children so every vector is sized exactly -------
-    // Polled here and in pass three so a drive switch that cancels this
-    // scan returns promptly instead of waiting out the whole tree build.
-    if (progress && progress->cancel.load(std::memory_order_relaxed)) {
-        return false;
-    }
-
-    std::vector<uint32_t> childCount(static_cast<size_t>(recordCount), 0);
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const Entry& e = entries[i];
-        if (!e.used) continue;
-        if (i == ntfs::kRootRecord) continue;
-        if (e.parent == i) continue;                 // self-parent: skip
-        if (!entries[e.parent].used) continue;       // orphan
-        if (!entries[e.parent].isDir) continue;      // parent is not a folder
-        ++childCount[e.parent];
-    }
-
-    // ---- pass three: build the tree, iteratively --------------------------
-
-    out.root.name = root;
-    out.root.dir  = true;
-    out.root.cat  = Cat::Directory;
-    out.root.children.clear();
-
-    // Breadth-first from the root record. Recursion here would be bounded by
-    // directory nesting depth, which a hostile volume controls.
-    // Depth travels with the frame: `Node` owns its children by value, so a
-    // tree deeper than the stack can unwind cannot be destroyed, and that
-    // crash would land when the tree is released rather than when the
-    // hostile volume was read.
-    struct Pending { uint32_t record; Node* node; uint32_t depth; };
-    std::vector<Pending> queue;
-    queue.push_back(Pending{ntfs::kRootRecord, &out.root, 0});
-
-    // Guards against a parent cycle, which a corrupt MFT can express and
-    // which would otherwise expand for ever.
-    std::vector<bool> visited(static_cast<size_t>(recordCount), false);
-    visited[ntfs::kRootRecord] = true;
-
-    // Bucket children by parent in one pass so the expansion below does not
-    // rescan the whole table per directory.
-    std::vector<uint32_t> childStart(static_cast<size_t>(recordCount) + 1, 0);
-    for (size_t i = 0; i < childCount.size(); ++i) {
-        childStart[i + 1] = childStart[i] + childCount[i];
-    }
-    std::vector<uint32_t>().swap(childCount);   // no longer needed
-
-    std::vector<uint32_t> childIds(childStart.back(), 0);
-    {
-        std::vector<uint32_t> cursor(childStart.begin(), childStart.end() - 1);
-        for (size_t i = 0; i < entries.size(); ++i) {
-            const Entry& e = entries[i];
-            if (!e.used || i == ntfs::kRootRecord) continue;
-            if (e.parent == i) continue;
-            if (!entries[e.parent].used || !entries[e.parent].isDir) continue;
-            childIds[cursor[e.parent]++] = static_cast<uint32_t>(i);
-        }
-    }
-
-    uint64_t builtGuard = 0;
-    while (!queue.empty()) {
-        if ((++builtGuard & 0x3FFF) == 0 && progress &&
-            progress->cancel.load(std::memory_order_relaxed)) {
-            out.root.children.clear();
-            return false;
-        }
-        const Pending p = queue.back();
-        queue.pop_back();
-
-        const uint32_t first = childStart[p.record];
-        const uint32_t last  = childStart[p.record + 1];
-        if (last <= first) continue;
-        if (p.depth >= kMaxTreeDepth) continue;   // stop, do not descend
-
-        p.node->children.reserve(last - first);
-
-        // Record which id produced which child, so the second loop can pair
-        // them up directly. Deriving the pairing from the loop index instead
-        // desynchronises the moment any child is skipped.
-        std::vector<uint32_t> added;
-        added.reserve(last - first);
-
-        for (uint32_t k = first; k < last; ++k) {
-            const uint32_t id = childIds[k];
-            if (id >= recordCount || visited[id]) continue;
-            visited[id] = true;
-
-            const Entry& e = entries[id];
-            Node child(pool.Get(e.nameOff, e.nameLen), e.isDir);
-            child.hardlink = e.hardlink;
-            if (e.isDir) {
-                child.cat = Cat::Directory;
-            } else {
-                child.size  = e.size;
-                child.files = 1;
-                child.cat   = CategoryForFile(child.name);
-            }
-            p.node->children.push_back(std::move(child));
-            added.push_back(id);
-        }
-
-        // Queue directories only now the vector has stopped growing: it was
-        // reserved for the full range and never exceeds it, so these pointers
-        // stay valid for the rest of the build.
-        for (size_t i = 0; i < added.size() && i < p.node->children.size();
-             ++i) {
-            if (entries[added[i]].isDir) {
-                queue.push_back(
-                    Pending{added[i], &p.node->children[i], p.depth + 1});
-            }
-        }
-    }
-
-    out.stats.fileCount     = files;
-    out.stats.dirCount      = dirs;
-    out.stats.hardlinkFiles = hardlinkFiles;
-    out.stats.hardlinkBytes = hardlinkBytes;
-    out.stats.bytes     = 0;   // filled in by the caller's roll-up
-
-    } catch (...) {
-        // The contract is that a failure here changes nothing and the
-        // caller falls back to the directory walk. The tree may be
-        // half-built by this point, so it goes too.
-        out.root.children.clear();
-        out.stats = ScanStats{};
+    // Checked here, after the reads have drained, rather than inside the
+    // loop where a read may still be in flight.
+    if (!assembler.Finish(root, out, progress ? &progress->cancel : nullptr)) {
         return false;
     }
     if (progress) progress->phase.store(0, std::memory_order_relaxed);

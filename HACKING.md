@@ -13,6 +13,7 @@ makes a million-file scan take well under a second.
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
 make test       host tests under ASan, UBSan and ThreadSanitizer
+make test-image the MFT assembler against a real NTFS image (ntfs-3g, root)
 make test-win   Windows-side tests; run with `wine build/test_win.exe`
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
@@ -33,7 +34,8 @@ src/spindle.h        types, and the public interface of everything below
 src/sync.h           SRWLOCK/CONDITION_VARIABLE, pthreads for host tests
 src/workqueue.h      the scanner's work queue, testable on any host
 src/ntfs.h/.cpp      NTFS on-disk structures, pure bytes, fuzz-tested
-src/mft.cpp          raw volume I/O and tree assembly (Windows)
+src/mfttree.h/.cpp   the tree built from MFT records, portable, tested on a real image
+src/mft.cpp          raw volume I/O for the MFT scan (Windows)
 src/scan.cpp         parallel FindFirstFileEx walker, volumes, file writing
 src/core.cpp         treemap, categories, reports, search, CSV, easing
 src/ui.cpp           Win32 window, Direct2D renderer, navigation, animation
@@ -41,17 +43,31 @@ res/                 icon, version info, manifest
 tools/make_icon.py   icon generator, stdlib only
 tools/hygiene.sh     what may never be committed; wired to the git hooks
 tools/wine-*.sh      the interface harness and the acceptance run under Wine
-tests/               core, ntfs, queue, stress; test_win for the Windows side
+tools/make-ntfs-image.sh  an NTFS image with a known tree, for the assembler test
+tools/win-screenshots.ps1 draws the README images on a real Windows desktop
+tests/               core, ntfs, mft, queue, stress; test_win for the Windows side
 docs/guide.md        using the program, in full
 docs/design.md       speed, architecture, text rendering, motion
 docs/*.png, *.gif    README media, captured from the real binary under Wine
 ```
 
-The split is deliberate: `core.cpp`, `ntfs.cpp` and `workqueue.h` contain no
-Windows headers, so they compile and run under sanitizers on any host. That
-is where the tests live, and it is why the fuzzing exists at all. Keep it
-that way. Anything that needs `windows.h` belongs in `scan.cpp`, `mft.cpp`
-or `ui.cpp`.
+The split is deliberate: `core.cpp`, `ntfs.cpp`, `mfttree.cpp` and
+`workqueue.h` contain no Windows headers, so they compile and run under
+sanitizers on any host. That is where the tests live, and it is why the
+fuzzing exists at all. Keep it that way. Anything that needs `windows.h`
+belongs in `scan.cpp`, `mft.cpp` or `ui.cpp`.
+
+The MFT scan is the clearest case. `mft.cpp` opens the volume and reads
+the table in overlapped chunks, and that is all it does; every record goes
+to `mfttree.cpp`, which decides what a parent reference is worth, what a
+cycle or a chain past `kMaxTreeDepth` gets, and what the root must look
+like for anything to attach. `make test` runs that assembler on tables
+built to be hostile, and `make test-image` runs it on a real volume:
+`tools/make-ntfs-image.sh` writes one with mkntfs, fills it through
+ntfs-3g (long, spaced and non-ASCII names, a directory large enough to
+need an index allocation, a forty-level chain, an empty file, a hard link)
+and lists what it wrote, and the tree assembled from the image's own
+table must match that list entry for entry.
 
 ## Invariants
 

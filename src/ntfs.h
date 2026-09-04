@@ -98,6 +98,20 @@ bool ApplyFixups(uint8_t* record, size_t len, uint32_t bytesPerSector);
 // Parses one MFT file record. `record` must already have had fixups applied.
 RecordInfo ParseRecord(const uint8_t* record, size_t len);
 
+// ------------------------------------------------------------- $MFT itself
+
+// Refuse absurd table sizes outright. A real MFT is roughly 1 KB per file;
+// this bound corresponds to a volume with hundreds of millions of files.
+inline constexpr uint64_t kMaxMftBytes = 8ull << 30;
+
+// Reads the extent of the table from record 0, the $MFT file's own record,
+// which must already have had fixups applied: the run list of its unnamed
+// non-resident $DATA, and the table's real size in bytes. False for a
+// record that is not a file record, has no such stream, or claims a size
+// of zero or past kMaxMftBytes.
+bool ParseMftDataRuns(const uint8_t* record, size_t len,
+                      std::vector<DataRun>& runs, uint64_t& mftBytes);
+
 // ------------------------------------------------------------------ limits
 
 // Caps that bound the work a hostile filesystem can induce. Each is far above

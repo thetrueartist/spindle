@@ -10,7 +10,8 @@ CXX_WIN  := $(ARCH)-w64-mingw32-g++
 CXX_HOST := g++
 WINDRES  := $(ARCH)-w64-mingw32-windres
 
-SRC      := src/core.cpp src/ntfs.cpp src/mft.cpp src/scan.cpp src/update.cpp src/ui.cpp
+SRC      := src/core.cpp src/ntfs.cpp src/mfttree.cpp src/mft.cpp src/scan.cpp \
+            src/update.cpp src/ui.cpp
 RC       := res/spindle.rc
 RES      := build/spindle.res.o
 ICON     := build/spindle.ico
@@ -42,13 +43,14 @@ LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
             -ladvapi32 -lrstrtmgr \
             -lcomdlg32 -lwinhttp -lbcrypt -luuid -lmpr -lcomctl32 -lcrypt32
 
-.PHONY: all help test test-core test-ntfs test-queue test-win stress analyze clean dirs icon hooks hygiene
+.PHONY: all help test test-core test-ntfs test-queue test-mft test-image test-win stress analyze clean dirs icon hooks hygiene
 
 all: dirs $(OUT)
 
 help:
 	@echo "make            cross-compile build/spindle.exe (MinGW-w64; ARCH=aarch64 for ARM64)"
 	@echo "make test       host tests under ASan, UBSan and ThreadSanitizer"
+	@echo "make test-image the MFT assembler against a real NTFS image (needs ntfs-3g, root)"
 	@echo "make test-win   Windows-side tests -> build/test_win.exe (run: wine build/test_win.exe)"
 	@echo "make stress     the scanner's concurrency structure over a real tree"
 	@echo "make analyze    cppcheck + clang-tidy over the portable core"
@@ -73,7 +75,7 @@ icon: $(ICON)
 $(RES): $(RC) res/spindle.manifest $(ICON)
 	$(WINDRES) -I res -I build --input $(RC) --output $@ --output-format=coff
 
-$(OUT): $(SRC) src/spindle.h $(RES)
+$(OUT): $(SRC) src/spindle.h src/ntfs.h src/mfttree.h src/sync.h src/workqueue.h $(RES)
 	$(CXX_WIN) $(CXXFLAGS) $(SRC) $(RES) -o $@ $(LDFLAGS) $(LIBS)
 	@echo "built $@"
 
@@ -88,7 +90,7 @@ hygiene:
 # Windows CI job; on a developer box, `wine build/test_win.exe`.
 test-win: dirs
 	$(CXX_WIN) $(CXXFLAGS) -Isrc tests/test_win.cpp src/scan.cpp src/core.cpp \
-	    src/mft.cpp src/ntfs.cpp -o build/test_win.exe \
+	    src/mft.cpp src/mfttree.cpp src/ntfs.cpp -o build/test_win.exe \
 	    -static -static-libgcc -static-libstdc++ $(HARDEN_L) $(LIBS)
 
 # -- Host tests --------------------------------------------------------------
@@ -125,8 +127,29 @@ build/test_queue_tsan: tests/test_queue.cpp src/workqueue.h src/sync.h tests/che
 	    -fsanitize=thread -fno-omit-frame-pointer \
 	    tests/test_queue.cpp -o $@ -pthread
 
+# The tree assembly behind the MFT scan, on tables built to be hostile.
+build/test_mft: tests/test_mft.cpp src/mfttree.cpp src/ntfs.cpp src/core.cpp \
+                src/mfttree.h src/ntfs.h src/spindle.h tests/check.h \
+                tests/ntfs_fixture.h
+	@mkdir -p build
+	$(CXX_HOST) $(TEST_FLAGS) tests/test_mft.cpp src/mfttree.cpp src/ntfs.cpp \
+	    src/core.cpp -o $@
+
+# A real NTFS image, written by mkntfs and filled through ntfs-3g. The
+# mount needs root, so CI runs the script under sudo before `make
+# test-image`; on a box without the tools, `make test` still covers the
+# assembler with synthetic tables.
+build/demo.ntfs: tools/make-ntfs-image.sh
+	tools/make-ntfs-image.sh $@
+
 test-core: build/test_core
 	$(TEST_ENV) ./build/test_core $(ARGS)
+
+test-mft: build/test_mft
+	$(TEST_ENV) ./build/test_mft $(ARGS)
+
+test-image: build/test_mft build/demo.ntfs
+	$(TEST_ENV) ./build/test_mft --image build/demo.ntfs $(ARGS)
 
 test-ntfs: build/test_ntfs
 	$(TEST_ENV) ./build/test_ntfs $(ARGS)
@@ -135,7 +158,7 @@ test-queue: build/test_queue_asan build/test_queue_tsan
 	ASAN_OPTIONS=detect_leaks=1 ./build/test_queue_asan $(ARGS)
 	./build/test_queue_tsan $(ARGS)
 
-test: test-core test-ntfs test-queue
+test: test-core test-ntfs test-queue test-mft
 
 # Walks a real directory tree with the scanner's exact concurrency structure.
 # Needs a POSIX host; the Windows scanner shares the queue and worker shape.

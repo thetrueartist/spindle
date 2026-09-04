@@ -182,9 +182,11 @@ make stress     # the scanner's concurrency structure over a real tree
 make analyze    # cppcheck + clang-tidy
 ```
 
-The treemap, categorisation, reports, parsers and the scanner's work
-queue are deliberately free of Windows headers, so they compile and run
-under sanitizers on any host, and that is where most of the tests live.
+The treemap, categorisation, reports, parsers, the tree built from the
+Master File Table and the scanner's work queue are deliberately free of
+Windows headers, so they compile and run under sanitizers on any host,
+and that is where most of the tests live; the MFT assembly is also run
+against a real NTFS image written by mkntfs.
 The Windows-only pieces run on real Windows in CI, and every push runs
 a hygiene check that refuses personal paths and secrets.
 

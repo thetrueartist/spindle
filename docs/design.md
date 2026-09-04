@@ -32,7 +32,8 @@ src/spindle.h        types and interfaces
 src/sync.h           SRWLOCK / CONDITION_VARIABLE, pthreads for host tests
 src/workqueue.h      the scanner's work queue (testable on any host)
 src/ntfs.h/.cpp      NTFS on-disk structures, pure bytes, fuzz-tested
-src/mft.cpp          raw volume I/O and tree assembly (Windows)
+src/mfttree.h/.cpp   the tree built from MFT records (portable)
+src/mft.cpp          raw volume I/O for the MFT scan (Windows)
 src/core.cpp         treemap, categorisation, reports, CSV (portable)
 src/scan.cpp         parallel FindFirstFileEx walker, volume enumeration
 src/ui.cpp           Win32 window, Direct2D renderer, navigation

@@ -13,6 +13,8 @@
 //   ./build/test_core --repeat 20      run the selection twenty times over:
 //                                      a race that shows once in ten runs
 //                                      is still a race
+//   ./build/test_mft --image FILE      any other --name value pair is kept
+//                                      for the suites, read with Option()
 //
 // Nothing but the standard library, on purpose: the tests exist to hold
 // the program to its no-dependency promise, so they keep it themselves.
@@ -24,6 +26,7 @@
 #include <cstdlib>
 #include <exception>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace spindle::testing {
@@ -52,6 +55,20 @@ struct State {
 inline State& Current() {
     static State state;
     return state;
+}
+
+// Extra --name value pairs from the command line, for suites that want an
+// input the binary cannot make itself (an image built by another tool).
+inline std::vector<std::pair<std::string, std::string>>& Options() {
+    static std::vector<std::pair<std::string, std::string>> options;
+    return options;
+}
+
+inline std::string Option(const char* name) {
+    for (const auto& kv : Options()) {
+        if (kv.first == name) return kv.second;
+    }
+    return std::string();
 }
 
 inline void Record(bool ok, const char* file, int line, const char* what,
@@ -93,6 +110,8 @@ inline int Main(const char* title, int argc, char** argv) {
         } else if (a == "--repeat" && i + 1 < argc) {
             repeat = std::atoi(argv[++i]);
             if (repeat < 1) repeat = 1;
+        } else if (a.rfind("--", 0) == 0 && a.size() > 2 && i + 1 < argc) {
+            Options().emplace_back(a.substr(2), argv[++i]);
         } else {
             std::printf("usage: %s [--list] [--filter NAME] [--repeat N]\n",
                         argc > 0 ? argv[0] : "test");

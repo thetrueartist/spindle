@@ -394,4 +394,42 @@ RecordInfo ParseRecord(const uint8_t* record, size_t len) {
     return info;
 }
 
+// ------------------------------------------------------------- $MFT itself
+
+bool ParseMftDataRuns(const uint8_t* record, size_t len,
+                      std::vector<DataRun>& runs, uint64_t& mftBytes) {
+    mftBytes = 0;
+    runs.clear();
+    const Reader r(record, len);
+    if (!r.Has(0, 48)) return false;
+    if (std::memcmp(r.Ptr(0), "FILE", 4) != 0) return false;
+
+    const uint32_t used = r.U32(0x18);
+    const size_t limit = (used >= 48 && used <= len) ? used : len;
+    size_t off = r.U16(0x14);
+    if (off < 48 || off >= limit) return false;
+
+    for (size_t guard = 0; guard < kMaxAttrsPerRec; ++guard) {
+        if (!r.Has(off, 16)) return false;
+        const uint32_t type = r.U32(off);
+        if (type == kAttrEnd) break;
+        const uint32_t attrLen = r.U32(off + 4);
+        if (attrLen < 16 || (attrLen % 8) != 0 || attrLen > limit - off) {
+            break;
+        }
+
+        // The unnamed, non-resident $DATA is the table's own extent.
+        if (type == kAttrData && r.U8(off + 8) == 1 && r.U8(off + 9) == 0) {
+            const uint16_t runOff = r.U16(off + 0x20);
+            if (runOff >= attrLen) return false;
+            mftBytes = r.U64(off + 0x30);          // real size
+            if (mftBytes == 0 || mftBytes > kMaxMftBytes) return false;
+            return ParseRunList(r.Ptr(off + runOff), attrLen - runOff, runs);
+        }
+        off += attrLen;
+        if (off >= limit) break;
+    }
+    return false;
+}
+
 }  // namespace spindle::ntfs

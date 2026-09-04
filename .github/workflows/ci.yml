@@ -18,6 +18,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Host test suite (ASan, UBSan, TSan)
         run: make test
+      - name: The MFT assembler against a real NTFS image
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ntfs-3g
+          sudo tools/make-ntfs-image.sh build/demo.ntfs
+          make test-image
       - name: Concurrency stress walk
         run: make stress
 

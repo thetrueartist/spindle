@@ -18,135 +18,9 @@ using namespace spindle::ntfs;
 
 #include "check.h"
 
-namespace {
+#include "ntfs_fixture.h"
 
-void Put16(std::vector<uint8_t>& b, size_t off, uint16_t v) {
-    b[off] = static_cast<uint8_t>(v & 0xFF);
-    b[off + 1] = static_cast<uint8_t>(v >> 8);
-}
-void Put32(std::vector<uint8_t>& b, size_t off, uint32_t v) {
-    for (int i = 0; i < 4; ++i) {
-        b[off + static_cast<size_t>(i)] =
-            static_cast<uint8_t>((v >> (i * 8)) & 0xFF);
-    }
-}
-void Put64(std::vector<uint8_t>& b, size_t off, uint64_t v) {
-    for (int i = 0; i < 8; ++i) {
-        b[off + static_cast<size_t>(i)] =
-            static_cast<uint8_t>((v >> (i * 8)) & 0xFF);
-    }
-}
-
-// --- builders -------------------------------------------------------------
-
-std::vector<uint8_t> MakeBootSector(uint16_t bps = 512, uint8_t spc = 8,
-                                    uint8_t cpr = 246 /* 2^10 = 1024 */,
-                                    uint64_t mftLcn = 786432,
-                                    uint64_t totalSectors = 100000000) {
-    std::vector<uint8_t> b(512, 0);
-    b[0] = 0xEB; b[1] = 0x52; b[2] = 0x90;
-    std::memcpy(&b[3], "NTFS    ", 8);
-    Put16(b, 0x0B, bps);
-    b[0x0D] = spc;
-    Put64(b, 0x28, totalSectors);
-    Put64(b, 0x30, mftLcn);
-    b[0x40] = cpr;
-    Put16(b, 510, 0xAA55);
-    return b;
-}
-
-// Builds a file record with a $FILE_NAME and a resident or non-resident
-// $DATA, then installs a valid update sequence array.
-std::vector<uint8_t> MakeRecord(const std::wstring& name, uint32_t parent,
-                                uint64_t size, bool isDir, bool inUse = true,
-                                uint8_t nameSpace = 1,
-                                uint32_t recSize = 1024,
-                                uint32_t bps = 512,
-                                bool nonResidentData = false) {
-    std::vector<uint8_t> b(recSize, 0);
-    std::memcpy(&b[0], "FILE", 4);
-
-    const uint16_t usaOff = 0x30;
-    const uint16_t usaCount = static_cast<uint16_t>(recSize / bps + 1);
-    Put16(b, 0x04, usaOff);
-    Put16(b, 0x06, usaCount);
-    Put16(b, 0x10, 1);                        // sequence number
-    Put16(b, 0x12, 1);                        // hard link count
-    const uint16_t attrOff = 0x38;
-    Put16(b, 0x14, attrOff);
-    Put16(b, 0x16, static_cast<uint16_t>((inUse ? 1 : 0) | (isDir ? 2 : 0)));
-    Put32(b, 0x1C, recSize);
-    Put64(b, 0x20, 0);                        // base record = 0 (not extension)
-
-    size_t off = attrOff;
-
-    // ---- $FILE_NAME (resident)
-    const uint32_t nameChars = static_cast<uint32_t>(name.size());
-    const uint32_t fnValueLen = 0x42 + nameChars * 2;
-    uint32_t fnAttrLen = 0x18 + fnValueLen;
-    fnAttrLen = (fnAttrLen + 7) & ~7u;
-
-    Put32(b, off + 0x00, kAttrFileName);
-    Put32(b, off + 0x04, fnAttrLen);
-    b[off + 0x08] = 0;                        // resident
-    b[off + 0x09] = 0;                        // no attribute name
-    Put32(b, off + 0x10, fnValueLen);
-    Put16(b, off + 0x14, 0x18);               // value offset
-
-    const size_t fnBase = off + 0x18;
-    Put64(b, fnBase + 0x00, parent);
-    Put64(b, fnBase + 0x30, size);
-    b[fnBase + 0x40] = static_cast<uint8_t>(nameChars);
-    b[fnBase + 0x41] = nameSpace;
-    for (uint32_t i = 0; i < nameChars; ++i) {
-        Put16(b, fnBase + 0x42 + i * 2, static_cast<uint16_t>(name[i]));
-    }
-    off += fnAttrLen;
-
-    // ---- $DATA
-    if (nonResidentData) {
-        const uint32_t attrLen = 0x48;
-        Put32(b, off + 0x00, kAttrData);
-        Put32(b, off + 0x04, attrLen);
-        b[off + 0x08] = 1;                    // non-resident
-        b[off + 0x09] = 0;
-        Put16(b, off + 0x20, 0x40);           // run list offset
-        Put64(b, off + 0x28, size);           // allocated
-        Put64(b, off + 0x30, size);           // real size
-        Put64(b, off + 0x38, size);           // initialised
-        off += attrLen;
-    } else {
-        const uint32_t valueLen = static_cast<uint32_t>(size & 0xFFFF);
-        uint32_t attrLen = 0x18 + valueLen;
-        attrLen = (attrLen + 7) & ~7u;
-        if (off + attrLen + 8 < recSize) {
-            Put32(b, off + 0x00, kAttrData);
-            Put32(b, off + 0x04, attrLen);
-            b[off + 0x08] = 0;
-            b[off + 0x09] = 0;
-            Put32(b, off + 0x10, valueLen);
-            Put16(b, off + 0x14, 0x18);
-            off += attrLen;
-        }
-    }
-
-    Put32(b, off + 0, kAttrEnd);
-    Put32(b, 0x18, static_cast<uint32_t>(off + 8));   // used size
-
-    // ---- update sequence array: stamp the check value into each sector tail
-    const uint16_t check = 0x1234;
-    Put16(b, usaOff, check);
-    for (size_t i = 0; i < static_cast<size_t>(usaCount) - 1; ++i) {
-        const size_t tail = (i + 1) * bps - 2;
-        // Save the real bytes into the array, then write the check value.
-        b[usaOff + 2 + i * 2]     = b[tail];
-        b[usaOff + 2 + i * 2 + 1] = b[tail + 1];
-        Put16(b, tail, check);
-    }
-    return b;
-}
-
-}  // namespace
+using namespace fixture;
 
 // ------------------------------------------------------------------- tests
 
@@ -512,6 +386,62 @@ SUITE(FuzzTruncation, "Fuzz: truncation at every offset") {
     }
     std::printf("    every prefix of a boot sector, record and run list\n");
     CHECK(true, "truncation fuzzing completed without a fault");
+}
+
+SUITE(TestMftDataRuns, "The $MFT record: where the table lives") {
+    auto rec = MakeMftRecord(64u << 20, 786432, 16384);
+    CHECK(ApplyFixups(rec.data(), rec.size(), 512), "the fixture's fixups hold");
+    std::vector<DataRun> runs;
+    uint64_t bytes = 0;
+    CHECK(ParseMftDataRuns(rec.data(), rec.size(), runs, bytes),
+          "a well-formed $MFT record yields its run list");
+    CHECK(bytes == (64u << 20), "and the table's real size");
+    CHECK(runs.size() == 1 && runs[0].lcn == 786432 &&
+              runs[0].clusters == 16384 && !runs[0].sparse,
+          "one run, at the cluster the boot sector names");
+
+    auto big = MakeMftRecord(kMaxMftBytes + 1, 786432, 16384);
+    ApplyFixups(big.data(), big.size(), 512);
+    CHECK(!ParseMftDataRuns(big.data(), big.size(), runs, bytes),
+          "a table past kMaxMftBytes is refused");
+    auto zero = MakeMftRecord(0, 786432, 16384);
+    ApplyFixups(zero.data(), zero.size(), 512);
+    CHECK(!ParseMftDataRuns(zero.data(), zero.size(), runs, bytes),
+          "a zero-length table is refused");
+    auto resident = MakeRecord(L"$MFT", kRootRecord, 100, false);
+    ApplyFixups(resident.data(), resident.size(), 512);
+    CHECK(!ParseMftDataRuns(resident.data(), resident.size(), runs, bytes),
+          "a record without a non-resident $DATA is refused");
+    auto notFile = rec;
+    std::memcpy(notFile.data(), "BAAD", 4);
+    CHECK(!ParseMftDataRuns(notFile.data(), notFile.size(), runs, bytes),
+          "a buffer that is not a file record is refused");
+    CHECK(!ParseMftDataRuns(rec.data(), 40, runs, bytes),
+          "a truncated record is refused");
+    CHECK(!ParseMftDataRuns(nullptr, 0, runs, bytes), "no buffer, no runs");
+
+    // Corrupted copies must never read outside the record. ASan is the
+    // judge; the checks are that nothing absurd comes back either.
+    std::mt19937 rng(0xABCDEF);
+    std::uniform_int_distribution<size_t> posDist(0, rec.size() - 1);
+    std::uniform_int_distribution<int> byteDist(0, 255);
+    size_t accepted = 0, absurd = 0;
+    for (int iter = 0; iter < 20000; ++iter) {
+        std::vector<uint8_t> r = rec;
+        const int flips = 1 + iter % 24;
+        for (int i = 0; i < flips; ++i) {
+            r[posDist(rng)] = static_cast<uint8_t>(byteDist(rng));
+        }
+        if (ParseMftDataRuns(r.data(), r.size(), runs, bytes)) {
+            ++accepted;
+            if (bytes == 0 || bytes > kMaxMftBytes || runs.size() > kMaxRuns) {
+                ++absurd;
+            }
+        }
+    }
+    CHECK(absurd == 0, "whatever is accepted stays within the bounds");
+    std::printf("    20000 corrupted $MFT records: %zu still parsed, no overruns\n",
+                accepted);
 }
 
 int main(int argc, char** argv) {

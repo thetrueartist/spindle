@@ -106,6 +106,10 @@ struct ScanResult {
 
 inline constexpr size_t kMaxDeniedRecorded = 512;
 
+// Post-order size roll-up of a tree whose leaves carry their own sizes and
+// counts, done iteratively: nesting depth comes off the disk.
+void RollUp(Node& root);
+
 // ----------------------------------------------------------------- scan cache
 //
 // A finished scan serialised for reuse: clicking a drive shows the cached

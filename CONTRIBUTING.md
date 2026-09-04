@@ -20,6 +20,7 @@ to take.
 ```
 make              # cross-compile build/spindle.exe (MinGW-w64)
 make test         # host tests under ASan, UBSan and ThreadSanitizer
+make test-image   # the MFT assembler against a real NTFS image (ntfs-3g, root)
 make test-win     # Windows-side tests; run with wine build/test_win.exe
 make stress       # the scanner's concurrency structure over a real tree
 make analyze      # cppcheck + clang-tidy
