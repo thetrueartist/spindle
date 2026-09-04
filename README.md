@@ -178,8 +178,12 @@ under MSYS2), and for ARM64 with llvm-mingw via `make ARCH=aarch64`.
 make            # build/spindle.exe
 make test       # host tests under ASan, UBSan and ThreadSanitizer
 make test-win   # the Windows-side tests, run natively or under Wine
+make test-image # the MFT assembler against a real NTFS image
+make fuzz       # every parser under random mutation
+make bench      # the hot paths on a synthetic million-file volume
 make stress     # the scanner's concurrency structure over a real tree
 make analyze    # cppcheck + clang-tidy
+make help       # every target
 ```
 
 The treemap, categorisation, reports, parsers, the tree built from the

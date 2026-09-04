@@ -19,6 +19,7 @@ C="$P/drive_c/users/$(whoami)/AppData/Local/Spindle"
 # drive letters the prefix has (a Linux path needs a Z: drive to be reachable).
 TMP="$P/drive_c/users/$(whoami)/Temp/spindle-check"; mkdir -p "$TMP"
 TMPW="C:\\users\\$(whoami)\\Temp\\spindle-check"
+[ -f build/spindle.exe ] || { echo "wine-corpo-check: build/spindle.exe is missing; run make first" >&2; exit 1; }
 PASS=0; FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
