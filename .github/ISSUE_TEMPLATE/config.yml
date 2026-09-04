@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security problem
+    url: https://github.com/thetrueartist/spindle/security/advisories/new
+    about: Report privately. Please do not open a public issue for anything exploitable.

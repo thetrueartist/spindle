@@ -81,6 +81,86 @@ accepted, the remembered shares and, if asked for, the last folder, view
 and panel. A network share is read only after an explicit
 per-share permission, remembered only if asked to be.
 
+## Decisions the threat model drove
+
+MFT parsing treats the disk as hostile. Reading the Master File Table
+means interpreting raw on-disk structures while running elevated, and a
+crafted VHD, a corrupt volume, or a USB stick with a hand-edited boot
+sector all reach that code. `src/ntfs.cpp` therefore handles nothing but
+bytes, knows nothing about Windows, and is fuzzed on the host as part of
+`make test`. Every field goes through a cursor that cannot read past its
+buffer, and no length, offset or count taken from the disk is used
+without validation.
+
+The volume is opened read-only, `FILE_READ_DATA` with read, write and
+delete sharing, so a scan cannot interfere with a volume in use.
+
+Filenames are attacker-controlled and are sanitised before display and
+before export. A name carrying a bidi override would otherwise be
+written verbatim into a CSV and carry the spoof into whatever opens it.
+
+## Import audit
+
+Every import comes from a Windows system DLL; at the time of writing 266
+functions across 17 DLLs, easy to recheck with `objdump -p`. What is absent
+matters as much as what is present:
+
+- Networking code exists for exactly one purpose: the auto-updater, over
+  WinHTTP, HTTPS, to the GitHub release API for this repository and the
+  release assets it names. Nothing else in the program opens a connection
+  of its own, and there is no Winsock, WinINet or DNS use anywhere.
+  Network shares are read through the same Windows file APIs as local
+  drives, after permission, and a mapping's name is read from the local
+  redirector table. The maintainer's public key is embedded in the
+  source, so the check runs at launch and can be turned off in the menu;
+  a build with the key constant emptied compiles the same code but never
+  opens a socket. An update is accepted only when a manifest signed by
+  the maintainer's ECDSA P-256 release key, held as a GitHub environment
+  secret that only an approved signing run can use (see Updates below),
+  verified through CNG, vouches for the exact SHA-256 and size of the
+  file and carries a serial newer than the last one accepted; it is
+  offered rather than installed, and every failure leaves the current
+  install untouched.
+- No process creation of its own. No `CreateProcess`, no `WinExec`.
+  `ShellExecuteW` hands a path to the shell in three places: to show a
+  file in Explorer, to open the cache folder, and, from the list view, to
+  open a double-clicked file with its default application, which starts
+  whatever program Windows associates with it.
+- No injection primitives. No `CreateRemoteThread`, `WriteProcessMemory`,
+  `VirtualAllocEx` or `SetWindowsHookEx`.
+- Registry writes happen in exactly one feature: the opt-in "Scan with
+  Spindle" Explorer entry, per-user under `HKCU`, added and removed from
+  the `···` menu. Nothing else touches the registry and nothing runs at
+  startup.
+
+Some imports deserve an explanation:
+
+- `OpenProcessToken` is called on `GetCurrentProcess()` in two places:
+  with `TOKEN_QUERY` to ask whether the process is elevated before
+  attempting MFT access, and, during force removal only, with
+  `TOKEN_ADJUST_PRIVILEGES` to enable the take-ownership, backup and
+  restore privileges.
+- `TerminateProcess` is reached only from Force remove, on the processes
+  the Restart Manager reports as holding the target, after they are
+  listed to the user by name and confirmed. System processes are refused.
+- `LoadLibraryW`, `VirtualProtect` and `CryptGenRandom` are not called by
+  any line of Spindle. They come from the MinGW C runtime's startup and
+  exception unwinding; grep the sources and you will not find them.
+- Files Spindle writes: the scan caches, `settings.txt` and, after a
+  crash, `spindle-crash.txt`, all under `%LOCALAPPDATA%\Spindle`, each
+  data file through a `.tmp` sibling and a rename; the CSV files you
+  choose; and, only when you accept an update, `spindle.exe.new` beside
+  the executable, which takes its name while the previous version becomes
+  `spindle.exe.old` until the next launch removes it. The release-signing
+  modes write `update-key.txt`, `manifest.json`, `manifest.sig` and
+  `sign-error.txt` where they are run. Spindle deletes files only through
+  the recycle and force-remove commands, all confirmed, and its own
+  caches, temporary files and `spindle.exe.old`; rename moves a file
+  within its folder.
+
+Everything is verifiable from the source, which is included. Nothing is
+downloaded, and nothing is generated at build time except the icon.
+
 ## For a deployment reviewer
 
 Behaviour worth knowing before rolling the program out, stated plainly.

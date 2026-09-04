@@ -1,9 +1,4 @@
-# Spindle - build and analysis
-#
-#   make            cross-compile spindle.exe (MinGW-w64)
-#   make test       build and run core tests natively with ASan + UBSan
-#   make analyze    cppcheck + clang-tidy
-#   make clean
+# Spindle - build and analysis. `make help` lists the targets.
 
 # ARCH selects the Windows target: x86_64 (the default) or aarch64 for
 # Windows on ARM. The aarch64 triple is only provided by llvm-mingw, which
@@ -47,9 +42,20 @@ LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
             -ladvapi32 -lrstrtmgr \
             -lcomdlg32 -lwinhttp -lbcrypt -luuid -lmpr -lcomctl32 -lcrypt32
 
-.PHONY: all test test-win stress analyze clean dirs icon
+.PHONY: all help test test-win stress analyze clean dirs icon hooks hygiene
 
 all: dirs $(OUT)
+
+help:
+	@echo "make            cross-compile build/spindle.exe (MinGW-w64; ARCH=aarch64 for ARM64)"
+	@echo "make test       host tests under ASan, UBSan and ThreadSanitizer"
+	@echo "make test-win   Windows-side tests -> build/test_win.exe (run: wine build/test_win.exe)"
+	@echo "make stress     the scanner's concurrency structure over a real tree"
+	@echo "make analyze    cppcheck + clang-tidy over the portable core"
+	@echo "make hygiene    refuse personal paths, secrets and typographic dashes"
+	@echo "make hooks      run the hygiene check on every commit"
+	@echo "make icon       regenerate spindle.ico"
+	@echo "make clean"
 
 dirs:
 	@mkdir -p build

@@ -1,7 +1,7 @@
 # Spindle
 
 A disk space analyser for Windows. Native C++17, Win32 + Direct2D, no runtime
-and no third-party libraries. Single portable executable, ~1 MB.
+and no third-party libraries. Single portable executable, about 1.5 MB.
 
 Scans a volume, shows where the space went as a treemap coloured by file
 kind, with a side panel for extension breakdown, largest files, search and
@@ -13,8 +13,11 @@ makes a million-file scan take well under a second.
 ```
 make            cross-compile build/spindle.exe (MinGW-w64)
 make test       host tests under ASan, UBSan and ThreadSanitizer
+make test-win   Windows-side tests; run with `wine build/test_win.exe`
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
+make hygiene    refuse personal paths, secrets and typographic dashes
+make hooks      run the hygiene check on every commit
 make icon       regenerate spindle.ico (prints each frame's encoding)
 make clean
 ```
@@ -36,8 +39,12 @@ src/core.cpp         treemap, categories, reports, search, CSV, easing
 src/ui.cpp           Win32 window, Direct2D renderer, navigation, animation
 res/                 icon, version info, manifest
 tools/make_icon.py   icon generator, stdlib only
-tests/               core, ntfs, queue, stress
-docs/                README media, captured from the real binary under Wine
+tools/hygiene.sh     what may never be committed; wired to the git hooks
+tools/wine-*.sh      the interface harness and the acceptance run under Wine
+tests/               core, ntfs, queue, stress; test_win for the Windows side
+docs/guide.md        using the program, in full
+docs/design.md       speed, architecture, text rendering, motion
+docs/*.png, *.gif    README media, captured from the real binary under Wine
 ```
 
 The split is deliberate: `core.cpp`, `ntfs.cpp` and `workqueue.h` contain no
