@@ -458,6 +458,26 @@ module-base offset, because a raw address is meaningless under ASLR.
   focus model beyond the search box. That is a real accessibility gap,
   not an oversight to rediscover later.
 
+## Tests
+
+Every test binary is built on `tests/check.h`: a suite is a function
+declared with `SUITE(Identifier, "Name")`, and `CHECK(condition, "what it
+means")` records one assertion. A failure prints the file and line, the
+message, the expression and the suite, so one red line is enough to go
+on. The binaries take `--list`, `--filter NAME` (a case-insensitive
+substring) and `--repeat N`, and the Makefile passes `ARGS` through:
+
+```
+make test-core ARGS='--filter cache'
+make test-queue ARGS='--repeat 20'      # a race that shows once in ten runs is still a race
+wine build/test_win.exe --filter sealed
+```
+
+The host builds carry `_GLIBCXX_ASSERTIONS`, so an out-of-range index in a
+standard container fails loudly under test rather than reading whatever
+happens to be there. Each test binary depends on exactly what it compiles,
+so `make test` after a one-line change rebuilds one test, not four.
+
 ## Testing the interface under Wine
 
 Logic lives in the portable files and is covered by `make test`. The Win32

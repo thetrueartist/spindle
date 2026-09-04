@@ -4001,8 +4001,8 @@ static LRESULT CALLBACK AddressEditProc(HWND h, UINT msg, WPARAM wp,
                 std::wstring done;
                 if (CompleteAddressPath(buf, done)) {
                     SetWindowTextW(h, done.c_str());
-                    const int n = static_cast<int>(done.size());
-                    SendMessageW(h, EM_SETSEL, n, n);   // caret to the end
+                    const WPARAM n = done.size();   // caret to the end
+                    SendMessageW(h, EM_SETSEL, n, static_cast<LPARAM>(n));
                 } else {
                     MessageBeep(MB_OK);   // nothing to complete
                 }

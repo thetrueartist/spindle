@@ -314,7 +314,8 @@ static bool SplitHttpsUrl(const std::string& url, std::wstring& host,
     if (url.rfind("https://", 0) != 0) return false;
     // Nothing but unreserved URL bytes: a raw CR or LF reaching
     // WinHttpOpenRequest would be a header-splitting primitive.
-    for (unsigned char c : url) {
+    for (const char ch : url) {
+        const unsigned char c = static_cast<unsigned char>(ch);
         if (c <= 0x20 || c >= 0x7F || c == '"' || c == '\\') return false;
     }
     const size_t hostAt = 8;

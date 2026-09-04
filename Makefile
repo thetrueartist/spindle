@@ -42,7 +42,7 @@ LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
             -ladvapi32 -lrstrtmgr \
             -lcomdlg32 -lwinhttp -lbcrypt -luuid -lmpr -lcomctl32 -lcrypt32
 
-.PHONY: all help test test-win stress analyze clean dirs icon hooks hygiene
+.PHONY: all help test test-core test-ntfs test-queue test-win stress analyze clean dirs icon hooks hygiene
 
 all: dirs $(OUT)
 
@@ -77,9 +77,6 @@ $(OUT): $(SRC) src/spindle.h $(RES)
 	$(CXX_WIN) $(CXXFLAGS) $(SRC) $(RES) -o $@ $(LDFLAGS) $(LIBS)
 	@echo "built $@"
 
-# Core logic and the work queue are platform-independent, so both run under
-# the host sanitizers. The queue is the scanner's concurrency core, so it
-# gets a ThreadSanitizer pass of its own on top of ASan.
 hooks:
 	git config core.hooksPath .githooks
 	@echo "hooks enabled: hygiene runs on every commit"
@@ -94,26 +91,51 @@ test-win: dirs
 	    src/mft.cpp src/ntfs.cpp -o build/test_win.exe \
 	    -static -static-libgcc -static-libstdc++ $(HARDEN_L) $(LIBS)
 
-test:
+# -- Host tests --------------------------------------------------------------
+# Each binary depends on exactly what it compiles, so `make test` after a
+# one-line change rebuilds one test, not four. ARGS passes flags through
+# to the harness in tests/check.h:
+#   make test-core ARGS='--filter cache'
+#   make test-queue ARGS='--repeat 20'
+# _GLIBCXX_ASSERTIONS turns the standard containers' bounds checks on, so
+# an out-of-range index fails loudly instead of reading whatever is there.
+TEST_FLAGS := -std=c++17 -O1 -g -I src -I tests $(WARN) \
+              -fsanitize=address,undefined -fno-omit-frame-pointer \
+              -D_GLIBCXX_ASSERTIONS
+TEST_ENV   := ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1
+ARGS       ?=
+
+build/test_core: tests/test_core.cpp src/core.cpp src/spindle.h tests/check.h
 	@mkdir -p build
-	$(CXX_HOST) -std=c++17 -O1 -g $(WARN) \
-	    -fsanitize=address,undefined -fno-omit-frame-pointer \
-	    tests/test_core.cpp src/core.cpp -o build/test_core
-	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
-	    ./build/test_core
-	$(CXX_HOST) -std=c++17 -O1 -g -I src \
-	    -fsanitize=address,undefined -fno-omit-frame-pointer \
-	    tests/test_ntfs.cpp src/ntfs.cpp -o build/test_ntfs
-	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
-	    ./build/test_ntfs
-	$(CXX_HOST) -std=c++17 -O1 -g -I src \
-	    -fsanitize=address,undefined -fno-omit-frame-pointer \
-	    tests/test_queue.cpp -o build/test_queue_asan -pthread
-	ASAN_OPTIONS=detect_leaks=1 ./build/test_queue_asan
-	$(CXX_HOST) -std=c++17 -O1 -g -I src \
+	$(CXX_HOST) $(TEST_FLAGS) tests/test_core.cpp src/core.cpp -o $@
+
+build/test_ntfs: tests/test_ntfs.cpp src/ntfs.cpp src/ntfs.h tests/check.h
+	@mkdir -p build
+	$(CXX_HOST) $(TEST_FLAGS) tests/test_ntfs.cpp src/ntfs.cpp -o $@
+
+build/test_queue_asan: tests/test_queue.cpp src/workqueue.h src/sync.h tests/check.h
+	@mkdir -p build
+	$(CXX_HOST) $(TEST_FLAGS) tests/test_queue.cpp -o $@ -pthread
+
+# The queue is the scanner's concurrency core, so it gets a ThreadSanitizer
+# pass of its own on top of ASan.
+build/test_queue_tsan: tests/test_queue.cpp src/workqueue.h src/sync.h tests/check.h
+	@mkdir -p build
+	$(CXX_HOST) -std=c++17 -O1 -g -I src -I tests $(WARN) \
 	    -fsanitize=thread -fno-omit-frame-pointer \
-	    tests/test_queue.cpp -o build/test_queue_tsan -pthread
-	./build/test_queue_tsan
+	    tests/test_queue.cpp -o $@ -pthread
+
+test-core: build/test_core
+	$(TEST_ENV) ./build/test_core $(ARGS)
+
+test-ntfs: build/test_ntfs
+	$(TEST_ENV) ./build/test_ntfs $(ARGS)
+
+test-queue: build/test_queue_asan build/test_queue_tsan
+	ASAN_OPTIONS=detect_leaks=1 ./build/test_queue_asan $(ARGS)
+	./build/test_queue_tsan $(ARGS)
+
+test: test-core test-ntfs test-queue
 
 # Walks a real directory tree with the scanner's exact concurrency structure.
 # Needs a POSIX host; the Windows scanner shares the queue and worker shape.

@@ -45,15 +45,7 @@ bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text) {
 }
 }  // namespace spindle
 
-static int g_fail = 0;
-static int g_pass = 0;
-
-#define CHECK(cond, msg)                                                    \
-    do {                                                                    \
-        if (cond) { ++g_pass; }                                             \
-        else { ++g_fail;                                                    \
-               std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, msg); }\
-    } while (0)
+#include "check.h"
 
 static std::string Narrow(const std::wstring& w) {
     std::string s;
@@ -86,8 +78,7 @@ static Node MakeDir(const wchar_t* name, std::vector<Node> kids) {
 
 // ------------------------------------------------------------------- checks
 
-static void TestFormatSize() {
-    std::printf("FormatSize\n");
+SUITE(TestFormatSize, "FormatSize") {
     CHECK(Narrow(FormatSize(0)) == "0 B", "zero");
     CHECK(Narrow(FormatSize(1023)) == "1023 B", "sub-KB");
     CHECK(Narrow(FormatSize(1024)) == "1.0 KB", "exactly 1KB");
@@ -102,8 +93,7 @@ static void TestFormatSize() {
     std::printf("    191GB case -> %s\n", s.c_str());
 }
 
-static void TestFormatCount() {
-    std::printf("FormatCount\n");
+SUITE(TestFormatCount, "FormatCount") {
     CHECK(Narrow(FormatCount(0)) == "0", "zero");
     CHECK(Narrow(FormatCount(7)) == "7", "single digit");
     CHECK(Narrow(FormatCount(999)) == "999", "three digits");
@@ -129,7 +119,7 @@ static void TestFormatCount() {
         for (char ch : s) {
             if (ch == ',') ++commaCount; else ++digitCount;
         }
-        const size_t expectCommas = (len - 1) / 3;
+        const size_t expectCommas = (static_cast<size_t>(len) - 1) / 3;
         if (digitCount != static_cast<size_t>(len) ||
             commaCount != expectCommas) {
             std::printf("    len %d -> %s (%zu digits, %zu commas, "
@@ -142,8 +132,7 @@ static void TestFormatCount() {
     }
 }
 
-static void TestCategories() {
-    std::printf("CategoryForFile\n");
+SUITE(TestCategories, "CategoryForFile") {
     CHECK(CategoryForFile(L"movie.mp4") == Cat::Media, "mp4 media");
     CHECK(CategoryForFile(L"MOVIE.MP4") == Cat::Media, "case insensitive");
     CHECK(CategoryForFile(L"disk.vmdk") == Cat::VirtualDisk, "vmdk");
@@ -163,8 +152,7 @@ static void TestCategories() {
           "over-long extension rejected");
 }
 
-static void TestSanitize() {
-    std::printf("SanitizeForDisplay\n");
+SUITE(TestSanitize, "SanitizeForDisplay") {
     bool mod = false;
 
     std::wstring clean = SanitizeForDisplay(L"normal_file.txt", &mod);
@@ -199,8 +187,7 @@ static void TestSanitize() {
     CHECK(mod, "control chars flagged");
 }
 
-static void TestSatAdd() {
-    std::printf("SatAdd\n");
+SUITE(TestSatAdd, "SatAdd") {
     CHECK(SatAdd(1, 2) == 3, "normal add");
     CHECK(SatAdd(0, 0) == 0, "zero");
     CHECK(SatAdd(UINT64_MAX, 1) == UINT64_MAX, "saturates at max");
@@ -210,8 +197,7 @@ static void TestSatAdd() {
 }
 
 // Cells must stay inside the bounds they were given.
-static void TestTreemapBounds() {
-    std::printf("Treemap containment\n");
+SUITE(TestTreemapBounds, "Treemap containment") {
 
     Node root = MakeDir(L"root", {
         MakeFile(L"a.bin", 500), MakeFile(L"b.bin", 300),
@@ -233,7 +219,8 @@ static void TestTreemapBounds() {
             c.rect.bottom() > bounds.bottom() + eps) {
             inside = false;
             std::printf("    escaped: %.2f,%.2f %.2fx%.2f\n",
-                        c.rect.x, c.rect.y, c.rect.w, c.rect.h);
+                        static_cast<double>(c.rect.x), static_cast<double>(c.rect.y),
+                        static_cast<double>(c.rect.w), static_cast<double>(c.rect.h));
         }
     }
     CHECK(inside, "all cells within bounds");
@@ -247,8 +234,7 @@ static void TestTreemapBounds() {
 
 // Total cell area at depth 0 should approximate the bounds area, and each
 // cell's area should be proportional to its node's size.
-static void TestTreemapProportionality() {
-    std::printf("Treemap proportionality\n");
+SUITE(TestTreemapProportionality, "Treemap proportionality") {
 
     Node root = MakeDir(L"root", {
         MakeFile(L"big.bin",   6000),
@@ -283,8 +269,7 @@ static void TestTreemapProportionality() {
 }
 
 // Sibling cells at the same depth must not overlap.
-static void TestTreemapNoOverlap() {
-    std::printf("Treemap overlap\n");
+SUITE(TestTreemapNoOverlap, "Treemap overlap") {
 
     std::mt19937 rng(20260831);
     std::uniform_int_distribution<uint64_t> dist(1, 100000);
@@ -318,8 +303,7 @@ static void TestTreemapNoOverlap() {
 }
 
 // The squarified algorithm exists to keep cells near-square; verify it does.
-static void TestTreemapAspectRatio() {
-    std::printf("Treemap aspect ratio\n");
+SUITE(TestTreemapAspectRatio, "Treemap aspect ratio") {
 
     std::mt19937 rng(1234);
     std::uniform_int_distribution<uint64_t> dist(1000, 500000);
@@ -353,8 +337,7 @@ static void TestTreemapAspectRatio() {
 }
 
 // Deep nesting must not blow the stack or emit runaway cell counts.
-static void TestTreemapDeepNesting() {
-    std::printf("Treemap deep nesting\n");
+SUITE(TestTreemapDeepNesting, "Treemap deep nesting") {
 
     Node leaf = MakeFile(L"leaf.bin", 1024 * 1024);
     Node cur = MakeDir(L"d40", {std::move(leaf)});
@@ -377,8 +360,7 @@ static void TestTreemapDeepNesting() {
 }
 
 // minArea must actually cap output on a large synthetic tree.
-static void TestTreemapCellCap() {
-    std::printf("Treemap cell cap\n");
+SUITE(TestTreemapCellCap, "Treemap cell cap") {
 
     std::mt19937 rng(99);
     std::uniform_int_distribution<uint64_t> dist(1, 10000);
@@ -405,8 +387,7 @@ static void TestTreemapCellCap() {
     CHECK(!cells.empty(), "still produced cells");
 }
 
-static void TestZeroAndDegenerate() {
-    std::printf("Degenerate inputs\n");
+SUITE(TestZeroAndDegenerate, "Degenerate inputs") {
 
     std::vector<Cell> cells;
 
@@ -432,8 +413,7 @@ static void TestZeroAndDegenerate() {
     std::printf("    saturated tree produced %zu cells\n", cells.size());
 }
 
-static void TestHitTest() {
-    std::printf("HitTest\n");
+SUITE(TestHitTest, "HitTest") {
 
     Node root = MakeDir(L"root", {
         MakeDir(L"sub", {MakeFile(L"inner.bin", 400)}),
@@ -474,8 +454,7 @@ static void TestHitTest() {
 // Filenames are attacker-controlled: this tool is meant to be pointed at
 // directories full of hostile samples. Throw randomised names and tree shapes
 // at the two functions that touch them and confirm nothing escapes.
-static void FuzzSanitize() {
-    std::printf("Fuzz: SanitizeForDisplay\n");
+SUITE(FuzzSanitize, "Fuzz: SanitizeForDisplay") {
 
     std::mt19937 rng(0xBADC0DE);
     std::uniform_int_distribution<int> lenDist(0, 300);
@@ -496,9 +475,9 @@ static void FuzzSanitize() {
         if (out.size() != name.size()) { ++escaped; continue; }
 
         for (wchar_t c : out) {
-            const uint32_t u =
-                static_cast<uint32_t>(
-                    static_cast<std::make_unsigned<wchar_t>::type>(c));
+            const std::make_unsigned<wchar_t>::type unsignedChar =
+                static_cast<std::make_unsigned<wchar_t>::type>(c);
+            const uint32_t u = unsignedChar;
             const bool bad = (u < 0x20) || (u == 0x7F) ||
                              (u >= 0x80 && u <= 0x9F) ||
                              (u >= 0x202A && u <= 0x202E) ||
@@ -517,8 +496,7 @@ static void FuzzSanitize() {
 // be a canonical \\server\share[\deeper]: nothing else may ever be
 // remembered as a share, whatever was typed, and the settings file it
 // lands in must stay within its limit and give it back unchanged.
-static void FuzzShareKeys() {
-    std::printf("Fuzz: NormalizeShareKey\n");
+SUITE(FuzzShareKeys, "Fuzz: NormalizeShareKey") {
     std::mt19937_64 rng(20260903);
     const wchar_t alphabet[] =
         L"\\/?.:*\"<>| \t\r\n\x7f\x01aAzZ09-_$@#~\u00e4\u0130\u00df";
@@ -607,8 +585,7 @@ static void FuzzShareKeys() {
     CHECK(parsedGood, "random settings files never yield a non-canonical trust");
 }
 
-static void FuzzTreemap() {
-    std::printf("Fuzz: BuildTreemap\n");
+SUITE(FuzzTreemap, "Fuzz: BuildTreemap") {
 
     std::mt19937 rng(0x5EED);
     std::uniform_int_distribution<int> kidsDist(0, 25);
@@ -674,8 +651,7 @@ static void FuzzTreemap() {
 // A parent that draws a label reserves a strip for it. If any child overlaps
 // that strip the two labels render on top of each other -- which is exactly
 // the bug this invariant exists to catch.
-static void TestLabelStripClear() {
-    std::printf("Label strip exclusivity\n");
+SUITE(TestLabelStripClear, "Label strip exclusivity") {
 
     std::mt19937 rng(0xABE1);
     std::uniform_int_distribution<uint64_t> sizeDist(1000, 900000);
@@ -716,9 +692,14 @@ static void TestLabelStripClear() {
                 if (intrusions <= 3) {
                     std::printf("    child at %.1f,%.1f %.1fx%.1f intrudes "
                                 "into strip %.1f,%.1f %.1fx%.1f\n",
-                                other.rect.x, other.rect.y, other.rect.w,
-                                other.rect.h, strip.x, strip.y, strip.w,
-                                strip.h);
+                                static_cast<double>(other.rect.x),
+                                static_cast<double>(other.rect.y),
+                                static_cast<double>(other.rect.w),
+                                static_cast<double>(other.rect.h),
+                                static_cast<double>(strip.x),
+                                static_cast<double>(strip.y),
+                                static_cast<double>(strip.w),
+                                static_cast<double>(strip.h));
                 }
             }
         }
@@ -738,8 +719,7 @@ static void TestLabelStripClear() {
 
 // An expanded cell with no strip must not be labelled at all -- its children
 // are drawn over it. Verify the flags the renderer branches on are consistent.
-static void TestExpandedFlagConsistency() {
-    std::printf("Expanded/header flag consistency\n");
+SUITE(TestExpandedFlagConsistency, "Expanded/header flag consistency") {
 
     std::mt19937 rng(4242);
     std::uniform_int_distribution<uint64_t> sizeDist(1, 5000000);
@@ -778,8 +758,7 @@ static void TestExpandedFlagConsistency() {
 // Reconstructing a nested cell's path is what "Show in Explorer" and, more
 // importantly, "Move to Recycle Bin" act on. If the parent chain is wrong the
 // destructive action targets a different path than the one clicked.
-static void TestCellChainPaths() {
-    std::printf("Cell parent chain\n");
+SUITE(TestCellChainPaths, "Cell parent chain") {
 
     // Deliberately deep and wide enough that cells nest several levels.
     std::vector<Node> lvl3;
@@ -850,8 +829,7 @@ static void TestCellChainPaths() {
 }
 
 // HitTestIndex must agree with HitTest and resolve to the deepest cell.
-static void TestHitTestIndexAgreement() {
-    std::printf("HitTestIndex agreement\n");
+SUITE(TestHitTestIndexAgreement, "HitTestIndex agreement") {
 
     std::mt19937 rng(777);
     std::uniform_int_distribution<uint64_t> sz(1000, 800000);
@@ -909,8 +887,7 @@ static Node BuildReportTree() {
     });
 }
 
-static void TestExtensionBreakdown() {
-    std::printf("ExtensionBreakdown\n");
+SUITE(TestExtensionBreakdown, "ExtensionBreakdown") {
 
     const Node root = BuildReportTree();
     const std::vector<ExtStat> stats = ExtensionBreakdown(root, 20);
@@ -956,8 +933,7 @@ static void TestExtensionBreakdown() {
     CHECK(ExtensionBreakdown(empty, 10).empty(), "empty tree yields no rows");
 }
 
-static void TestLargestFiles() {
-    std::printf("LargestFiles\n");
+SUITE(TestLargestFiles, "LargestFiles") {
 
     const Node root = BuildReportTree();
     const std::vector<FileHit> top = LargestFiles(root, 3);
@@ -1011,8 +987,7 @@ static void TestLargestFiles() {
     CHECK(larger < 20, "no file outside the list beats the cut-off");
 }
 
-static void TestFindByName() {
-    std::printf("FindByName\n");
+SUITE(TestFindByName, "FindByName") {
 
     const Node root = BuildReportTree();
 
@@ -1038,8 +1013,7 @@ static void TestFindByName() {
                 Narrow(FormatSize(vmdk[0].size)).c_str());
 }
 
-static void TestCsvExport() {
-    std::printf("CSV export\n");
+SUITE(TestCsvExport, "CSV export") {
 
     // Names chosen to exercise the quoting rules and the sanitiser: a comma,
     // an embedded quote, and a bidi override.
@@ -1097,8 +1071,7 @@ static void TestCsvExport() {
 
 // The report walkers must not blow up on the tree shapes a hostile or merely
 // unusual volume produces.
-static void TestReportsOnHostileTrees() {
-    std::printf("Reports on degenerate trees\n");
+SUITE(TestReportsOnHostileTrees, "Reports on degenerate trees") {
 
     // Very deep chain: recursion in these walkers would be a stack overflow.
     Node cur = MakeFile(L"leaf.bin", 1024);
@@ -1160,8 +1133,7 @@ static Node BuildSearchTree() {
     });
 }
 
-static void TestQueryParsing() {
-    std::printf("ParseQuery\n");
+SUITE(TestQueryParsing, "ParseQuery") {
 
     Query q = ParseQuery(L"pak");
     CHECK(q.include.size() == 1 && q.include[0] == L"pak", "bare name term");
@@ -1230,8 +1202,7 @@ static void TestQueryParsing() {
     CHECK(q.minSize == 0, "overflowing size rejected");
 }
 
-static void TestPathCompletion() {
-    std::printf("path completion\n");
+SUITE(TestPathCompletion, "path completion") {
     using V = std::vector<std::wstring>;
 
     // Drive-relative input is rooted, then split at the last separator.
@@ -1270,8 +1241,7 @@ static void TestPathCompletion() {
           "no matches completes to nothing");
 }
 
-static void TestPathQueries() {
-    std::printf("FindMatching: path terms\n");
+SUITE(TestPathQueries, "FindMatching: path terms") {
 
     const Node root = BuildSearchTree();
     auto count = [&](const wchar_t* text) {
@@ -1319,8 +1289,7 @@ static void TestPathQueries() {
     }
 }
 
-static void TestQueryMatching() {
-    std::printf("FindMatching\n");
+SUITE(TestQueryMatching, "FindMatching") {
 
     const Node root = BuildSearchTree();
 
@@ -1364,8 +1333,7 @@ static void TestQueryMatching() {
 }
 
 // A search box takes arbitrary text, so it is an input surface like any other.
-static void FuzzQueries() {
-    std::printf("Fuzz: query parsing\n");
+SUITE(FuzzQueries, "Fuzz: query parsing") {
 
     const Node root = BuildSearchTree();
     std::mt19937 rng(0x0DDBA11);
@@ -1407,8 +1375,7 @@ static void FuzzQueries() {
 }
 
 
-static void TestEasing() {
-    std::printf("Easing curves\n");
+SUITE(TestEasing, "Easing curves") {
 
     struct Curve { const char* name; float (*fn)(float); bool overshoots; };
     const Curve curves[] = {
@@ -1460,7 +1427,9 @@ static void TestEasing() {
     const float quintAtThird = ease::OutQuint(0.33f);
     const float cubicAtThird = ease::OutCubic(0.33f);
     std::printf("    at t=0.33  OutQuint %.3f  OutCubic %.3f  InOutCubic %.3f\n",
-                quintAtThird, cubicAtThird, ease::InOutCubic(0.33f));
+                static_cast<double>(quintAtThird),
+                static_cast<double>(cubicAtThird),
+                static_cast<double>(ease::InOutCubic(0.33f)));
     CHECK(quintAtThird > 0.85f, "OutQuint is most of the way by a third");
     CHECK(quintAtThird > cubicAtThird, "OutQuint leads OutCubic early");
 }
@@ -1488,8 +1457,7 @@ static bool TreesEqual(const Node& a, const Node& b) {
     return true;
 }
 
-static void TestScanCache() {
-    std::printf("Scan cache serialisation\n");
+SUITE(TestScanCache, "Scan cache serialisation") {
 
     ScanResult in;
     in.root = MakeDir(L"", {
@@ -1765,8 +1733,7 @@ static Digest HashOf(const std::string& s) {
     return h.Finish();
 }
 
-static void TestHasher() {
-    std::printf("Content hashing\n");
+SUITE(TestHasher, "Content hashing") {
 
     CHECK(HashOf("") == HashOf(""), "empty is stable");
     CHECK(HashOf("hello") == HashOf("hello"), "same input, same digest");
@@ -1805,8 +1772,7 @@ static void TestHasher() {
     CHECK(seen.size() == before, "4000 similar strings, no collisions");
 }
 
-static void TestDuplicates() {
-    std::printf("Duplicate detection\n");
+SUITE(TestDuplicates, "Duplicate detection") {
 
     // Three 100-byte files, two 200-byte files, one lonely 50.
     // Three 100s waste 200; the 500 pair wastes 500. Deliberately not a tie,
@@ -1930,8 +1896,7 @@ static CommandLine Parse(std::vector<const wchar_t*> argv) {
     return ParseCommandLine(args);
 }
 
-static void TestCommandLine() {
-    std::printf("Command line\n");
+SUITE(TestCommandLine, "Command line") {
 
     const CommandLine none = Parse({});
     CHECK(none.valid && none.mode == CommandLine::Mode::Gui,
@@ -2019,8 +1984,7 @@ static const Change* FindChange(const DiffReport& r, const char* path) {
     return nullptr;
 }
 
-static void TestDiff() {
-    std::printf("Scan comparison\n");
+SUITE(TestDiff, "Scan comparison") {
 
     Node before = MakeDir(L"", {
         MakeDir(L"games", {MakeFile(L"a.pak", 1000)}),
@@ -2100,8 +2064,7 @@ static void TestDiff() {
 
 // ---------------------------------------------------------- force removal
 
-static void TestForceRemovalGuards() {
-    std::printf("Force removal guards\n");
+SUITE(TestForceRemovalGuards, "Force removal guards") {
 
     // Volume roots and anything that is not a plain drive-letter path.
     CHECK(IsProtectedSystemPath(L""), "empty refused");
@@ -2231,8 +2194,7 @@ static void TestForceRemovalGuards() {
 
 // --------------------------------------------------------------- settings
 
-static void TestUtf8() {
-    std::printf("UTF-8\n");
+SUITE(TestUtf8, "UTF-8") {
 
     CHECK(WideToUtf8(L"plain") == "plain", "ascii passes through");
     CHECK(Utf8ToWide("plain") == L"plain", "ascii back");
@@ -2283,8 +2245,7 @@ static void TestUtf8() {
     CHECK(WideToUtf8(L"a\\\\b") == "a\\\\b", "backslashes untouched");
 }
 
-static void TestCacheSeal() {
-    std::printf("Cache seal\n");
+SUITE(TestCacheSeal, "Cache seal") {
 
     auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
         v.push_back(static_cast<uint8_t>(x));
@@ -2361,8 +2322,7 @@ static void TestCacheSeal() {
           "one byte of ciphertext is enough for the frame");
 }
 
-static void TestCachePolicy() {
-    std::printf("Cache policy\n");
+SUITE(TestCachePolicy, "Cache policy") {
 
     // C: internal, D: internal, E: a USB stick, F: locked (unknowable),
     // Y: a share. Caches exist for C, D, E, F, Y and for a vanished X.
@@ -2385,8 +2345,7 @@ static void TestCachePolicy() {
           "no drives at all means every cache is stale");
 }
 
-static void TestShareKeys() {
-    std::printf("Share keys\n");
+SUITE(TestShareKeys, "Share keys") {
 
     CHECK(NormalizeShareKey(L"\\\\Server\\Share\\") == L"\\\\server\\share",
           "lowercased, trailing separator dropped");
@@ -2539,8 +2498,7 @@ static void TestShareKeys() {
     CHECK(back.lastPath.size() == 1000, "and the path with it");
 }
 
-static void TestSettings() {
-    std::printf("Settings\n");
+SUITE(TestSettings, "Settings") {
 
     const Settings d;
     CHECK(d.keepCaches && d.resumeOnLaunch && d.prefetchAll,
@@ -2768,22 +2726,22 @@ static void TestSettings() {
     }
 
     {
-        const std::string j =
+        const std::string manifest =
             "{\"tag_name\": \"v2.1.0\", \"assets\": ["
             "{\"name\":\"manifest.json\","
             "\"browser_download_url\":\"https://x/m.json\"},"
             "{\"name\":\"spindle.exe\","
             "\"browser_download_url\":\"https://x/s.exe\"}]}";
         std::string v;
-        CHECK(JsonFindString(j, "tag_name", 0, v) && v == "v2.1.0",
+        CHECK(JsonFindString(manifest, "tag_name", 0, v) && v == "v2.1.0",
               "json extractor finds a simple field");
         size_t at = 0;
-        CHECK(JsonFindString(j, "name", 0, v, &at) &&
+        CHECK(JsonFindString(manifest, "name", 0, v, &at) &&
                   v == "manifest.json",
               "json extractor finds the first repeated key");
-        CHECK(JsonFindString(j, "name", at + 1, v) && v == "spindle.exe",
+        CHECK(JsonFindString(manifest, "name", at + 1, v) && v == "spindle.exe",
               "json extractor walks to the next one");
-        CHECK(!JsonFindString(j, "absent", 0, v),
+        CHECK(!JsonFindString(manifest, "absent", 0, v),
               "a missing key is not found, not invented");
         CHECK(!JsonFindString("{\"k\": \"unterminated", "k", 0, v),
               "an unterminated string is refused");
@@ -2796,10 +2754,10 @@ static void TestSettings() {
             "is text\", \"tag_name\": \"v1.0.0\"}";
         CHECK(JsonFindString(spoof, "tag_name", 0, v) && v == "v1.0.0",
               "a key-shaped string in a value cannot spoof the field");
-        std::string big = "{\"k\": \"";
-        big.append(5000, 'x');
-        big += "\"}";
-        CHECK(!JsonFindString(big, "k", 0, v),
+        std::string bigValue = "{\"k\": \"";
+        bigValue.append(5000, 'x');
+        bigValue += "\"}";
+        CHECK(!JsonFindString(bigValue, "k", 0, v),
               "an oversized value is refused");
     }
 
@@ -2824,13 +2782,14 @@ static void TestSettings() {
         // bound, since UINT64_MAX has twenty, and a wrapped anti-replay
         // serial would read as "accept anything".
         const char* huge = "update_serial=18446744073709551616\n";
-        Settings r = ParseSettings(
+        Settings overflow = ParseSettings(
             reinterpret_cast<const uint8_t*>(huge), strlen(huge));
-        CHECK(r.updateSerial == 0,
+        CHECK(overflow.updateSerial == 0,
               "an overflowing update serial is refused, not wrapped");
         const char* ok = "update_serial=1756742400\n";
-        r = ParseSettings(reinterpret_cast<const uint8_t*>(ok), strlen(ok));
-        CHECK(r.updateSerial == 1756742400ull,
+        overflow = ParseSettings(reinterpret_cast<const uint8_t*>(ok),
+                                 strlen(ok));
+        CHECK(overflow.updateSerial == 1756742400ull,
               "a plausible update serial round-trips");
 
         // Remember-view fields round-trip, including a path with a space
@@ -2861,52 +2820,6 @@ static void TestSettings() {
     }
 }
 
-int main() {
-    std::printf("\n=== Spindle core tests ===\n\n");
-
-    TestEasing();
-    TestFormatSize();
-    TestFormatCount();
-    TestCategories();
-    TestSanitize();
-    TestSatAdd();
-    TestTreemapBounds();
-    TestTreemapProportionality();
-    TestTreemapNoOverlap();
-    TestTreemapAspectRatio();
-    TestTreemapDeepNesting();
-    TestTreemapCellCap();
-    TestZeroAndDegenerate();
-    TestHitTest();
-    TestExtensionBreakdown();
-    TestLargestFiles();
-    TestFindByName();
-    TestQueryParsing();
-    TestQueryMatching();
-    TestPathQueries();
-    TestPathCompletion();
-    FuzzQueries();
-    TestCsvExport();
-    TestReportsOnHostileTrees();
-    TestCellChainPaths();
-    TestHitTestIndexAgreement();
-    TestLabelStripClear();
-    TestExpandedFlagConsistency();
-    FuzzSanitize();
-    FuzzTreemap();
-    FuzzShareKeys();
-    TestScanCache();
-    TestSettings();
-    TestShareKeys();
-    TestCachePolicy();
-    TestCacheSeal();
-    TestUtf8();
-    TestForceRemovalGuards();
-    TestHasher();
-    TestDuplicates();
-    TestDiff();
-    TestCommandLine();
-
-    std::printf("\n=== %d passed, %d failed ===\n\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+int main(int argc, char** argv) {
+    return spindle::testing::Main("Spindle core tests", argc, argv);
 }

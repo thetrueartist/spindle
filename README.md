@@ -1,14 +1,24 @@
-# Spindle
+<p align="center">
+  <img src="docs/logo.png" width="112" alt="">
+</p>
 
-[![ci](https://github.com/thetrueartist/spindle/actions/workflows/ci.yml/badge.svg)](https://github.com/thetrueartist/spindle/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/thetrueartist/spindle?label=release&color=b8860b)](https://github.com/thetrueartist/spindle/releases/latest)
-[![platform](https://img.shields.io/badge/windows-x64%20%7C%20arm64-555)](https://github.com/thetrueartist/spindle/releases/latest)
-[![license](https://img.shields.io/github/license/thetrueartist/spindle?color=555)](LICENSE)
+<h1 align="center">Spindle</h1>
 
-A disk space analyser for Windows. Native C++17, Win32 and Direct2D, no
-runtime and no third-party code. One portable executable of about 1.5 MB.
+<p align="center"><strong>A disk space analyser for Windows. It shows what a drive is full of, not just how full it is.</strong></p>
+
+<p align="center">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20x64%20%7C%20ARM64-0078d4">
+  <img alt="third-party code" src="https://img.shields.io/badge/third--party%20code-none-3fb950">
+  <img alt="single exe" src="https://img.shields.io/badge/single%20exe-1.5%20MB-555">
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-3fb950"></a>
+  <a href="https://github.com/thetrueartist/spindle/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/thetrueartist/spindle?label=release&color=b8860b"></a>
+  <a href="https://github.com/thetrueartist/spindle/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/thetrueartist/spindle/actions/workflows/ci.yml/badge.svg"></a>
+</p>
 
 ![treemap](docs/screenshot.png)
+
+Native C++17, Win32 and Direct2D, no runtime and no third-party code, in
+one portable executable of about 1.5 MB.
 
 Scan a drive and see where the space went as a treemap coloured by what
 the files are. The side panel breaks the drive down by kind, lists the

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generate spindle.ico. Standard library only -- no Pillow, no dependencies.
+"""Generate spindle.ico, or one frame as a PNG with --png PATH SIZE.
+Standard library only -- no Pillow, no dependencies.
 
 The icon is the application's own visual language rather than a generic disc:
 an asymmetric treemap in the category palette, amber dominant to match the
@@ -13,6 +14,7 @@ back to the stock Windows icon. So: DIB up to 128, PNG only at 256.
 """
 
 import struct
+import sys
 import zlib
 
 INK = (0x12, 0x16, 0x1C, 255)
@@ -228,5 +230,15 @@ def main():
     print(f"wrote build/spindle.ico  ({len(out)} bytes, {len(frames)} frames)")
 
 
+def write_png(path, size):
+    """One frame at any size as a standalone PNG, for the README logo."""
+    with open(path, "wb") as f:
+        f.write(png_frame(render(size), size))
+    print(f"wrote {path}  ({size}x{size})")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--png":
+        write_png(sys.argv[2], int(sys.argv[3]))
+    else:
+        main()

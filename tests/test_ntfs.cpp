@@ -16,15 +16,7 @@
 
 using namespace spindle::ntfs;
 
-static int g_fail = 0;
-static int g_pass = 0;
-
-#define CHECK(cond, msg)                                                    \
-    do {                                                                    \
-        if (cond) { ++g_pass; }                                             \
-        else { ++g_fail;                                                    \
-               std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, msg); }\
-    } while (0)
+#include "check.h"
 
 namespace {
 
@@ -158,8 +150,7 @@ std::vector<uint8_t> MakeRecord(const std::wstring& name, uint32_t parent,
 
 // ------------------------------------------------------------------- tests
 
-static void TestBootSectorValid() {
-    std::printf("Boot sector: valid input\n");
+SUITE(TestBootSectorValid, "Boot sector: valid input") {
     const auto b = MakeBootSector();
     const BootInfo bi = ParseBootSector(b.data(), b.size());
 
@@ -173,8 +164,7 @@ static void TestBootSectorValid() {
                 static_cast<unsigned long long>(bi.mftStartCluster));
 }
 
-static void TestBootSectorRejects() {
-    std::printf("Boot sector: malformed input rejected\n");
+SUITE(TestBootSectorRejects, "Boot sector: malformed input rejected") {
 
     CHECK(!ParseBootSector(nullptr, 0).valid, "null buffer");
     CHECK(!ParseBootSector(nullptr, 512).valid, "null with length");
@@ -227,8 +217,7 @@ static void TestBootSectorRejects() {
           "MFT start past a small volume");
 }
 
-static void TestRunList() {
-    std::printf("Run list decoding\n");
+SUITE(TestRunList, "Run list decoding") {
 
     // header 0x21: 1 length byte, 2 offset bytes.
     const uint8_t simple[] = {0x21, 0x18, 0x34, 0x56, 0x00};
@@ -282,8 +271,7 @@ static void TestRunList() {
           "delta before volume start");
 }
 
-static void TestFixups() {
-    std::printf("Fixup application\n");
+SUITE(TestFixups, "Fixup application") {
 
     auto rec = MakeRecord(L"test.txt", 5, 4096, false);
     std::vector<uint8_t> copy = rec;
@@ -316,8 +304,7 @@ static void TestFixups() {
     CHECK(!ApplyFixups(copy.data(), copy.size(), 512), "torn write detected");
 }
 
-static void TestRecordParsing() {
-    std::printf("Record parsing: valid input\n");
+SUITE(TestRecordParsing, "Record parsing: valid input") {
 
     auto rec = MakeRecord(L"KingdomCome.pak", 42, 512, false);
     CHECK(ApplyFixups(rec.data(), rec.size(), 512), "fixups ok");
@@ -364,8 +351,7 @@ static void TestRecordParsing() {
           "DOS name used when it is the only one");
 }
 
-static void TestRecordRejects() {
-    std::printf("Record parsing: malformed input rejected\n");
+SUITE(TestRecordRejects, "Record parsing: malformed input rejected") {
 
     RecordInfo info = ParseRecord(nullptr, 1024);
     CHECK(!info.valid, "null record");
@@ -431,8 +417,7 @@ static void TestRecordRejects() {
 
 // Structured fuzzing: take a valid record and corrupt it, which reaches deeper
 // into the parser than uniformly random bytes usually do.
-static void FuzzRecords() {
-    std::printf("Fuzz: record parsing\n");
+SUITE(FuzzRecords, "Fuzz: record parsing") {
 
     std::mt19937 rng(0xF0FA);
     std::uniform_int_distribution<int> byteDist(0, 255);
@@ -459,7 +444,7 @@ static void FuzzRecords() {
             if (info.name.size() > kMaxNameChars) {
                 std::printf("    name exceeded the NTFS limit: %zu chars\n",
                             info.name.size());
-                ++g_fail;
+                CHECK(false, "a corrupted record yielded a name past the NTFS limit");
                 return;
             }
         }
@@ -469,8 +454,7 @@ static void FuzzRecords() {
     CHECK(true, "fuzzing completed without a fault");
 }
 
-static void FuzzRandomBuffers() {
-    std::printf("Fuzz: uniformly random buffers\n");
+SUITE(FuzzRandomBuffers, "Fuzz: uniformly random buffers") {
 
     std::mt19937 rng(0x5A17);
     std::uniform_int_distribution<int> byteDist(0, 255);
@@ -502,8 +486,7 @@ static void FuzzRandomBuffers() {
 
 // Truncation is its own class of bug: a structure that is valid up to the
 // point the buffer ends.
-static void FuzzTruncation() {
-    std::printf("Fuzz: truncation at every offset\n");
+SUITE(FuzzTruncation, "Fuzz: truncation at every offset") {
 
     const auto boot = MakeBootSector();
     for (size_t n = 0; n <= boot.size(); ++n) {
@@ -515,8 +498,8 @@ static void FuzzTruncation() {
     for (size_t n = 0; n <= rec.size(); ++n) {
         const RecordInfo info = ParseRecord(rec.data(), n);
         if (info.hasName && info.name.size() > kMaxNameChars) {
-            ++g_fail;
             std::printf("    truncation at %zu produced an over-long name\n", n);
+            CHECK(false, "a truncated record yielded a name past the NTFS limit");
             return;
         }
     }
@@ -531,19 +514,6 @@ static void FuzzTruncation() {
     CHECK(true, "truncation fuzzing completed without a fault");
 }
 
-int main() {
-    std::printf("\n=== Spindle NTFS parser tests ===\n\n");
-
-    TestBootSectorValid();
-    TestBootSectorRejects();
-    TestRunList();
-    TestFixups();
-    TestRecordParsing();
-    TestRecordRejects();
-    FuzzRecords();
-    FuzzRandomBuffers();
-    FuzzTruncation();
-
-    std::printf("\n=== %d passed, %d failed ===\n\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+int main(int argc, char** argv) {
+    return spindle::testing::Main("Spindle NTFS parser tests", argc, argv);
 }

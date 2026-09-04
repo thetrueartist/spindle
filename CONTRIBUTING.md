@@ -26,6 +26,9 @@ make analyze      # cppcheck + clang-tidy
 make hooks        # run the hygiene check on every commit
 ```
 
+A single suite runs with `make test-core ARGS='--filter cache'`; HACKING.md
+describes the harness.
+
 `tools/wine-ui-test.sh` drives the real window under Wine for
 interface changes, and `tools/wine-corpo-check.sh` runs the
 network-permission and cache-policy acceptance checks end to end.

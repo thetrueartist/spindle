@@ -437,8 +437,12 @@ std::wstring SanitizeForDisplay(const std::wstring& in, bool* modified) {
         // negative value straight to uint32_t produces something above every
         // range test below -- which would let the character through
         // unsanitised on exactly the platforms where wchar_t is signed.
-        const uint32_t u =
-            static_cast<uint32_t>(static_cast<std::make_unsigned<wchar_t>::type>(c));
+        // Widened implicitly: wchar_t is 16 bits on Windows and 32 on the
+        // test host, so a spelled-out cast is right on one and useless
+        // on the other.
+        const std::make_unsigned<wchar_t>::type unsignedChar =
+            static_cast<std::make_unsigned<wchar_t>::type>(c);
+        const uint32_t u = unsignedChar;
 
         const bool isC0     = (u < 0x20);
         const bool isDel    = (u == 0x7F);
@@ -2129,12 +2133,18 @@ std::vector<wchar_t> CachesToDrop(
     const std::vector<std::pair<wchar_t, int>>& present,
     const std::vector<wchar_t>& cached) {
     std::vector<wchar_t> drop;
+    // Drive letters are ASCII, so folding case needs no locale, and the
+    // arithmetic form is the same on both widths of wchar_t.
+    const auto upper = [](wchar_t c) {
+        return (c >= L'a' && c <= L'z') ? static_cast<wchar_t>(c - (L'a' - L'A'))
+                                        : c;
+    };
     for (wchar_t c : cached) {
-        const wchar_t letter = static_cast<wchar_t>(towupper(c));
+        const wchar_t letter = upper(c);
         bool found   = false;
         int  verdict = -1;
         for (const auto& p : present) {
-            if (static_cast<wchar_t>(towupper(p.first)) == letter) {
+            if (upper(p.first) == letter) {
                 found   = true;
                 verdict = p.second;
                 break;

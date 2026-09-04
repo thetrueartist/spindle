@@ -15,15 +15,7 @@
 
 using namespace spindle;
 
-static int g_fail = 0;
-static int g_pass = 0;
-
-#define CHECK(cond, msg)                                                    \
-    do {                                                                    \
-        if (cond) { ++g_pass; }                                             \
-        else { ++g_fail;                                                    \
-               std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, msg); }\
-    } while (0)
+#include "check.h"
 
 namespace {
 
@@ -88,8 +80,7 @@ long RunPool(Ctx& c, int threads) {
 // Every enqueued item must be processed exactly once and every worker must
 // exit. A hang here is the classic termination bug: workers sleeping while
 // work is still in flight, or exiting while the queue still has items.
-static void TestDrainsCompletely() {
-    std::printf("Queue drains and terminates\n");
+SUITE(TestDrainsCompletely, "Queue drains and terminates") {
 
     // 3-way fanout to depth 6 = 1 + 3 + 9 + ... + 729 = 1093 items.
     long expected = 0;
@@ -117,8 +108,7 @@ static void TestDrainsCompletely() {
 
 // The scanner starts every thread before any work exists beyond a single root
 // item, so most workers begin by waiting. They must not exit early.
-static void TestNoEarlyExit() {
-    std::printf("Workers do not exit before work arrives\n");
+SUITE(TestNoEarlyExit, "Workers do not exit before work arrives") {
 
     for (int trial = 0; trial < 40; ++trial) {
         Ctx c;
@@ -141,8 +131,7 @@ static void TestNoEarlyExit() {
 
 // Cancellation must stop promptly and leave the queue consistent, with Done
 // still balanced against Pop.
-static void TestCancellation() {
-    std::printf("Cancellation is clean\n");
+SUITE(TestCancellation, "Cancellation is clean") {
 
     for (int trial = 0; trial < 60; ++trial) {
         Ctx c;
@@ -167,8 +156,7 @@ static void TestCancellation() {
 
 // Stop before any worker starts: nothing should be handed out, and nothing
 // should block.
-static void TestStopBeforeStart() {
-    std::printf("Stop before workers start\n");
+SUITE(TestStopBeforeStart, "Stop before workers start") {
 
     Ctx c;
     c.maxDepth = 0;
@@ -183,8 +171,7 @@ static void TestStopBeforeStart() {
 
 // An empty queue with no workers busy must return immediately rather than
 // blocking forever.
-static void TestEmptyQueueReturns() {
-    std::printf("Empty queue returns immediately\n");
+SUITE(TestEmptyQueueReturns, "Empty queue returns immediately") {
 
     Ctx c;
     c.maxDepth = 0;
@@ -196,8 +183,7 @@ static void TestEmptyQueueReturns() {
 
 // Heavy contention: many threads, tiny units of work, repeated. This is the
 // shape that was killing the win32 std::condition_variable build.
-static void TestHeavyContention() {
-    std::printf("Heavy contention\n");
+SUITE(TestHeavyContention, "Heavy contention") {
 
     long total = 0;
     for (int round = 0; round < 12; ++round) {
@@ -213,16 +199,6 @@ static void TestHeavyContention() {
     CHECK(total == 4095L * 12, "exact item count across all rounds");
 }
 
-int main() {
-    std::printf("\n=== Spindle work queue concurrency tests ===\n\n");
-
-    TestEmptyQueueReturns();
-    TestStopBeforeStart();
-    TestDrainsCompletely();
-    TestNoEarlyExit();
-    TestCancellation();
-    TestHeavyContention();
-
-    std::printf("\n=== %d passed, %d failed ===\n\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+int main(int argc, char** argv) {
+    return spindle::testing::Main("Spindle work queue concurrency tests", argc, argv);
 }

@@ -14,20 +14,9 @@
 
 using namespace spindle;
 
-static int g_pass = 0;
-static int g_fail = 0;
-#define CHECK(cond, what)                                              \
-    do {                                                               \
-        if (cond) {                                                    \
-            ++g_pass;                                                  \
-        } else {                                                       \
-            ++g_fail;                                                  \
-            std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, what); \
-        }                                                              \
-    } while (0)
+#include "check.h"
 
-static void TestClassify() {
-    std::printf("Classify\n");
+SUITE(TestClassify, "Classify") {
     // A UNC path is a network location by spelling and its identity is the
     // share, however deep the path or how the prefix is spelled.
     NetPlace a = ClassifyPath(L"\\\\nas\\share\\deep", true);
@@ -67,8 +56,7 @@ static void TestClassify() {
     }
 }
 
-static void TestSealedCache() {
-    std::printf("Sealed cache\n");
+SUITE(TestSealedCache, "Sealed cache") {
     wchar_t sys[MAX_PATH] = {};
     if (GetWindowsDirectoryW(sys, MAX_PATH) <= 2) return;
     const std::wstring root = std::wstring(sys).substr(0, 3);
@@ -154,9 +142,6 @@ static void TestSealedCache() {
           "a leftover temporary is swept at launch");
 }
 
-int wmain() {
-    TestClassify();
-    TestSealedCache();
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+int wmain(int argc, wchar_t** argv) {
+    return spindle::testing::Main("Spindle Windows-side tests", argc, argv);
 }
