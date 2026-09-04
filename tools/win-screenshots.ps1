@@ -246,12 +246,14 @@ $origin = New-Object PSObject -Property @{ X = $o[0]; Y = $o[1] }
 if ($W -le 0 -or $H -le 0) { throw "client area is ${W}x${H}" }
 Log ("client {0}x{1} at screen {2},{3}" -f $W, $H, $origin.X, $origin.Y)
 
-function Shot($name, $x = 0, $y = 0, $w = 0, $h = 0) {
-    if ($w -le 0) { $w = $W - $x }
-    if ($h -le 0) { $h = $H - $y }
-    $bmp = New-Object System.Drawing.Bitmap $w, $h
+# Variable names are case-insensitive in PowerShell, so these parameters
+# must not be spelled like the client size they default to.
+function Shot($name, $left = 0, $top = 0, $width = 0, $height = 0) {
+    if ($width -le 0) { $width = $W - $left }
+    if ($height -le 0) { $height = $H - $top }
+    $bmp = New-Object System.Drawing.Bitmap $width, $height
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($origin.X + $x, $origin.Y + $y, 0, 0, $bmp.Size)
+    $g.CopyFromScreen($origin.X + $left, $origin.Y + $top, 0, 0, $bmp.Size)
     $g.Dispose()
     $bmp.Save((Join-Path $Out "$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
