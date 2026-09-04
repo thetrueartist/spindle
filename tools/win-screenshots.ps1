@@ -328,13 +328,16 @@ Keys "^f"; Frames 3
 TypeText "kind:media >100mb"; Frames 12
 Keys "{ESC}"
 
-# --- 3. the list
-Click ($W - 16 - 33) 35
+# --- 3. the list. Map and List are the two 46-wide buttons at the right
+#        end of the breadcrumb row (src/ui.cpp DrawBreadcrumb).
+Keys "{ESC}"; Start-Sleep -Milliseconds 300
+Click ($W - 10 - 23) 19
 Start-Sleep -Seconds 1
 Hover 700 200
 Shot "browse" 262 0 1010 420
 ShotWindow "window_browse"
-Click ($W - 16 - 46 - 14 - 23) 35     # back to the map
+Click ($W - 46 - 14 - 23) 19     # back to the map
+Start-Sleep -Milliseconds 600
 
 # --- 4. the address bar with Tab completion
 Keys "^l"; Start-Sleep -Milliseconds 400
@@ -343,9 +346,10 @@ Shot "addressbar" 262 0 1000 140
 ShotWindow "window_addressbar"
 Keys "{ESC}"
 
-# --- 5. Find
+# --- 5. Find. The walkthrough left its query in the box; select it all
+#        first so the new one replaces it.
 Tab 2
-Keys "^f"; TypeText "kind:media >100mb"; Start-Sleep -Seconds 1
+Keys "^f"; Keys "^a"; TypeText "kind:media >300mb"; Start-Sleep -Seconds 1
 Shot "find" 0 $tabsY 262 246
 ShotWindow "window_find"
 Keys "{ESC}"
@@ -358,14 +362,21 @@ Start-Sleep -Seconds 6
 Shot "duplicates" 0 $tabsY 262 300
 ShotWindow "window_dupes"
 
-# --- 7. tabs: open a block in its own tab
+# --- 7. tabs: open a folder in its own tab. The right-click lands on a
+#        folder's header strip (the "Games" label row at the top left of
+#        the map), because only a folder's menu carries "Open in a new
+#        tab" as its third item; on a file the third item would be the
+#        recycle prompt.
 Tab 0
-Click 420 220 $true; Start-Sleep -Milliseconds 500
+Keys "{ESC}"; Start-Sleep -Milliseconds 300
+Click 330 48 $true; Start-Sleep -Milliseconds 600
 Keys "{DOWN}{DOWN}{DOWN}{ENTER}"; Start-Sleep -Seconds 2
 Shot "tabs" 262 0 780 62
 ShotWindow "window_tabs"
 
-# --- 8. the question a network path asks
+# --- 8. the question a network path asks. Anything modal left over would
+#        take the keys instead, so clear the decks first.
+Keys "{ESC}"; Start-Sleep -Milliseconds 400
 Keys "^l"; Start-Sleep -Milliseconds 400
 Keys "^a"; TypeText "\\nas\share"; Keys "{ENTER}"
 $dlg = [IntPtr]::Zero
