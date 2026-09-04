@@ -1313,6 +1313,22 @@ Digest Hasher::Finish() const {
     return Digest{a, b};
 }
 
+// The volume's own metadata files ($MFT, $LogFile, $Extend and the rest),
+// which only the MFT path lists. None can be opened by an ordinary read,
+// and the transaction log under $Extend is a pair of identically sized
+// containers on every fresh volume, so without this every hunt reported
+// two unreadable candidates. The recycle bin is a folder of a person's
+// files despite its name, and stays.
+bool IsVolumeMetadataName(const std::wstring& name) {
+    if (name.empty() || name[0] != L'$') return false;
+    static const wchar_t* const kBin = L"$recycle.bin";
+    if (name.size() != 12) return true;
+    for (size_t i = 0; i < 12; ++i) {
+        if (LowerAscii(name[i]) != kBin[i]) return true;
+    }
+    return false;
+}
+
 std::vector<DupFile> CollectDupFiles(const Node& tree,
                                      const std::wstring& rootPath,
                                      uint64_t minSize) {
@@ -1320,6 +1336,12 @@ std::vector<DupFile> CollectDupFiles(const Node& tree,
     ForEachNodeWithPath(tree, [&](const Node& n, const std::wstring& prefix) {
         if (n.dir) return;
         if (n.size < minSize) return;
+        // Under a metadata folder, or a metadata file at the root.
+        if (prefix.empty() ? IsVolumeMetadataName(n.name)
+                           : IsVolumeMetadataName(prefix.substr(
+                                 0, prefix.find(L'\\')))) {
+            return;
+        }
         // A cloud placeholder would have to be downloaded to be read, and a
         // hardlink is already the same bytes as its twin - calling either a
         // duplicate would be a lie that costs the user bandwidth or data.

@@ -282,6 +282,10 @@ std::vector<DupFile> DuplicateCandidatesIn(const Node& tree,
 // eligible from each, then filter the pooled result once. Filtering per
 // tree would discard the file whose only twin lives on another drive -
 // which is the whole point of comparing drives against each other.
+// The volume's own metadata ($MFT, $Extend and the rest), which only an
+// MFT scan lists and no ordinary read can open. The recycle bin is not.
+bool IsVolumeMetadataName(const std::wstring& name);
+
 std::vector<DupFile> CollectDupFiles(const Node& tree,
                                      const std::wstring& rootPath,
                                      uint64_t minSize);

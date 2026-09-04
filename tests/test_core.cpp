@@ -1984,6 +1984,45 @@ static const Change* FindChange(const DiffReport& r, const char* path) {
     return nullptr;
 }
 
+SUITE(TestDupMetadata, "Duplicates: the volume's own metadata is never a candidate") {
+    // What an MFT scan of a fresh NTFS volume holds at its root, beside
+    // the person's files: the transaction log's two identical containers
+    // under $Extend, $MFT itself, and a recycle bin with a file in it.
+    Node root(L"D:\\", true);
+    root.cat = Cat::Directory;
+    Node extend = MakeDir(L"$Extend", {
+        MakeDir(L"$RmMetadata", {
+            MakeDir(L"$TxfLog", {
+                MakeFile(L"$TxfLogContainer00000000000000000001", 10u << 20),
+                MakeFile(L"$TxfLogContainer00000000000000000002", 10u << 20)})})});
+    Node bin = MakeDir(L"$Recycle.Bin", {
+        MakeDir(L"S-1-5-21-1", {MakeFile(L"$RABC123.mp4", 10u << 20)})});
+    root.children.push_back(std::move(extend));
+    root.children.push_back(MakeFile(L"$MFT", 10u << 20));
+    root.children.push_back(std::move(bin));
+    root.children.push_back(MakeFile(L"holiday.mp4", 10u << 20));
+    root.size = 50u << 20;
+    root.files = 5;
+
+    const auto c = DuplicateCandidates(root, 1u << 20);
+    bool sawLog = false, sawMft = false, sawBin = false, sawFile = false;
+    for (const DupFile& f : c) {
+        if (f.path.find(L"$TxfLog") != std::wstring::npos) sawLog = true;
+        if (f.path == L"$MFT") sawMft = true;
+        if (f.path.find(L"$RABC123") != std::wstring::npos) sawBin = true;
+        if (f.path == L"holiday.mp4") sawFile = true;
+    }
+    CHECK(!sawLog, "the transaction log containers are not candidates");
+    CHECK(!sawMft, "nor is the table itself");
+    CHECK(sawBin, "a file in the recycle bin still is");
+    CHECK(sawFile, "and so is an ordinary file of the same size");
+    CHECK(IsVolumeMetadataName(L"$Extend") && IsVolumeMetadataName(L"$MFT") &&
+              !IsVolumeMetadataName(L"$Recycle.Bin") &&
+              !IsVolumeMetadataName(L"$RECYCLE.BIN") &&
+              !IsVolumeMetadataName(L"Program Files"),
+          "the rule names exactly the metadata");
+}
+
 SUITE(TestDiff, "Scan comparison") {
 
     Node before = MakeDir(L"", {
