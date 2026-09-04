@@ -2808,6 +2808,14 @@ SUITE(TestSettings, "Settings") {
               "a remembered path with a space survives");
         CHECK(!ParseSettings(nullptr, 0).rememberView,
               "remember-view defaults off");
+        // The writer never emits a remembered path past a thousand
+        // characters, so the reader treats one the same way: as damage.
+        std::string longLine = "remember_view=1\nlast_path=D:\\";
+        longLine.append(1200, 'x');
+        longLine += "\n";
+        CHECK(ParseSettings(reinterpret_cast<const uint8_t*>(longLine.data()),
+                            longLine.size()).lastPath.empty(),
+              "a remembered path past the writer's bound is dropped on read too");
 
         // The fractional part of a size bound multiplies too, reached
         // through the query parser since that is the public door to it.

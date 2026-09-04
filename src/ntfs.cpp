@@ -336,11 +336,15 @@ RecordInfo ParseRecord(const uint8_t* record, size_t len) {
                                    : (nameSpace == 0) ? 1
                                    : 2;
                     if (rank > bestNamespace) {
-                        std::wstring candidate;
-                        candidate.reserve(nameChars);
+                        // Index arithmetic done in size_t. Computing
+                        // i * 2 in uint32_t and widening afterwards is
+                        // how an offset overflows before it is checked;
+                        // nameChars is bounded above, but the parser
+                        // should not depend on a bound to be safe.
+                        std::wstring candidate(nameChars, L'\0');
                         for (size_t i = 0; i < nameChars; ++i) {
-                            candidate.push_back(static_cast<wchar_t>(
-                                r.U16(base + size_t{0x42} + i * 2)));
+                            candidate[i] = static_cast<wchar_t>(
+                                r.U16(base + size_t{0x42} + i * 2));
                         }
                         // A name that cannot be a path component is not
                         // used, and does not displace a safe one.
@@ -353,18 +357,10 @@ RecordInfo ParseRecord(const uint8_t* record, size_t len) {
                         bestNamespace = rank;
                         info.parent =
                             r.U64(base) & 0x0000FFFFFFFFFFFFull;
-
-                        info.name.clear();
-                        info.name.reserve(nameChars);
-                        for (size_t i = 0; i < nameChars; ++i) {
-                            // Index arithmetic done in size_t. Computing
-                            // i * 2 in uint32_t and widening afterwards is
-                            // how an offset overflows before it is checked;
-                            // nameChars is bounded above, but the parser
-                            // should not depend on a bound to be safe.
-                            info.name.push_back(static_cast<wchar_t>(
-                                r.U16(base + size_t{0x42} + i * 2)));
-                        }
+                        // The candidate is exactly the name, already
+                        // read once above; a second pass over the bytes
+                        // was a second allocation per record.
+                        info.name = std::move(candidate);
                         info.hasName = true;
                     }
                 }

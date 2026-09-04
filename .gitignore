@@ -1,5 +1,9 @@
 # Build output
 build/
+# libFuzzer artifacts, if a run is ever started outside build/
+crash-*
+leak-*
+timeout-*
 *.o
 *.exe
 *.res.o

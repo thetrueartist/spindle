@@ -43,7 +43,7 @@ LIBS     := -ld2d1 -ldwrite -ldwmapi -lole32 -lshell32 -luser32 -lgdi32 \
             -ladvapi32 -lrstrtmgr \
             -lcomdlg32 -lwinhttp -lbcrypt -luuid -lmpr -lcomctl32 -lcrypt32
 
-.PHONY: all help test test-core test-ntfs test-queue test-mft test-image test-win stress analyze clean dirs icon hooks hygiene
+.PHONY: all help test test-core test-ntfs test-queue test-mft test-image test-win fuzz fuzz-lib bench stress analyze clean dirs icon hooks hygiene
 
 all: dirs $(OUT)
 
@@ -52,6 +52,9 @@ help:
 	@echo "make test       host tests under ASan, UBSan and ThreadSanitizer"
 	@echo "make test-image the MFT assembler against a real NTFS image (needs ntfs-3g, root)"
 	@echo "make test-win   Windows-side tests -> build/test_win.exe (run: wine build/test_win.exe)"
+	@echo "make fuzz       the parsers under random mutation (any compiler, ASan + UBSan)"
+	@echo "make fuzz-lib   the same targets under libFuzzer (clang + libclang-rt-dev)"
+	@echo "make bench      the portable hot paths on a synthetic million-file volume"
 	@echo "make stress     the scanner's concurrency structure over a real tree"
 	@echo "make analyze    cppcheck + clang-tidy over the portable core"
 	@echo "make hygiene    refuse personal paths, secrets and typographic dashes"
@@ -159,6 +162,60 @@ test-queue: build/test_queue_asan build/test_queue_tsan
 	./build/test_queue_tsan $(ARGS)
 
 test: test-core test-ntfs test-queue test-mft
+
+# -- Fuzzing -----------------------------------------------------------------
+# Each target in tests/fuzz_*.cpp is a libFuzzer entry point. `make fuzz`
+# builds them with the host compiler and tests/fuzz_main.cpp, a driver that
+# replays each target's seeds and mutates them at random under ASan and
+# UBSan, so the targets run on any box. `make fuzz-lib` is the real thing:
+# coverage-guided, under clang with its runtime (libclang-rt-dev), each
+# target for FUZZ_SECONDS seeded from the driver's --seeds output.
+FUZZERS         := ntfs cache settings text json
+FUZZ_SRC        := src/core.cpp src/ntfs.cpp src/mfttree.cpp
+FUZZ_DEPS       := tests/fuzz_common.h tests/ntfs_fixture.h src/spindle.h \
+                   src/ntfs.h src/mfttree.h $(FUZZ_SRC)
+FUZZ_ITERATIONS ?= 20000
+FUZZ_SECONDS    ?= 20
+CLANG           ?= clang++
+
+build/fuzz_%: tests/fuzz_%.cpp tests/fuzz_main.cpp $(FUZZ_DEPS)
+	@mkdir -p build
+	$(CXX_HOST) $(TEST_FLAGS) tests/fuzz_main.cpp tests/fuzz_$*.cpp $(FUZZ_SRC) -o $@
+
+build/libfuzz_%: tests/fuzz_%.cpp $(FUZZ_DEPS)
+	@mkdir -p build
+	$(CLANG) -std=c++17 -O1 -g -I src -I tests -Wall -Wextra \
+	    -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+	    -D_GLIBCXX_ASSERTIONS tests/fuzz_$*.cpp $(FUZZ_SRC) -o $@
+
+fuzz: $(FUZZERS:%=build/fuzz_%)
+	@for t in $(FUZZERS); do \
+	    echo "== fuzz_$$t"; \
+	    $(TEST_ENV) ./build/fuzz_$$t --random $(FUZZ_ITERATIONS) || exit 1; \
+	done
+
+fuzz-lib: $(FUZZERS:%=build/libfuzz_%) $(FUZZERS:%=build/fuzz_%)
+	@for t in $(FUZZERS); do \
+	    echo "== libfuzz_$$t ($(FUZZ_SECONDS)s)"; \
+	    mkdir -p build/corpus/$$t; \
+	    ./build/fuzz_$$t --seeds build/corpus/$$t >/dev/null || exit 1; \
+	    ./build/libfuzz_$$t -max_total_time=$(FUZZ_SECONDS) -max_len=65536 \
+	        -artifact_prefix=build/corpus/$$t/ build/corpus/$$t \
+	        > build/corpus/$$t.log 2>&1 || { tail -30 build/corpus/$$t.log; exit 1; }; \
+	    grep -E '^Done|^#[0-9]+.*DONE' build/corpus/$$t.log | tail -1; \
+	done
+
+# -- Benchmarks --------------------------------------------------------------
+# The portable hot paths on a synthetic million-file volume, at the
+# program's own optimisation level. Run it before and after a change.
+build/bench_core: tests/bench_core.cpp src/core.cpp src/ntfs.cpp src/mfttree.cpp \
+                  tests/ntfs_fixture.h src/spindle.h src/ntfs.h src/mfttree.h
+	@mkdir -p build
+	$(CXX_HOST) -std=c++17 -O2 -DNDEBUG -g -I src -I tests $(WARN) \
+	    tests/bench_core.cpp src/core.cpp src/ntfs.cpp src/mfttree.cpp -o $@
+
+bench: build/bench_core
+	./build/bench_core $(ARGS)
 
 # Walks a real directory tree with the scanner's exact concurrency structure.
 # Needs a POSIX host; the Windows scanner shares the queue and worker shape.

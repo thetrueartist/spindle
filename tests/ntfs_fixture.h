@@ -14,19 +14,22 @@ namespace fixture {
 
 using namespace spindle::ntfs;
 
+// Written through at(), which refuses an offset past the buffer rather
+// than trusting the caller, and which keeps the optimiser from guessing
+// that the buffer might be empty.
 inline void Put16(std::vector<uint8_t>& b, size_t off, uint16_t v) {
-    b[off] = static_cast<uint8_t>(v & 0xFF);
-    b[off + 1] = static_cast<uint8_t>(v >> 8);
+    b.at(off) = static_cast<uint8_t>(v & 0xFF);
+    b.at(off + 1) = static_cast<uint8_t>(v >> 8);
 }
 inline void Put32(std::vector<uint8_t>& b, size_t off, uint32_t v) {
     for (int i = 0; i < 4; ++i) {
-        b[off + static_cast<size_t>(i)] =
+        b.at(off + static_cast<size_t>(i)) =
             static_cast<uint8_t>((v >> (i * 8)) & 0xFF);
     }
 }
 inline void Put64(std::vector<uint8_t>& b, size_t off, uint64_t v) {
     for (int i = 0; i < 8; ++i) {
-        b[off + static_cast<size_t>(i)] =
+        b.at(off + static_cast<size_t>(i)) =
             static_cast<uint8_t>((v >> (i * 8)) & 0xFF);
     }
 }

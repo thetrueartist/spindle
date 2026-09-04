@@ -27,6 +27,20 @@ jobs:
       - name: Concurrency stress walk
         run: make stress
 
+  # Coverage-guided fuzzing of every parser, briefly, on every push. A
+  # finding here is a crash file in the job's output; replay it with the
+  # standalone driver (build/fuzz_<target> FILE) to reproduce.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang and the libFuzzer runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-rt-dev
+      - name: Fuzz each parser for thirty seconds
+        run: make fuzz-lib FUZZ_SECONDS=30
+
   cross-build:
     runs-on: ubuntu-latest
     steps:

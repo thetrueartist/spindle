@@ -201,6 +201,12 @@ bool Assembler::Finish(const std::wstring& rootName, ScanResult& out,
     std::vector<bool> visited(count, false);
     visited[ntfs::kRootRecord] = true;
 
+    // Which id produced which child, so the second loop below can pair
+    // them up directly; deriving the pairing from the loop index instead
+    // desynchronises the moment any child is skipped. One buffer for the
+    // whole build rather than one allocation per directory.
+    std::vector<uint32_t> added;
+
     uint64_t builtGuard = 0;
     while (!queue.empty()) {
         if ((++builtGuard & 0x3FFF) == 0 && cancelled()) {
@@ -216,12 +222,7 @@ bool Assembler::Finish(const std::wstring& rootName, ScanResult& out,
         if (p.depth >= kMaxTreeDepth) continue;   // stop, do not descend
 
         p.node->children.reserve(last - first);
-
-        // Record which id produced which child, so the second loop can pair
-        // them up directly. Deriving the pairing from the loop index
-        // instead desynchronises the moment any child is skipped.
-        std::vector<uint32_t> added;
-        added.reserve(last - first);
+        added.clear();
 
         for (uint32_t k = first; k < last; ++k) {
             const uint32_t id = childIds[k];

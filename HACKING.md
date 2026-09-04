@@ -15,6 +15,9 @@ make            cross-compile build/spindle.exe (MinGW-w64)
 make test       host tests under ASan, UBSan and ThreadSanitizer
 make test-image the MFT assembler against a real NTFS image (ntfs-3g, root)
 make test-win   Windows-side tests; run with `wine build/test_win.exe`
+make fuzz       the parsers under random mutation, any compiler, ASan + UBSan
+make fuzz-lib   the same targets under libFuzzer (clang + libclang-rt-dev)
+make bench      the portable hot paths on a synthetic million-file volume
 make stress     walk a real tree with the scanner's concurrency structure
 make analyze    cppcheck + clang-tidy
 make hygiene    refuse personal paths, secrets and typographic dashes
@@ -493,6 +496,21 @@ The host builds carry `_GLIBCXX_ASSERTIONS`, so an out-of-range index in a
 standard container fails loudly under test rather than reading whatever
 happens to be there. Each test binary depends on exactly what it compiles,
 so `make test` after a one-line change rebuilds one test, not four.
+
+Every parser has a fuzz target in `tests/fuzz_*.cpp`, written to the
+libFuzzer entry point and seeded from the same fixtures the unit tests
+use. `make fuzz-lib` runs them coverage-guided under clang, which CI does
+for thirty seconds each on every push; `make fuzz` links the same targets
+against `tests/fuzz_main.cpp`, a standalone driver that replays the seeds
+and mutates them at random, so they run on a box without libFuzzer and a
+crash file from CI can be replayed with `build/fuzz_<target> FILE`. A
+`FUZZ_REQUIRE` inside a target is a property the parser must keep whatever
+it was fed, and a failed one names itself.
+
+`make bench` times the portable hot paths on a synthetic million-file
+volume, median of five runs on an optimised build. Run it before and after
+a change to the tree, the cache, the panels or the assembler; the numbers
+that matter are in docs/design.md.
 
 ## Testing the interface under Wine
 

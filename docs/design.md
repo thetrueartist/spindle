@@ -25,6 +25,29 @@ testing at a few microseconds per mouse move. Extensions are aggregated
 by a hash computed in place rather than by building a string per file,
 and full paths are only assembled for the rows a caller actually keeps.
 
+`make bench` measures the portable paths on a synthetic volume of a
+million files in seventy thousand folders, median of five runs on an
+optimised build. On one ordinary machine:
+
+| | |
+|---|---|
+| Roll-up of every folder size | 17 ms |
+| Category of a file from its name | 49 ns each |
+| Treemap layout, 8,500 cells | 3 ms |
+| Kinds panel | 61 ms |
+| Largest panel | 21 ms |
+| Find, a query with three terms | 21 ms |
+| Cache written (51 MB) and read back | 106 ms and 203 ms |
+| Tree assembled from 400,000 MFT records | 395 ms, of which reading the records 111 ms |
+
+The category lookup is a compile-time hash table over the extension
+rules, because both the directory walk and the MFT assembly ask it once
+per file; the record parser builds each name once; the tree build reuses
+one scratch buffer for the whole table; and the cache parser reads each
+name straight into its node. Together those took the MFT assembly from
+506 ms to 395 ms and the cache read from 266 ms to 203 ms on the same
+volume.
+
 ## Architecture
 
 ```

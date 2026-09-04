@@ -114,9 +114,61 @@ constexpr ExtRule kExtRules[] = {
     {L"bin", Cat::Database}, {L"idx", Cat::Database},
 };
 
-inline wchar_t LowerAscii(wchar_t c) {
+constexpr wchar_t LowerAscii(wchar_t c) {
     return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
 }
+
+// The rules above, as a hash table built at compile time. This is called
+// once for every file on a volume by the walker and by the MFT assembler,
+// and a linear scan of a hundred and fifty rules per call was the largest
+// single cost of building a tree; a probe into a table a quarter full is
+// a few loads. Rules are lowercased here so a rule written in mixed case
+// (resS) matches the lowercased extension it is compared with.
+constexpr size_t kExtSlots = 512;
+
+struct ExtSlot {
+    wchar_t ext[9] = {};   // ext[0] == 0 marks an empty slot
+    Cat     cat    = Cat::Other;
+};
+
+struct ExtTable {
+    ExtSlot slots[kExtSlots];
+};
+
+constexpr uint32_t ExtHash(const wchar_t* ext, size_t len) {
+    uint32_t h = 2166136261u;   // FNV-1a, on the lowercased units
+    for (size_t i = 0; i < len; ++i) {
+        h ^= static_cast<uint32_t>(ext[i]);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+constexpr ExtTable BuildExtTable() {
+    ExtTable t{};
+    for (const ExtRule& r : kExtRules) {
+        wchar_t low[9] = {};
+        size_t n = 0;
+        for (; n < 8 && r.ext[n] != 0; ++n) low[n] = LowerAscii(r.ext[n]);
+        size_t i = ExtHash(low, n) & (kExtSlots - 1);
+        bool present = false;
+        while (t.slots[i].ext[0] != 0) {
+            bool same = true;
+            for (size_t k = 0; k < 9; ++k) {
+                if (t.slots[i].ext[k] != low[k]) { same = false; break; }
+            }
+            if (same) { present = true; break; }   // the first rule wins
+            i = (i + 1) & (kExtSlots - 1);
+        }
+        if (!present) {
+            for (size_t k = 0; k < 9; ++k) t.slots[i].ext[k] = low[k];
+            t.slots[i].cat = r.cat;
+        }
+    }
+    return t;
+}
+
+constexpr ExtTable kExtTable = BuildExtTable();
 
 }  // namespace
 
@@ -132,11 +184,16 @@ Cat CategoryForFile(const std::wstring& name) {
         ext[i] = LowerAscii(name[dot + 1 + i]);
     }
 
-    for (const ExtRule& r : kExtRules) {
-        const wchar_t* a = ext;
-        const wchar_t* b = r.ext;
-        while (*a && *b && *a == *b) { ++a; ++b; }
-        if (*a == 0 && *b == 0) return r.cat;
+    size_t i = ExtHash(ext, extLen) & (kExtSlots - 1);
+    for (size_t probe = 0; probe < kExtSlots; ++probe) {
+        const ExtSlot& s = kExtTable.slots[i];
+        if (s.ext[0] == 0) return Cat::Other;
+        bool same = true;
+        for (size_t k = 0; k < 9; ++k) {
+            if (s.ext[k] != ext[k]) { same = false; break; }
+        }
+        if (same) return s.cat;
+        i = (i + 1) & (kExtSlots - 1);
     }
     return Cat::Other;
 }
@@ -998,10 +1055,9 @@ bool ReadRecord(CacheReader& r, Node& n, uint32_t& childCount, bool isRoot) {
     }
 
     if (!r.Has(static_cast<size_t>(nameLen) * 2)) return false;
-    n.name.clear();
-    n.name.reserve(nameLen);
+    n.name.resize(nameLen);
     for (uint16_t i = 0; i < nameLen; ++i) {
-        n.name.push_back(static_cast<wchar_t>(r.U16()));
+        n.name[i] = static_cast<wchar_t>(r.U16());
     }
     // The cache file lives in the user's profile and is writable without
     // elevation, while this reads it elevated. A name is a path component
@@ -1063,8 +1119,12 @@ void SerializeScan(const ScanResult& in, const CacheMeta& meta,
         Put64(out, n->size);
         Put32(out, n->files);
         Put32(out, static_cast<uint32_t>(n->children.size()));
+        const size_t at = out.size();
+        out.resize(at + nameLen * 2);
         for (size_t i = 0; i < nameLen; ++i) {
-            Put16(out, static_cast<uint16_t>(n->name[i]));
+            const uint16_t u = static_cast<uint16_t>(n->name[i]);
+            out[at + i * 2]     = static_cast<uint8_t>(u);
+            out[at + i * 2 + 1] = static_cast<uint8_t>(u >> 8);
         }
 
         // Reversed so children pop in their stored order.
@@ -1140,13 +1200,14 @@ bool DeserializeScan(const uint8_t* data, size_t len, ScanResult& out,
         --top.remaining;
 
         if (seen == nodeCount) return false;   // more records than declared
-        Node child;
-        uint32_t kids = 0;
-        if (!ReadRecord(r, child, kids, /*isRoot=*/false)) return false;
-        ++seen;
-
-        top.node->children.push_back(std::move(child));
+        // Read straight into its place: the vector was reserved for every
+        // child its parent declared, so nothing moves, and a failure
+        // discards the whole tree anyway.
+        top.node->children.emplace_back();
         Node& placed = top.node->children.back();
+        uint32_t kids = 0;
+        if (!ReadRecord(r, placed, kids, /*isRoot=*/false)) return false;
+        ++seen;
         if (kids > 0) {
             reserved += kids;
             if (reserved >= nodeCount) return false;
@@ -1936,9 +1997,11 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
             } else if (key == "last_path") {
                 // Stored verbatim as UTF-8; the Windows layer converts it.
                 // A single value, so any '=' inside a path is kept. A
-                // control character means a damaged or forged line.
+                // control character means a damaged or forged line, and
+                // so does a path past the thousand characters the writer
+                // below will ever emit.
                 const std::string v = line.substr(eq + 1);
-                bool clean = true;
+                bool clean = v.size() <= 1000;
                 for (char ch : v) {
                     if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) {
                         clean = false;
