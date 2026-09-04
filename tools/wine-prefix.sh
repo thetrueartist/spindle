@@ -16,10 +16,21 @@ export WINEDEBUG=-all
 # No Mono or Gecko prompts: nothing here needs either.
 export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-mscoree,mshtml=}
 command -v wine >/dev/null 2>&1 || { echo "wine-prefix: wine not found" >&2; exit 1; }
+# Creating a prefix without a display does not finish; on a headless box
+# the same virtual display the interface harness uses serves.
+: "${DISPLAY:=:99}"
+export DISPLAY
+if ! xdpyinfo >/dev/null 2>&1; then
+  command -v Xvfb >/dev/null 2>&1 || { echo "wine-prefix: no display and no Xvfb" >&2; exit 1; }
+  (setsid Xvfb "$DISPLAY" -screen 0 1280x800x24 >/dev/null 2>&1 &)
+  sleep 2
+fi
 
 if [ ! -d "$WINEPREFIX/drive_c" ]; then
   echo "wine-prefix: creating $WINEPREFIX"
-  wineboot -i >/dev/null 2>&1 || true
+  # Wine creates the prefix directory but not its parents.
+  mkdir -p "$WINEPREFIX"
+  wineboot -i >/dev/null 2>&1 || { echo "wine-prefix: wineboot failed" >&2; exit 1; }
   wineserver -w
 fi
 

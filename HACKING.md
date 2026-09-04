@@ -529,8 +529,20 @@ acceptance checks end to end under Wine and prints a PASS/FAIL line per
 check. It wants a prefix with Y: registered as a `network` drive and E:
 as `floppy` under `HKLM\Software\Wine\Drives`, a fixed D: with content,
 and a folder at `dosdevices/unc/nas/share`, which is how Wine spells
-`\\nas\share`. Wine gives a mapped letter no share name, so the checks
-that need a remembered identity use the UNC path.
+`\\nas\share`. `tools/wine-prefix.sh` builds exactly that from nothing,
+with sparse files so the volumes cost no space, and `WINEPREFIX` points
+both scripts at a prefix other than `~/.wine`. CI runs the pair on every
+push, non-blocking until the job has proven steady on the hosted runner.
+Wine gives a mapped letter no share name, so the checks that need a
+remembered identity use the UNC path.
+
+The README images are not drawn under Wine, which renders its own window
+chrome and fonts. `tools/win-screenshots.ps1` draws them on a real
+Windows desktop: it builds a demo NTFS volume from a VHDX, launches the
+built exe against it, drives the window with the same clicks and keys a
+person would use and saves each scene, and `screenshots.yml` runs it on
+a hosted Windows runner, handing the captures back on a short-lived
+branch. The walkthrough frames it saves become docs/demo.gif here.
 
 ## Conventions
 

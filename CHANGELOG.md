@@ -3,6 +3,24 @@
 Newest first. Every version is a GitHub release carrying `spindle.exe`
 and `SHA256SUMS`, built by CI from the tagged commit.
 
+## 2.6.0
+
+- The tree is built from the Master File Table faster: the category
+  lookup is a compile-time hash table, the record parser builds each
+  name once and the build reuses its scratch buffer, which took 400,000
+  records from 506 ms to 395 ms on the benchmark volume; a cached map
+  reads back a quarter faster.
+- The volume's own metadata files ($MFT, $Extend and the rest) are never
+  offered as duplicate candidates, so a hunt no longer reports two
+  unreadable files on every fresh NTFS volume.
+- An extension rule written in mixed case (resS) matches.
+- A remembered path longer than the settings writer will ever emit is
+  refused on read as well as on write.
+- Under the hood: the MFT assembly is a portable unit proven against a
+  real NTFS image in CI, every parser has a fuzz target run on every
+  push, one harness runs every test binary, `make bench` times the hot
+  paths, and the README images are drawn on a real Windows desktop.
+
 ## 2.5.14
 
 - The cache is sealed in an envelope: a random key per file protected

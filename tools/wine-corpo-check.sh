@@ -3,8 +3,9 @@
 # Wine with tools/wine-ui-test.sh. Needs a Wine prefix where Y: is a
 # drive registered as type "network", E: as "floppy", D: an ordinary
 # fixed drive with content, and a folder under dosdevices/unc/nas/share
-# (see HACKING.md). Prints PASS/FAIL per check and exits non-zero on any
-# failure. Dialog button offsets are measured from the dialog's client
+# (see HACKING.md); tools/wine-prefix.sh builds exactly that, and
+# WINEPREFIX names the prefix if it is not $HOME/.wine. Prints PASS/FAIL
+# per check and exits non-zero on any failure. Dialog button offsets are measured from the dialog's client
 # origin: the Scan and Don't scan buttons sit side by side at (230,127)
 # and (314,127) when the remember box is present, with the box itself at
 # (14,127), and at (230,130) and (314,130) when it is not.
@@ -12,15 +13,16 @@ set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=wine-ui-test.sh
 source "$HERE/wine-ui-test.sh"
-C="$HOME/.wine/drive_c/users/$(whoami)/AppData/Local/Spindle"
+P="${WINEPREFIX:-$HOME/.wine}"
+C="$P/drive_c/users/$(whoami)/AppData/Local/Spindle"
 # A folder inside the prefix, so the output path is a Windows path whatever
 # drive letters the prefix has (a Linux path needs a Z: drive to be reachable).
-TMP="$HOME/.wine/drive_c/users/$(whoami)/Temp/spindle-check"; mkdir -p "$TMP"
+TMP="$P/drive_c/users/$(whoami)/Temp/spindle-check"; mkdir -p "$TMP"
 TMPW="C:\\users\\$(whoami)\\Temp\\spindle-check"
 PASS=0; FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
-stop() { for P in $(ps -eo pid,cmd | awk '$2 ~ /spindle\.exe$/ {print $1}'); do kill -TERM "$P" 2>/dev/null; done; }
+stop() { for pid in $(ps -eo pid,cmd | awk '$2 ~ /spindle\.exe$/ {print $1}'); do kill -TERM "$pid" 2>/dev/null; done; }
 windows() { xdotool search --name 'Spindle' 2>/dev/null | wc -l; }
 menu() { ui_focus; ui_click 240 28; sleep 1; xdotool mousemove $((UI_X+260)) $((UI_Y+$1)) click 1; sleep 1.2; }
 stop; sleep 1

@@ -318,9 +318,12 @@ Keys "{F5}"
 Frames 10 100
 Start-Sleep -Milliseconds 800
 Frames 6
-Click 420 220           # the largest block, top-left of the map
+# A folder's header strip descends into it; a file's cell only outlines
+# it. Games sits top-left, and once inside, its largest child's header
+# takes the same place.
+Click 330 48
 Frames 10
-Click 420 220           # one level further
+Click 330 48
 Frames 8
 Keys "{BACKSPACE}"; Frames 4
 Keys "{BACKSPACE}"; Frames 6

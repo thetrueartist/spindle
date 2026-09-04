@@ -14,6 +14,7 @@
 set -u
 : "${DISPLAY:=:99}"
 export DISPLAY WINEDEBUG=-all
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree,mshtml=}"   # no Mono or Gecko prompts
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 UI_OUT="${UI_OUT:-$REPO/build/uitest}"
 mkdir -p "$UI_OUT"
