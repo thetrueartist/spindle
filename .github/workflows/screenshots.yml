@@ -1,0 +1,57 @@
+name: screenshots
+
+# Draws the README images on a real Windows desktop. Started by hand; the
+# captures come back on a short-lived branch (an artifact cannot be
+# fetched from everywhere), from which they are copied into docs/ by a
+# person and the branch deleted.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+      - run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindle-exe
+          path: build/spindle.exe
+
+  capture:
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: spindle-exe
+      - name: Capture
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File tools\win-screenshots.ps1 -Exe .\spindle.exe -Out shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: shots
+      - name: Hand the captures back on a branch
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          [ -d shots ] || exit 0
+          git config user.name "screenshots"
+          git config user.email "screenshots@users.noreply.github.com"
+          git checkout --orphan screenshots-out
+          git rm -rfq --cached . >/dev/null
+          git clean -fdxq -e shots
+          git add -f shots
+          git commit -qm "Captures from run ${{ github.run_id }}"
+          git push -f origin screenshots-out
