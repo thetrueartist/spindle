@@ -53,5 +53,6 @@ jobs:
           git rm -rfq --cached . >/dev/null
           git clean -fdxq -e shots
           git add -f shots
+          if git diff --cached --quiet; then echo "nothing was captured"; exit 0; fi
           git commit -qm "Captures from run ${{ github.run_id }}"
           git push -f origin screenshots-out

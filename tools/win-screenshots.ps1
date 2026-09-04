@@ -88,7 +88,7 @@ $root = "${Letter}:\"
 if (-not (Test-Path $root)) {
     $dp = Join-Path $env:TEMP "spindle-demo.dp"
     @(
-        "create vdisk file=`"$vhd`" maximum=16384 type=expandable",
+        "create vdisk file=`"$vhd`" maximum=40960 type=expandable",
         "attach vdisk",
         "create partition primary",
         "format fs=ntfs quick label=Demo",
@@ -101,7 +101,7 @@ if (-not (Test-Path $root)) {
 }
 
 # fsutil allocates the file without writing it, so a multi-gigabyte tree
-# costs seconds. Every size is unique (a counter times a prime on top of
+# costs seconds and the expandable disk stays small. Every size is unique (a counter times a prime on top of
 # the requested size) so that same-length zero-filled files never pose as
 # duplicates; the only duplicates on the volume are the real ones below.
 $script:n = 0
@@ -259,6 +259,7 @@ $tabsY = 144 + 74 * $drives.Count + 10
 Log ("{0} fixed drives, demo card at y={1}, panel tabs at y={2}" -f $drives.Count, $cardY, $tabsY)
 function Tab($i) { Click (16 + 59 * $i + 29) ($tabsY + 12) }
 
+try {
 # --- 1. the map, after the scan (the demo card is clicked so the sidebar
 #        shows it selected even if the launch path already opened it)
 Start-Sleep -Seconds 4
@@ -332,7 +333,12 @@ if ($dlg -ne [IntPtr]::Zero) {
     $bmp.Save((Join-Path $Out "network.png"), [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
     Keys "{ESC}"
 } else { Log "no network dialog appeared" }
-ShotWindow "window_end"
-
-Log "done: $((Get-ChildItem $Out).Count) files in $Out"
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+} catch {
+    Log "failed: $_"
+    try { ShotWindow "window_failure" } catch { }
+    throw
+} finally {
+    try { ShotWindow "window_end" } catch { }
+    Log "done: $((Get-ChildItem $Out).Count) files in $Out"
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+}
