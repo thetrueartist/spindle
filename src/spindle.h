@@ -514,6 +514,10 @@ struct Settings {
     std::string lastPath;         // UTF-8 folder path to reopen
     bool lastBrowse     = false;  // list view rather than the map
     int  lastPanel      = 0;      // which side panel was open
+    // The place was inside the All drives view. The path alone cannot
+    // say so: a folder opened there flattens to the same "C:\Users" a
+    // direct scan gives, and the aggregate's own root has no path at all.
+    bool lastAllDrives  = false;
     // Network shares the person has agreed to read, remembered by their
     // own identity (\\server\share, normalised) rather than by drive
     // letter, so a letter mapped somewhere else later asks afresh. A

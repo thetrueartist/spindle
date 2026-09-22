@@ -28,6 +28,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (s.rememberView) FUZZ_REQUIRE(back.lastPath == s.lastPath);
     else FUZZ_REQUIRE(back.lastPath.empty());
     FUZZ_REQUIRE(back.lastPanel == s.lastPanel);
+    FUZZ_REQUIRE(back.lastAllDrives == s.lastAllDrives);
     FUZZ_REQUIRE(back.cleanupOld == s.cleanupOld);
     return 0;
 }
@@ -35,7 +36,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 void FuzzSeeds(std::vector<std::vector<uint8_t>>& out) {
     const char* text =
         "keep_caches=1\nresume_on_launch=1\nprefetch_all=0\ncheck_updates=1\n"
-        "remember_view=1\nlast_browse=0\nlast_panel=2\n"
+        "remember_view=1\nlast_browse=0\nlast_all_drives=1\nlast_panel=2\n"
         "trusted_share=\\\\nas\\share\ntrusted_share=\\\\fileserver\\public\n"
         "cleanup_old=0\nupdate_serial=1756742400\n"
         "last_path=D:\\Games\\Northwind Online\n";

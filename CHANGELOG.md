@@ -3,6 +3,13 @@
 Newest first. Every version is a GitHub release carrying `spindle.exe`
 and `SHA256SUMS`, built by CI from the tagged commit.
 
+## 2.6.1
+
+- "Remember where I was" brings back the All drives view. It remembered
+  the place but not the view, so a launch from the aggregate's root fell
+  back to the freshest drive, and one from a folder inside it reopened
+  that folder on its own drive instead.
+
 ## 2.6.0
 
 - The tree is built from the Master File Table faster: the category

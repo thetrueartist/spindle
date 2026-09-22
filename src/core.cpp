@@ -2009,6 +2009,8 @@ Settings ParseSettings(const uint8_t* data, size_t len) {
                 s.rememberView = value;
             } else if (key == "last_browse") {
                 s.lastBrowse = value;
+            } else if (key == "last_all_drives") {
+                s.lastAllDrives = value;
             } else if (key == "cleanup_old") {
                 s.cleanupOld = value;
             } else if (key == "last_panel") {
@@ -2075,6 +2077,7 @@ void SerializeSettings(const Settings& s, std::vector<uint8_t>& out) {
         "\ncheck_updates=" + (s.checkUpdates ? "1" : "0") +
         "\nremember_view=" + (s.rememberView ? "1" : "0") +
         "\nlast_browse=" + (s.lastBrowse ? "1" : "0") +
+        "\nlast_all_drives=" + (s.lastAllDrives ? "1" : "0") +
         "\nlast_panel=" + std::to_string(s.lastPanel) +
         "\ncleanup_old=" + (s.cleanupOld ? "1" : "0") +
         "\nupdate_serial=" + std::to_string(s.updateSerial) + "\n";

@@ -2845,6 +2845,25 @@ SUITE(TestSettings, "Settings") {
               "remember-view flags round-trip");
         CHECK(ro.lastPath == sv.lastPath,
               "a remembered path with a space survives");
+        // The All drives view is a flag beside the path, since the path
+        // cannot express it: a folder opened inside it has the same path
+        // as the folder opened on its own drive.
+        CHECK(!ro.lastAllDrives, "the All drives flag is off unless set");
+        sv.lastAllDrives = true;
+        sv.lastPath      = "All drives";
+        sb.clear();
+        SerializeSettings(sv, sb);
+        ro = ParseSettings(sb.data(), sb.size());
+        CHECK(ro.lastAllDrives && ro.lastPath == "All drives",
+              "a remembered All drives view round-trips");
+        sv.lastPath = "C:\\Users";
+        sb.clear();
+        SerializeSettings(sv, sb);
+        ro = ParseSettings(sb.data(), sb.size());
+        CHECK(ro.lastAllDrives && ro.lastPath == "C:\\Users",
+              "a folder inside All drives keeps both the path and the view");
+        CHECK(!ParseSettings(nullptr, 0).lastAllDrives,
+              "the All drives flag defaults off");
         CHECK(!ParseSettings(nullptr, 0).rememberView,
               "remember-view defaults off");
         // The writer never emits a remembered path past a thousand

@@ -536,6 +536,11 @@ push, non-blocking until the job has proven steady on the hosted runner.
 Wine gives a mapped letter no share name, so the checks that need a
 remembered identity use the UNC path.
 
+`tools/wine-remember-check.sh` round-trips "Remember where I was" through
+a real launch and close, All drives included, and proves it from what the
+program writes back rather than from pixels; `tools/win-remember-check.ps1`
+is the same check on a real Windows desktop, which CI runs on every push.
+
 The README images are not drawn under Wine, which renders its own window
 chrome and fonts. `tools/win-screenshots.ps1` draws them on a real
 Windows desktop: it builds a demo NTFS volume from a VHDX, launches the

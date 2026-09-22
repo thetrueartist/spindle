@@ -80,6 +80,28 @@ jobs:
           $p = Start-Process -FilePath .\test_win.exe -Wait -NoNewWindow -PassThru
           if ($p.ExitCode -ne 0) { throw "test_win failed with exit $($p.ExitCode)" }
 
+  # "Remember where I was" round-tripped through a real launch and close
+  # on a real Windows desktop, All drives included. Non-blocking until it
+  # has proven steady on the hosted runner, like the Wine acceptance run.
+  windows-remember:
+    runs-on: windows-latest
+    needs: cross-build
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: spindle-exe
+      - name: Round trip the remembered view
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File tools\win-remember-check.ps1 -Exe .\spindle.exe -Out remember-shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-remember
+          path: remember-shots
+          retention-days: 7
+
   # Windows on ARM. llvm-mingw is the only toolchain that targets it, and it
   # is not packaged, so CI fetches a pinned release. Marked non-blocking:
   # nothing here can run an ARM64 binary to prove it works, so a green tick

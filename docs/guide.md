@@ -337,8 +337,9 @@ read. The path must be a full one: a drive letter or `\\server\share`.
 
 The `···` menu can remember where you were: turn on "Remember
 where I was" and the next launch reopens the same drive and folder in the
-same map or list view. It is off by default, so a normal launch still
-opens the drive with the freshest scan.
+same map or list view, with the same panel open. All drives is remembered
+too, down to the folder you were in. It is off by default, so a normal
+launch still opens the drive with the freshest scan.
 
 Spindle can also add a "Scan with Spindle" entry to folder right-click
 menus, from the `···` menu. It is off by default and is the only registry

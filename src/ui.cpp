@@ -181,7 +181,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.6.0";
+constexpr const wchar_t* kAppVersion = L"2.6.1";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -504,12 +504,30 @@ static std::wstring TrailPath(const std::vector<const Node*>& trail) {
 
 static void EndAddressEdit(bool commit);
 
+// The folder components of a remembered drive path, below its "X:\".
+static std::vector<std::wstring> ComponentsBelowRoot(const std::wstring& path) {
+    std::vector<std::wstring> comps;
+    size_t pos = 3;   // past "X:\"
+    while (pos < path.size()) {
+        const size_t sep = path.find(L'\\', pos);
+        const std::wstring c = (sep == std::wstring::npos)
+                                   ? path.substr(pos)
+                                   : path.substr(pos, sep - pos);
+        pos = (sep == std::wstring::npos) ? path.size() : sep + 1;
+        if (!c.empty()) comps.push_back(c);
+    }
+    return comps;
+}
+
 // Capture the current place into settings, for "remember where I was".
+// The view goes with it: All drives is not a place, and a folder opened
+// inside it has the same path as the folder opened on its own drive.
 static void RememberCurrentView() {
     if (!g_app.result) return;
-    g_app.settings.lastPath   = WideToUtf8(TrailPath(g_app.trail));
-    g_app.settings.lastBrowse = g_app.browse;
-    g_app.settings.lastPanel  = static_cast<int>(g_app.panel);
+    g_app.settings.lastPath      = WideToUtf8(TrailPath(g_app.trail));
+    g_app.settings.lastBrowse    = g_app.browse;
+    g_app.settings.lastPanel     = static_cast<int>(g_app.panel);
+    g_app.settings.lastAllDrives = g_app.allDrives;
 }
 
 static void DestroyEditFonts() {
@@ -4301,6 +4319,7 @@ static void ShowAppMenu(POINT screenPt) {
                 RememberCurrentView();
             } else {
                 g_app.settings.lastPath.clear();
+                g_app.settings.lastAllDrives = false;
             }
             SaveSettings(g_app.settings);
             break;
@@ -5496,9 +5515,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // the drive is still here. Falls through to the default below
             // if the remembered drive is gone (a card pulled out).
             if (g_app.settings.rememberView &&
-                !g_app.settings.lastPath.empty()) {
+                (g_app.settings.lastAllDrives ||
+                 !g_app.settings.lastPath.empty())) {
                 const std::wstring last = Utf8ToWide(g_app.settings.lastPath);
-                if (last.size() >= 2 && last[1] == L':') {
+                const bool lettered = last.size() >= 2 && last[1] == L':';
+
+                // All drives is rebuilt the way a tab restores it, then
+                // the trail is replayed once the aggregate has loaded. The
+                // aggregate names its top-level nodes by volume path, so
+                // a remembered "C:\Users" is led by "C:\"; a remembered
+                // root, which has no path, means the aggregate's own root.
+                // Only shares already allowed join, as with any All drives.
+                if (g_app.settings.lastAllDrives) {
+                    g_app.browse = g_app.settings.lastBrowse;
+                    const int p = g_app.settings.lastPanel;
+                    g_app.panel = static_cast<App::Panel>(
+                        (p >= 0 && p <= 3) ? p : 0);
+                    StartAllDrives();   // clears pendingTrail, so set it after
+                    std::vector<std::wstring> comps;
+                    if (lettered) {
+                        comps.push_back(last.substr(0, 2) + L"\\");
+                        for (std::wstring& c : ComponentsBelowRoot(last)) {
+                            comps.push_back(std::move(c));
+                        }
+                    }
+                    g_app.pendingTrail = comps;
+                    return 0;
+                }
+
+                if (lettered) {
                     int idx = -1;
                     for (size_t i = 0; i < g_app.volumes.size(); ++i) {
                         if (!g_app.volumes[i].path.empty() &&
@@ -5517,18 +5562,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (idx >= 0) {
                         const std::wstring drive =
                             g_app.volumes[static_cast<size_t>(idx)].path;
-                        std::vector<std::wstring> comps;
-                        size_t pos = 3;   // past "X:\"
-                        while (pos < last.size()) {
-                            const size_t sep = last.find(L'\\', pos);
-                            const std::wstring c =
-                                (sep == std::wstring::npos)
-                                    ? last.substr(pos)
-                                    : last.substr(pos, sep - pos);
-                            pos = (sep == std::wstring::npos) ? last.size()
-                                                             : sep + 1;
-                            if (!c.empty()) comps.push_back(c);
-                        }
+                        const std::vector<std::wstring> comps =
+                            ComponentsBelowRoot(last);
                         g_app.browse = g_app.settings.lastBrowse;
                         const int p = g_app.settings.lastPanel;
                         g_app.panel = static_cast<App::Panel>(
