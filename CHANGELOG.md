@@ -20,6 +20,13 @@ and `SHA256SUMS`, built by CI from the tagged commit.
   parent with the folder selected, which for anything at the top of a
   drive looked like Explorer had opened the drive's root. A file still
   opens its folder with the file selected.
+- Security: "Show in Explorer" never follows a link and never runs a
+  file. A junction or directory symlink, which an elevated scan lists as
+  an empty folder, is selected where it sits rather than opened, since it
+  can point anywhere, a server included. And a path the shell could not
+  resolve fell back to opening its folder with the "open" verb, which on
+  a folder since replaced by a script would have run it; it now uses
+  "explore", which no file has. The only new import is `ShellExecuteExW`.
 - Paths listed under All drives no longer carry a doubled separator after
   the drive (`C:\\Users`), so Copy path gives the path as it is.
 - Under the hood: `tools/win-newtab-check.ps1` checks these on a real

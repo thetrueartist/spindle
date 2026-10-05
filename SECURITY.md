@@ -101,7 +101,7 @@ written verbatim into a CSV and carry the spoof into whatever opens it.
 
 ## Import audit
 
-Every import comes from a Windows system DLL; at the time of writing 266
+Every import comes from a Windows system DLL; at the time of writing 267
 functions across 17 DLLs, easy to recheck with `objdump -p`. What is absent
 matters as much as what is present:
 
@@ -122,10 +122,16 @@ matters as much as what is present:
   offered rather than installed, and every failure leaves the current
   install untouched.
 - No process creation of its own. No `CreateProcess`, no `WinExec`.
-  `ShellExecuteW` hands a path to the shell in three places: to show a
-  file in Explorer, to open the cache folder, and, from the list view, to
-  open a double-clicked file with its default application, which starts
-  whatever program Windows associates with it.
+  The shell is handed a path in three places: to show an item in
+  Explorer, to open the cache folder, and, from the list view, to open a
+  double-clicked file with its default application, which starts
+  whatever program Windows associates with it. Showing an item never
+  starts anything: a file or a link is selected in its folder by
+  `SHOpenFolderAndSelectItems`, and a folder is opened by
+  `ShellExecuteExW` with the `explore` verb, which no file type has, only
+  once the disk says it is a plain folder. A folder swapped for a program
+  is refused rather than run, and a junction or symbolic link is never
+  followed, since it can point anywhere, a server included.
 - No injection primitives. No `CreateRemoteThread`, `WriteProcessMemory`,
   `VirtualAllocEx` or `SetWindowsHookEx`.
 - Registry writes happen in exactly one feature: the opt-in "Scan with

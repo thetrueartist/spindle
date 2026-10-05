@@ -3627,10 +3627,39 @@ static void CopyPathToClipboard(const std::wstring& path) {
     CopyTextToClipboard(path);
 }
 
-// A folder opens as itself, showing what is in it; a file opens its folder
-// with the file selected. Selecting a folder in its parent, which is what
-// this did for both, put a top-level folder's drive root on screen rather
-// than the folder that was right-clicked.
+// Open `dir` in Explorer, but only a plain folder: the disk is asked now,
+// not a tree that can be minutes old, and the verb is "explore", which no
+// file type has, so a folder swapped for a program in between is refused
+// rather than run. A link is never followed: a junction or directory
+// symlink can point anywhere, a server included, and the scan leaves it
+// untraversed for the same reason. By item when there is one, else by
+// path, which ShellExecuteEx takes as a path and never as a command line.
+static bool ExploreFolder(const std::wstring& dir, PIDLIST_ABSOLUTE pidl) {
+    const DWORD attrs = GetFileAttributesW(dir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return false;
+    }
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask  = SEE_MASK_FLAG_NO_UI;
+    sei.hwnd   = g_app.hwnd;
+    sei.lpVerb = L"explore";
+    sei.nShow  = SW_SHOWNORMAL;
+    if (pidl != nullptr) {
+        sei.fMask   |= SEE_MASK_IDLIST;
+        sei.lpIDList = pidl;
+    } else {
+        sei.lpFile = dir.c_str();
+    }
+    return ShellExecuteExW(&sei) != FALSE;
+}
+
+// A folder opens as itself, showing what is in it; a file, or a link,
+// opens its folder with it selected. Selecting a folder in its parent,
+// which is what this did for both, put a top-level folder's drive root on
+// screen rather than the folder that was right-clicked.
 static void RevealInExplorer(const std::wstring& path) {
     if (path.empty()) return;
 
@@ -3644,34 +3673,22 @@ static void RevealInExplorer(const std::wstring& path) {
     if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0,
                                      nullptr)) &&
         pidl != nullptr) {
-        // A folder is judged by the disk now, not by a tree that can be
-        // minutes old, and opened with "explore", a verb no file has: a
-        // folder swapped for a program in between is refused, not run.
-        bool shown = false;
-        const DWORD attrs = GetFileAttributesW(path.c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES &&
-            (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            SHELLEXECUTEINFOW sei{};
-            sei.cbSize   = sizeof(sei);
-            sei.fMask    = SEE_MASK_IDLIST | SEE_MASK_FLAG_NO_UI;
-            sei.hwnd     = g_app.hwnd;
-            sei.lpVerb   = L"explore";
-            sei.lpIDList = pidl;
-            sei.nShow    = SW_SHOWNORMAL;
-            shown = ShellExecuteExW(&sei) != FALSE;
+        if (!ExploreFolder(path, pidl)) {
+            SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
         }
-        if (!shown) SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
         CoTaskMemFree(pidl);
         return;
     }
-    // Could not resolve it: open the containing folder rather than
-    // constructing a command line as a fallback.
+    // Could not resolve it, usually because it is gone: show the folder
+    // that held it instead, under the same rules. This used the "open"
+    // verb, which on a folder since replaced by a script would have run it.
     const size_t slash = path.find_last_of(L'\\');
     if (slash == std::wstring::npos) return;
-    const std::wstring parent = path.substr(0, slash);
+    std::wstring parent = path.substr(0, slash);
     if (parent.find(L'"') != std::wstring::npos) return;
-    ShellExecuteW(g_app.hwnd, L"open", parent.c_str(), nullptr, nullptr,
-                  SW_SHOWNORMAL);
+    // "C:" alone names that drive's current directory, not its root.
+    if (parent.size() == 2 && parent[1] == L':') parent += L'\\';
+    ExploreFolder(parent, nullptr);
 }
 
 static std::wstring CurrentRootPath() {

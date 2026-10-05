@@ -14,15 +14,21 @@
 # way against the Explorer window it opens: a folder opens as itself, a
 # file opens its folder (what Explorer then selects is reported).
 #
+# "Show in Explorer" on a link is checked to select the link rather than
+# follow it, since a link can point anywhere, a server included.
+#
 # A click only means something when the layout is known, so the script
 # builds its own volume the way the README captures do: a VHDX attached
 # through diskpart and formatted NTFS, where Alpha is the largest folder
 # at the root and Beta the largest inside Alpha, so each sits top-left
 # under the click. A small tree on C: does the same for the revalidation
 # case, which needs a drive whose walk takes long enough to act during.
-# Written for the hosted Windows runner (ci.yml); runs anywhere with a
-# built spindle.exe and the right to attach a virtual disk. A capture of
-# each case lands in -Out.
+# Written for the hosted Windows runner (ci.yml), and meant for a machine
+# that is there to be thrown away: it replaces this account's Spindle
+# settings and caches, closes open Explorer windows, leaves the volume
+# attached and half a gigabyte under C:\spindle-newtab, and refuses a
+# -Letter that is already some other volume's. A capture of each case
+# lands in -Out.
 param(
     [string]$Exe = ".\spindle.exe",
     [string]$Out = ".\newtab-shots",
@@ -40,6 +46,7 @@ public static class Native {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -47,6 +54,7 @@ public static class Native {
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     public static int[] WindowRect(IntPtr h) { RECT r; GetWindowRect(h, out r); return new int[] { r.L, r.T, r.R, r.B }; }
     public static int[] ClientOrigin(IntPtr h) { POINT p; p.X = 0; p.Y = 0; ClientToScreen(h, ref p); return new int[] { p.X, p.Y }; }
+    public static int[] ClientSize(IntPtr h) { RECT r; GetClientRect(h, out r); return new int[] { r.R - r.L, r.B - r.T }; }
 }
 "@
 
@@ -70,6 +78,9 @@ Log ("screen {0}x{1}" -f $screen.Width, $screen.Height)
 
 # ----------------------------------------------------------------- volume
 $R = "${Letter}:\"
+if ((Test-Path $R) -and ([IO.DriveInfo]::new($R).VolumeLabel -ne "NewTab")) {
+    throw "$R is already a volume this script did not make; pass -Letter with a free letter"
+}
 if (-not (Test-Path $R)) {
     $vhd = Join-Path $env:TEMP "spindle-newtab.vhdx"
     $dp = Join-Path $env:TEMP "spindle-newtab.dp"
@@ -100,6 +111,8 @@ Blob "${R}Alpha\Beta\two.bin" (2000 * $MB)
 Blob "${R}Alpha\Gamma\three.bin" (1000 * $MB)
 Blob "${R}Other\four.bin" (800 * $MB)
 Blob "${R}Small\five.bin" (200 * $MB)
+# A junction to a sibling, which an elevated scan lists as an empty folder.
+if (-not (Test-Path "${R}Alpha\Link")) { & cmd /c mklink /J "${R}Alpha\Link" "${R}Other" | Out-Null }
 $cTree = "C:\spindle-newtab"
 Blob "$cTree\Alpha\one.bin" (300 * $MB)
 Blob "$cTree\Alpha\two.bin" (150 * $MB)
@@ -150,6 +163,7 @@ function Launch($target) {
     [void][Native]::SetForegroundWindow($script:hwnd)
     $o = [Native]::ClientOrigin($script:hwnd)
     $script:origin = @{ X = $o[0]; Y = $o[1] }
+    $script:clientW = ([Native]::ClientSize($script:hwnd))[0]
 }
 function Click($x, $y, [switch]$Right) {
     [void][Native]::SetCursorPos($script:origin.X + $x, $script:origin.Y + $y)
@@ -340,7 +354,30 @@ Info ("${R}Alpha -> Explorer on '{0}' with [{1}] selected" -f $e.Where, $e.Selec
 if ($e.Where -eq "${R}Alpha") { Ok "Explorer opened ${R}Alpha itself" }
 else { Bad "Explorer opened '$($e.Where)', not ${R}Alpha" }
 
-Write-Host "6) a tab switched back to while another drive is being read reopens on its folder"
+Write-Host "6) Show in Explorer on a link selects it where it sits, and does not follow it"
+Seed ""
+Launch $R
+[void](WaitDrawn 44 60)
+Start-Sleep -Seconds 1
+Click 330 (HeaderY 1)                        # into Alpha
+Start-Sleep -Seconds 1
+Click ($script:clientW - 10 - 23) 19         # the list, sorted by size
+Start-Sleep -Seconds 1
+$linkY = 40 + 26 + 22 + 2 * 22 + 11          # under the header and "..": Beta, Gamma, then the link
+Set-Clipboard -Value " "
+Menu 330 $linkY 2                            # Copy path
+Start-Sleep -Milliseconds 500
+$link = [string](Get-Clipboard)
+Menu 330 $linkY 1                            # Show in Explorer
+$e = ExplorerLanding
+Shot "6_link"
+[void](CloseAndRead)
+Info ("{0} -> Explorer on '{1}' with [{2}] selected" -f $link, $e.Where, $e.Selected)
+if ($link -ne "${R}Alpha\Link") { Moot "the third row is '$link', not the link: only an elevated scan lists links" }
+elseif ($e.Where -eq "${R}Alpha") { Ok "Explorer stayed in ${R}Alpha; the link was not followed" }
+else { Bad "Explorer opened '$($e.Where)' for the link" }
+
+Write-Host "7) a tab switched back to while another drive is being read reopens on its folder"
 Seed ""
 Launch $R                                    # minutes-old cache: no walk
 [void](WaitDrawn 44 60)
@@ -359,7 +396,7 @@ Start-Sleep -Milliseconds 800
 Click 314 15                                 # the first tab, while C: is still being read
 $inTime = (CacheTime "C") -le $t
 Start-Sleep -Seconds 15
-Shot "6_switch_back"
+Shot "7_switch_back"
 $got = CloseAndRead
 if (-not $inTime) { Moot "C: finished its walk before the switch, so nothing was being read" }
 else { Expect $got "0" "${R}Alpha" "the first tab came back on ${R}Alpha" }
@@ -373,7 +410,7 @@ if ($wait -gt 0) {
     Start-Sleep -Seconds ([int][Math]::Ceiling($wait))
 }
 
-Write-Host "7) a folder opened in a new tab while its drive is revalidated stays open when the walk lands"
+Write-Host "8) a folder opened in a new tab while its drive is revalidated stays open when the walk lands"
 Seed "last_path=$cTree`n"
 $t = [DateTime]::UtcNow
 Launch $null                                 # reopens on $cTree from a stale cache, and walks C:
@@ -381,30 +418,30 @@ $drawn = WaitDrawn 44 60
 Menu 330 (HeaderY 1) 3                       # Alpha, in a new tab
 $opened = [DateTime]::UtcNow
 $inTime = (CacheTime "C") -le $t
-Shot "7_while_walking"
+Shot "8_while_walking"
 $landed = WaitCacheAfter "C" $t 240
 Log ("tab opened {0:n1} s after launch; the walk of C: landed {1:n1} s after launch" -f `
     ($opened - $t).TotalSeconds, ((CacheTime "C") - $t).TotalSeconds)
 Start-Sleep -Seconds 3
-Shot "7_after_walk"
+Shot "8_after_walk"
 $got = CloseAndRead
 if (-not $drawn) { Moot "the cached map never came up" }
 elseif (-not $inTime) { Moot "the walk of C: had landed before the tab opened" }
 elseif (-not $landed) { Moot "the walk of C: never landed" }
 else { Expect $got "0" "$cTree\Alpha" "the new tab is still on $cTree\Alpha after the walk" }
 
-Write-Host "8) a remembered folder reopened from a stale cache is still open when the walk lands"
+Write-Host "9) a remembered folder reopened from a stale cache is still open when the walk lands"
 Seed "last_path=${R}Alpha\Beta`n"
 $t = [DateTime]::UtcNow
 Launch $null
 $landed = WaitCacheAfter $Letter $t 120
 Start-Sleep -Seconds 3
-Shot "8_remembered"
+Shot "9_remembered"
 $got = CloseAndRead
 if (-not $landed) { Moot "the walk of $R never landed" }
 else { Expect $got "0" "${R}Alpha\Beta" "${R}Alpha\Beta is still open" }
 
-Write-Host "9) a drive clicked while All drives is still being gathered opens that drive"
+Write-Host "10) a drive clicked while All drives is still being gathered opens that drive"
 Seed "last_all_drives=1`n"
 Remove-Item (Join-Path $dir "C.spincache") -Force -ErrorAction SilentlyContinue
 Launch $null                                 # walks C: afresh, which takes a while
@@ -412,7 +449,7 @@ Start-Sleep -Milliseconds 1500
 $inTime = -not (Test-Path (Join-Path $dir "C.spincache"))
 Click 134 (144 + 74 * [array]::IndexOf($drives, "D") + 33)   # the D: card
 Start-Sleep -Seconds 15
-Shot "9_drive_while_gathering"
+Shot "10_drive_while_gathering"
 $got = CloseAndRead
 if (-not $inTime) { Moot "All drives had finished gathering before the click" }
 else { Expect $got "0" "D:\" "D: opened once the gathering stopped" }
