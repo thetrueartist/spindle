@@ -102,6 +102,31 @@ jobs:
           path: remember-shots
           retention-days: 7
 
+  # Where a right-click opens, on a real Windows desktop: "Open in a new
+  # tab" from the map, from All drives and its Largest list, on switching
+  # back to a tab while another drive is being read, and while a stale
+  # cache is revalidated behind the map; where "Show in Explorer" lands is
+  # reported. Non-blocking until it has proven steady on the hosted
+  # runner, like the other desktop runs.
+  windows-newtab:
+    runs-on: windows-latest
+    needs: cross-build
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: spindle-exe
+      - name: Where a right-click opens
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File tools\win-newtab-check.ps1 -Exe .\spindle.exe -Out newtab-shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-newtab
+          path: newtab-shots
+          retention-days: 7
+
   # Windows on ARM. llvm-mingw is the only toolchain that targets it, and it
   # is not packaged, so CI fetches a pinned release. Marked non-blocking:
   # nothing here can run an ARM64 binary to prove it works, so a green tick

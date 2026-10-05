@@ -541,6 +541,15 @@ a real launch and close, All drives included, and proves it from what the
 program writes back rather than from pixels; `tools/win-remember-check.ps1`
 is the same check on a real Windows desktop, which CI runs on every push.
 
+`tools/win-newtab-check.ps1` checks where a right-click opens, on a real
+Windows desktop: "Open in a new tab" from the map, from All drives and
+its Largest list, on switching back to a tab while another drive is
+being read, and while a cache older than five minutes is revalidated
+behind the map. Each landing is judged from the place the program writes
+back on close. The script builds its own VHDX volume, so the folder
+under each click is known, and it reports where "Show in Explorer" lands
+without judging it. CI runs it on every push, non-blocking for now.
+
 The README images are not drawn under Wine, which renders its own window
 chrome and fonts. `tools/win-screenshots.ps1` draws them on a real
 Windows desktop: it builds a demo NTFS volume from a VHDX, launches the
