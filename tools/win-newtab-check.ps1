@@ -6,10 +6,13 @@
 # with nothing else going on, inside All drives (from the map and from
 # the Largest list), on switching back to a tab while another drive is
 # still being read, and while a cache older than five minutes is being
-# revalidated behind the map. Where a tab landed is read from what the
+# revalidated behind the map. A drive clicked while All drives is still
+# being gathered is checked too: the stop it asks for used to leave the
+# window waiting for good. Where a tab landed is read from what the
 # program writes back on close ("Remember where I was" records the
-# active tab), not from pixels. Where "Show in Explorer" lands is read
-# from the Explorer window it opens, and reported rather than judged.
+# active tab), not from pixels. "Show in Explorer" is checked the same
+# way against the Explorer window it opens: a folder opens as itself, a
+# file opens its folder (what Explorer then selects is reported).
 #
 # A click only means something when the layout is known, so the script
 # builds its own volume the way the README captures do: a VHDX attached
@@ -229,20 +232,30 @@ function Get-ExplorerWindows {
     }
     return $list
 }
-# What Explorer shows after a "Show in Explorer": the folder it opened
-# and what it has selected there.
+# What Explorer shows after a "Show in Explorer": the folder it opened,
+# and what it has selected there, which can arrive a moment after the
+# window does, so it is given a few seconds to.
 function ExplorerLanding() {
-    for ($i = 0; $i -lt 40; $i++) {
+    $where = ""; $sel = ""; $settle = $null
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         foreach ($w in Get-ExplorerWindows) {
             try {
-                $where = $w.Document.Folder.Self.Path
-                $sel = @($w.Document.SelectedItems() | ForEach-Object { $_.Name }) -join ", "
-                if ($where) { return "Explorer opened $where with [$sel] selected" }
+                $p = $w.Document.Folder.Self.Path
+                if ($p) {
+                    $where = $p
+                    $sel = @($w.Document.SelectedItems() | ForEach-Object { $_.Name }) -join ", "
+                }
             } catch { }
         }
+        if ($where) {
+            if ($sel) { break }
+            if (-not $settle) { $settle = (Get-Date).AddSeconds(6) }
+            elseif ((Get-Date) -gt $settle) { break }
+        }
     }
-    return "no Explorer window appeared"
+    return @{ Where = $where; Selected = $sel }
 }
 function Flatten($p) { return ($p -replace '(?<=.)\\{2,}', '\') }
 
@@ -286,8 +299,11 @@ Start-Sleep -Seconds 3
 Set-Clipboard -Value " "
 Menu 134 $rowY 4                             # Copy path
 Start-Sleep -Milliseconds 500
-$file = Flatten ([string](Get-Clipboard))
-Log "the first row is $file"
+$raw = [string](Get-Clipboard)
+$file = Flatten $raw
+Log "the first row is $raw"
+if ($raw -match '^[A-Z]:\\[^\\]') { Ok "Copy path gave $raw, one separator after the drive" }
+elseif ($raw -match '^[A-Z]:\\') { Bad "Copy path gave $raw" }
 Menu 134 $rowY 1                             # Open in a new tab
 Start-Sleep -Seconds 15
 Shot "3_largest_row"
@@ -296,7 +312,7 @@ $want = Split-Path -Parent $file
 if (-not $want -or $file -notmatch '^[A-Z]:\\') { Moot "no path came off the first row ('$file')" }
 else { Expect $got "1" $want "the new tab is on $want, inside All drives" }
 
-Write-Host "4) Show in Explorer on a file's row in All drives' Largest list"
+Write-Host "4) Show in Explorer on a file's row in All drives' Largest list opens the file's folder"
 Seed "last_all_drives=1`n"
 Launch $null
 [void](WaitDrawn 44 120)
@@ -304,17 +320,25 @@ Start-Sleep -Seconds 1
 Click (16 + 59 + 29) ($panelY + 12)
 Start-Sleep -Seconds 3
 Menu 134 $rowY 3                             # Show in Explorer
-Info "$file -> $(ExplorerLanding)"
+$e = ExplorerLanding
 [void](CloseAndRead)
+$want = Split-Path -Parent $file
+Info ("{0} -> Explorer on '{1}' with [{2}] selected" -f $file, $e.Where, $e.Selected)
+if (-not $want -or $file -notmatch '^[A-Z]:\\') { Moot "no path came off the first row ('$file')" }
+elseif ($e.Where -eq $want) { Ok "Explorer opened $want, the file's folder" }
+else { Bad "Explorer opened '$($e.Where)', not $want" }
 
-Write-Host "5) Show in Explorer on a folder on the map"
+Write-Host "5) Show in Explorer on a folder on the map opens that folder, not its parent"
 Seed ""
 Launch $R
 [void](WaitDrawn 44 60)
 Start-Sleep -Seconds 1
 Menu 330 (HeaderY 1) 1                       # Show in Explorer
-Info "${R}Alpha -> $(ExplorerLanding)"
+$e = ExplorerLanding
 [void](CloseAndRead)
+Info ("${R}Alpha -> Explorer on '{0}' with [{1}] selected" -f $e.Where, $e.Selected)
+if ($e.Where -eq "${R}Alpha") { Ok "Explorer opened ${R}Alpha itself" }
+else { Bad "Explorer opened '$($e.Where)', not ${R}Alpha" }
 
 Write-Host "6) a tab switched back to while another drive is being read reopens on its folder"
 Seed ""
@@ -379,6 +403,19 @@ Shot "8_remembered"
 $got = CloseAndRead
 if (-not $landed) { Moot "the walk of $R never landed" }
 else { Expect $got "0" "${R}Alpha\Beta" "${R}Alpha\Beta is still open" }
+
+Write-Host "9) a drive clicked while All drives is still being gathered opens that drive"
+Seed "last_all_drives=1`n"
+Remove-Item (Join-Path $dir "C.spincache") -Force -ErrorAction SilentlyContinue
+Launch $null                                 # walks C: afresh, which takes a while
+Start-Sleep -Milliseconds 1500
+$inTime = -not (Test-Path (Join-Path $dir "C.spincache"))
+Click 134 (144 + 74 * [array]::IndexOf($drives, "D") + 33)   # the D: card
+Start-Sleep -Seconds 15
+Shot "9_drive_while_gathering"
+$got = CloseAndRead
+if (-not $inTime) { Moot "All drives had finished gathering before the click" }
+else { Expect $got "0" "D:\" "D: opened once the gathering stopped" }
 } catch {
     Log "failed: $_"
     Bad "the script stopped: $_"

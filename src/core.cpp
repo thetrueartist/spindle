@@ -610,7 +610,11 @@ void ForEachNodeWithPath(const Node& root, Fn&& fn) {
 
             if (child->dir && !child->children.empty()) {
                 const size_t before = prefix.size();
-                if (!prefix.empty()) prefix += L'\\';
+                // A volume root is named with its separator, "C:\" under
+                // All drives, and adding another made every path below it
+                // "C:\\Users\...": not the path a person copies, and not
+                // one to hand Explorer.
+                if (!prefix.empty() && prefix.back() != L'\\') prefix += L'\\';
                 prefix += child->name;
                 stack.push_back(Frame{child, 0, before});
             }
@@ -621,14 +625,15 @@ void ForEachNodeWithPath(const Node& root, Fn&& fn) {
     }
 }
 
-// Joins a directory prefix and a leaf name.
+// Joins a directory prefix and a leaf name, with one separator between
+// them even when the prefix is a volume root that already ends in one.
 inline std::wstring JoinRel(const std::wstring& prefix,
                             const std::wstring& leaf) {
     if (prefix.empty()) return leaf;
     std::wstring out;
     out.reserve(prefix.size() + 1 + leaf.size());
     out += prefix;
-    out += L'\\';
+    if (out.back() != L'\\') out += L'\\';
     out += leaf;
     return out;
 }
@@ -2659,6 +2664,33 @@ Query ParseQuery(const std::wstring& text) {
         else        q.include.push_back(lowered);
     }
     return q;
+}
+
+
+// ---- tree paths -----------------------------------------------------------
+
+std::vector<std::wstring> TreePathComponents(const std::wstring& rel) {
+    std::vector<std::wstring> comps;
+    size_t pos = 0;
+    while (pos < rel.size()) {
+        const size_t sep = rel.find(L'\\', pos);
+        std::wstring comp = (sep == std::wstring::npos)
+                                ? rel.substr(pos)
+                                : rel.substr(pos, sep - pos);
+        pos = (sep == std::wstring::npos) ? rel.size() : sep + 1;
+        if (comp.empty()) continue;
+        // A path that starts at a drive is one All drives produced, and the
+        // aggregate names that drive "C:\", separator included. Split as
+        // "C:" it matches nothing, and the walk stops at the aggregate's
+        // root. No real name can hold a colon, so nothing else is touched.
+        if (comps.empty() && comp.size() == 2 && comp[1] == L':' &&
+            ((comp[0] >= L'A' && comp[0] <= L'Z') ||
+             (comp[0] >= L'a' && comp[0] <= L'z'))) {
+            comp += L'\\';
+        }
+        comps.push_back(std::move(comp));
+    }
+    return comps;
 }
 
 

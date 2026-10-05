@@ -1241,6 +1241,90 @@ SUITE(TestPathCompletion, "path completion") {
           "no matches completes to nothing");
 }
 
+// A list row is sent to a tab or to the map by the names its relative path
+// walks through. Under All drives that path starts at a drive, which the
+// aggregate names with its separator, and a split that left "C:" behind
+// matched nothing, so the new tab stopped at the aggregate's root.
+SUITE(TestTreePaths, "Tree path components") {
+    using V = std::vector<std::wstring>;
+    CHECK(TreePathComponents(L"Users\\sam\\notes.txt") ==
+              V({L"Users", L"sam", L"notes.txt"}),
+          "a relative path splits into its names");
+    CHECK(TreePathComponents(L"").empty(), "an empty path names nothing");
+    CHECK(TreePathComponents(L"a\\\\b\\") == V({L"a", L"b"}),
+          "doubled and trailing separators name nothing");
+    CHECK(TreePathComponents(L"C:\\\\Users\\big.iso") ==
+              V({L"C:\\", L"Users", L"big.iso"}),
+          "a drive keeps its backslash, as All drives names it");
+    CHECK(TreePathComponents(L"d:\\x") == V({L"d:\\", L"x"}),
+          "a lower-case drive is a drive too");
+    CHECK(TreePathComponents(L"C:") == V({L"C:\\"}), "a bare drive is its root");
+    CHECK(TreePathComponents(L"1:\\x") == V({L"1:", L"x"}),
+          "only a letter makes a drive");
+
+    // End to end over an aggregate: every Largest row's folder is reached
+    // by the same case-blind walk a tab replays.
+    std::vector<Node> games;
+    games.push_back(MakeFile(L"big.iso", 9000));
+    std::vector<Node> c;
+    c.push_back(MakeDir(L"Games", std::move(games)));
+    c.push_back(MakeFile(L"pagefile.sys", 8000));
+    std::vector<Node> d;
+    d.push_back(MakeFile(L"backup.7z", 7000));
+    std::vector<Node> vols;
+    vols.push_back(MakeDir(L"C:\\", std::move(c)));
+    vols.push_back(MakeDir(L"D:\\", std::move(d)));
+    const Node all = MakeDir(L"All drives", std::move(vols));
+
+    // Case-blind, as RestoreTrailComps compares (lstrcmpiW on Windows).
+    const auto same = [](const std::wstring& x, const std::wstring& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); ++i) {
+            if (std::towlower(static_cast<wint_t>(x[i])) !=
+                std::towlower(static_cast<wint_t>(y[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const std::vector<FileHit> rows = LargestFiles(all, 10);
+    CHECK(rows.size() == 3, "every file is listed");
+    // One separator after the drive: "C:\\Games" is not a path to copy or
+    // to hand Explorer.
+    if (rows.size() == 3) {
+        CHECK(Narrow(rows[0].path) == "C:\\Games\\big.iso",
+              "a folder's file under All drives has a clean path");
+        CHECK(Narrow(rows[1].path) == "C:\\pagefile.sys",
+              "a file at a drive's root under All drives has a clean path");
+        CHECK(Narrow(rows[2].path) == "D:\\backup.7z",
+              "every drive's files come out the same way");
+    }
+    for (const FileHit& row : rows) {
+        V comps = TreePathComponents(row.path);
+        CHECK(!comps.empty() && comps.back() == row.node->name,
+              "the path ends at the row's own name");
+        if (!comps.empty()) comps.pop_back();   // a file: its folder
+        const Node* cur = &all;
+        size_t reached = 0;
+        for (const std::wstring& name : comps) {
+            const Node* next = nullptr;
+            for (const Node& k : cur->children) {
+                if (k.dir && same(k.name, name)) { next = &k; break; }
+            }
+            if (!next) break;
+            cur = next;
+            ++reached;
+        }
+        CHECK(reached == comps.size() && reached >= 1,
+              "the row's folder is reached inside All drives");
+        bool holds = false;
+        for (const Node& k : cur->children) {
+            if (&k == row.node) holds = true;
+        }
+        CHECK(holds, "the folder reached is the one that holds the file");
+    }
+}
+
 SUITE(TestPathQueries, "FindMatching: path terms") {
 
     const Node root = BuildSearchTree();

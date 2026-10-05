@@ -3,6 +3,29 @@
 Newest first. Every version is a GitHub release carrying `spindle.exe`
 and `SHA256SUMS`, built by CI from the tagged commit.
 
+## 2.6.2
+
+- "Open in a new tab" opens where you right-clicked. Inside All drives it
+  opened the aggregate's root instead, from the map and from the Largest
+  and Find lists alike. A tab opened while a stale cache was being
+  revalidated went back to the root when the walk finished, and so did a
+  remembered place; a tab switched to while another drive was being read
+  landed on its drive's root; and a duplicate's tab, on a drive not on
+  screen, lost the file it was opened for.
+- Clicking a drive or a tab while another drive was loading from its
+  cache, or while All drives was being gathered, could leave the window
+  on "Stopping the current scan" for good: the stopped load never said
+  it had stopped, so the click waited forever. Every stop now reports in.
+- "Show in Explorer" on a folder opens that folder, rather than its
+  parent with the folder selected, which for anything at the top of a
+  drive looked like Explorer had opened the drive's root. A file still
+  opens its folder with the file selected.
+- Paths listed under All drives no longer carry a doubled separator after
+  the drive (`C:\\Users`), so Copy path gives the path as it is.
+- Under the hood: `tools/win-newtab-check.ps1` checks these on a real
+  Windows desktop in CI, and `tools/wine-newtab-check.sh` the All drives
+  ones under Wine.
+
 ## 2.6.1
 
 - "Remember where I was" brings back the All drives view. It remembered

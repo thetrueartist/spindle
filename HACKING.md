@@ -546,9 +546,11 @@ Windows desktop: "Open in a new tab" from the map, from All drives and
 its Largest list, on switching back to a tab while another drive is
 being read, and while a cache older than five minutes is revalidated
 behind the map. Each landing is judged from the place the program writes
-back on close. The script builds its own VHDX volume, so the folder
-under each click is known, and it reports where "Show in Explorer" lands
-without judging it. CI runs it on every push, non-blocking for now.
+back on close, and "Show in Explorer" is judged by the window it opens.
+The script builds its own VHDX volume, so the folder under each click is
+known. CI runs it on every push, non-blocking for now.
+`tools/wine-newtab-check.sh` runs the cases that need no disk timing
+(the folder, All drives, its Largest list) under Wine.
 
 The README images are not drawn under Wine, which renders its own window
 chrome and fonts. `tools/win-screenshots.ps1` draws them on a real

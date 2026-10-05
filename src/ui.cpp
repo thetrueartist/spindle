@@ -181,7 +181,7 @@ constexpr DWORD kFrameMs  = 8;     // ~120 Hz while animating
 
 // Shown in the About box. The authoritative version lives in the resource
 // block; keep the two in step when releasing.
-constexpr const wchar_t* kAppVersion = L"2.6.1";
+constexpr const wchar_t* kAppVersion = L"2.6.2";
 
 // A running animation. Holding the start time rather than a progress value
 // means a dropped frame is skipped over instead of stretching the duration.
@@ -311,12 +311,15 @@ struct App {
     std::wstring          scanNote;
     // A start asked for while a scan was still stopping. The interface
     // never waits for a thread; the waiting start runs when the old
-    // worker reports in, and the latest request wins.
+    // worker reports in, and the latest request wins. It carries the
+    // place the view is going to, or a tab switched to while another
+    // drive was being read would wait out the walk and land on the root.
     struct PendingStart {
         bool         allDrives   = false;
         std::wstring root;
         int          volumeIndex = -1;
         bool         useCache    = true;
+        std::vector<std::wstring> trail;
     };
     bool         pendingStartSet = false;
     PendingStart pendingStart;
@@ -382,9 +385,10 @@ struct App {
     const Node*                      flashNode = nullptr;
     Anim                             dupeFlash;
     std::wstring                     pendingReveal;
-    // Where a tab wanted to be when its drive had no cache to restore
-    // from. Replayed once the scan lands, or the tab silently forgets how
-    // deep it was and the next snapshot overwrites the memory of it.
+    // Where the view is going once its tree is here: a tab, a remembered
+    // place, a typed path. Replayed when the cache or the scan lands, or
+    // the view silently forgets how deep it was and the next snapshot
+    // overwrites the memory of it.
     std::vector<std::wstring>        pendingTrail;
     std::unordered_set<std::wstring> dupePaths;
     std::vector<uint8_t>             cellDupe;   // parallel to `cells`
@@ -848,7 +852,12 @@ unsigned __stdcall ScanThread(void* param) {
             }
             req->progress->phase.store(0, std::memory_order_relaxed);
             if (req->progress->cancel.load(std::memory_order_relaxed)) {
-                return 0;   // superseded before it finished; drop silently
+                // Stopped before it finished. Said out loud, with nothing
+                // to show: a start waiting for this thread runs when it
+                // hears, and silence left it waiting for good.
+                PostMessageW(req->hwnd, WM_SCAN_DONE,
+                             static_cast<WPARAM>(req->gen), 0);
+                return 0;
             }
             if (loaded) {
                 const uint64_t now = UnixNowMs();
@@ -1542,8 +1551,11 @@ static bool DeferUntilWorkerStops(App::PendingStart start) {
     return true;
 }
 
+// `trail` is where to land once the tree is here: folder names below the
+// root, replayed as deep as they still exist.
 static void StartScanPath(const std::wstring& root, int volumeIndex,
-                          bool useCache) {
+                          bool useCache,
+                          std::vector<std::wstring> trail = {}) {
     if (root.empty()) return;
     if (!ConfirmNetworkScan(root)) return;
     {
@@ -1551,6 +1563,7 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
         p.root        = root;
         p.volumeIndex = volumeIndex;
         p.useCache    = useCache;
+        p.trail       = trail;
         if (DeferUntilWorkerStops(std::move(p))) return;
     }
     g_app.scanNote.clear();
@@ -1570,9 +1583,17 @@ static void StartScanPath(const std::wstring& root, int volumeIndex,
                               g_app.prefetchQueue.end());
 
     // Order matters: everything that points into the old tree is dropped
-    // before the tree itself is freed.
-    g_app.pendingReveal.clear();
-    g_app.pendingTrail.clear();
+    // before the tree itself is freed. A reveal waiting on this very root
+    // stays, since a start that waited for another scan to stop is still
+    // the one it was waiting for; any other would fire on the wrong tree.
+    if (g_app.pendingReveal.size() <= root.size() ||
+        CompareStringOrdinal(g_app.pendingReveal.c_str(),
+                             static_cast<int>(root.size()), root.c_str(),
+                             static_cast<int>(root.size()),
+                             TRUE) != CSTR_EQUAL) {
+        g_app.pendingReveal.clear();
+    }
+    g_app.pendingTrail = std::move(trail);
     g_app.selected  = volumeIndex;
     g_app.allDrives = false;
     DropTreeReferences();
@@ -1642,6 +1663,7 @@ unsigned __stdcall AllDrivesThread(void* param) {
     agg->root.dir  = true;
     agg->root.cat  = Cat::Directory;
     uint64_t aggDirs = 0;
+    bool stopped = false;
     try {
         auto note = [&req](const std::wstring& text) {
             // Best effort, owned string, adopted by the interface.
@@ -1657,7 +1679,8 @@ unsigned __stdcall AllDrivesThread(void* param) {
         };
         for (const std::wstring& path : req->volumePaths) {
             if (req->progress->cancel.load(std::memory_order_relaxed)) {
-                return 0;
+                stopped = true;
+                break;
             }
             const std::wstring letter = path.substr(0, 2);
             ScanResult one;
@@ -1673,7 +1696,8 @@ unsigned __stdcall AllDrivesThread(void* param) {
             }
             if (!ok) {
                 if (req->progress->cancel.load(std::memory_order_relaxed)) {
-                    return 0;
+                    stopped = true;
+                    break;
                 }
                 // A fixed drive is walked; removable media is left alone.
                 // A share reaches this thread only after StartAllDrives
@@ -1685,7 +1709,8 @@ unsigned __stdcall AllDrivesThread(void* param) {
                 note(L"Reading " + letter);
                 one = Scan(path, 0, req->progress);
                 if (req->progress->cancel.load(std::memory_order_relaxed)) {
-                    return 0;
+                    stopped = true;
+                    break;
                 }
                 if (req->keepCache && !one.stats.faulted) {
                     SaveScanCache(path, one);
@@ -1696,6 +1721,13 @@ unsigned __stdcall AllDrivesThread(void* param) {
             agg->root.children.push_back(std::move(one.root));
         }
     } catch (...) {
+        stopped = true;
+    }
+    // A stop is reported like a failure, as an empty result. A start that
+    // asked for the stop is waiting for this thread to say it is done, and
+    // returning without a word left the window on "Stopping the current
+    // scan" for good.
+    if (stopped) {
         PostMessageW(req->hwnd, WM_SCAN_DONE,
                      static_cast<WPARAM>(req->gen), 0);
         return 0;
@@ -1722,10 +1754,13 @@ unsigned __stdcall AllDrivesThread(void* param) {
     return 0;
 }
 
-static void StartAllDrives() {
+// `trail` as for StartScanPath, led by the volume root ("C:\") the
+// aggregate names each drive by.
+static void StartAllDrives(std::vector<std::wstring> trail = {}) {
     {
         App::PendingStart p;
         p.allDrives = true;
+        p.trail     = trail;
         if (DeferUntilWorkerStops(std::move(p))) return;
     }
     g_app.scanNote.clear();
@@ -1733,7 +1768,7 @@ static void StartAllDrives() {
     CancelPrefetch(false);
     g_app.prefetchQueue.clear();
     g_app.pendingReveal.clear();
-    g_app.pendingTrail.clear();
+    g_app.pendingTrail = std::move(trail);
     g_app.selected    = -1;
     g_app.allDrives   = true;
     DropTreeReferences();
@@ -1778,11 +1813,11 @@ static void StartAllDrives() {
 static void RunPendingStart() {
     if (!g_app.pendingStartSet) return;
     g_app.pendingStartSet = false;
-    const App::PendingStart p = g_app.pendingStart;
+    App::PendingStart p = g_app.pendingStart;
     if (p.allDrives) {
-        StartAllDrives();
+        StartAllDrives(std::move(p.trail));
     } else {
-        StartScanPath(p.root, p.volumeIndex, p.useCache);
+        StartScanPath(p.root, p.volumeIndex, p.useCache, std::move(p.trail));
     }
 }
 
@@ -3592,6 +3627,10 @@ static void CopyPathToClipboard(const std::wstring& path) {
     CopyTextToClipboard(path);
 }
 
+// A folder opens as itself, showing what is in it; a file opens its folder
+// with the file selected. Selecting a folder in its parent, which is what
+// this did for both, put a top-level folder's drive root on screen rather
+// than the folder that was right-clicked.
 static void RevealInExplorer(const std::wstring& path) {
     if (path.empty()) return;
 
@@ -3605,7 +3644,23 @@ static void RevealInExplorer(const std::wstring& path) {
     if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0,
                                      nullptr)) &&
         pidl != nullptr) {
-        SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+        // A folder is judged by the disk now, not by a tree that can be
+        // minutes old, and opened with "explore", a verb no file has: a
+        // folder swapped for a program in between is refused, not run.
+        bool shown = false;
+        const DWORD attrs = GetFileAttributesW(path.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES &&
+            (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            SHELLEXECUTEINFOW sei{};
+            sei.cbSize   = sizeof(sei);
+            sei.fMask    = SEE_MASK_IDLIST | SEE_MASK_FLAG_NO_UI;
+            sei.hwnd     = g_app.hwnd;
+            sei.lpVerb   = L"explore";
+            sei.lpIDList = pidl;
+            sei.nShow    = SW_SHOWNORMAL;
+            shown = ShellExecuteExW(&sei) != FALSE;
+        }
+        if (!shown) SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
         CoTaskMemFree(pidl);
         return;
     }
@@ -3634,7 +3689,29 @@ static std::wstring ViewTitleFor(const std::wstring& root) {
 // Record the live view into its tab. Called before anything switches away
 // from it; the active tab otherwise just mirrors whatever is on screen.
 static void SnapshotActiveView() {
-    const std::wstring root = CurrentRootPath();
+    std::wstring root;
+    std::vector<std::wstring> comps;
+    int volumeIndex = g_app.selected;
+    if (g_app.pendingStartSet) {
+        // A start is waiting for the old scan to stop, so the screen still
+        // shows the view being left. The tab is where that start goes.
+        const App::PendingStart& p = g_app.pendingStart;
+        root        = p.allDrives ? std::wstring(L"All drives") : p.root;
+        comps       = p.trail;
+        volumeIndex = p.allDrives ? -1 : p.volumeIndex;
+    } else if (!g_app.result && g_app.scanning) {
+        // Nothing on screen yet: the tab is where the scan in flight goes,
+        // not wherever it was before that scan was asked for.
+        root        = g_app.allDrives ? std::wstring(L"All drives")
+                                      : g_app.scanRoot;
+        comps       = g_app.pendingTrail;
+        volumeIndex = g_app.allDrives ? -1 : g_app.selected;
+    } else {
+        root = CurrentRootPath();
+        for (size_t i = 1; i < g_app.trail.size(); ++i) {
+            if (g_app.trail[i]) comps.push_back(g_app.trail[i]->name);
+        }
+    }
     if (root.empty()) return;
     if (g_app.viewTabs.empty()) {
         g_app.viewTabs.push_back(ViewTab{});
@@ -3646,12 +3723,9 @@ static void SnapshotActiveView() {
     }
     ViewTab& t = g_app.viewTabs[static_cast<size_t>(g_app.activeView)];
     t.root        = root;
-    t.volumeIndex = g_app.selected;
+    t.volumeIndex = volumeIndex;
     t.panel       = static_cast<int>(g_app.panel);
-    t.comps.clear();
-    for (size_t i = 1; i < g_app.trail.size(); ++i) {
-        if (g_app.trail[i]) t.comps.push_back(g_app.trail[i]->name);
-    }
+    t.comps       = std::move(comps);
     t.query  = g_app.query;
     t.browse = g_app.browse;
     if (t.panel == static_cast<int>(App::Panel::Search) &&
@@ -3690,9 +3764,11 @@ static void RestoreTrailComps(const std::vector<std::wstring>& comps) {
     g_app.panelDirty = true;
 }
 
-// Make a stored tab the live view: switch roots if it lives elsewhere
-// (instant when the cache is fresh, which the launch prefetch makes the
-// normal case), then walk back to where it was.
+// Make a stored tab the live view: walk to where it was if its tree is
+// already on screen, otherwise switch roots (instant when the cache is
+// fresh, which the launch prefetch makes the normal case) and land there
+// once the tree arrives. The place travels with the start, so a start
+// that waits for a running scan to stop still lands on it.
 // Takes its tab BY VALUE: StartScanPath below can reach a message box,
 // which pumps, and anything that grows viewTabs would leave a reference
 // dangling mid-function. The struct is a few strings.
@@ -3700,26 +3776,23 @@ static void ApplyView(ViewTab t) {
     g_app.panel  = static_cast<App::Panel>(t.panel);
     g_app.query  = t.query;
     g_app.browse = t.browse;
-    // An aggregate tab restores through the same builder rather than a
-    // volume scan; its root is the synthetic name, not a drive path.
-    if (t.root == L"All drives") {
-        g_app.searchFocus = false;
-        g_app.searchSelectAll = false;
-        StartAllDrives();
-        return;
-    }
     g_app.searchFocus = false;
     g_app.searchSelectAll = false;
-    if (!t.root.empty() &&
-        lstrcmpiW(t.root.c_str(), CurrentRootPath().c_str()) != 0) {
-        StartScanPath(t.root, t.volumeIndex, true);
+    // The tree on screen serves the tab unless another start is about to
+    // replace it. All drives included: a tab opened from inside it used
+    // to rebuild the whole aggregate and arrive at its root.
+    const bool onScreen =
+        g_app.result && !g_app.pendingStartSet &&
+        lstrcmpiW(t.root.c_str(), CurrentRootPath().c_str()) == 0;
+    if (onScreen) {
+        RestoreTrailComps(t.comps);
+    } else if (t.root == L"All drives") {
+        // An aggregate tab restores through the same builder rather than
+        // a volume scan; its root is the synthetic name, not a drive path.
+        StartAllDrives(t.comps);
+    } else if (!t.root.empty()) {
+        StartScanPath(t.root, t.volumeIndex, true, t.comps);
     }
-    if (!g_app.result && !t.comps.empty()) {
-        // No cache to land on, so the tree is still being walked. Keep the
-        // destination and let the scan's completion take the tab there.
-        g_app.pendingTrail = t.comps;
-    }
-    RestoreTrailComps(t.comps);
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
@@ -4598,8 +4671,11 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
 
     if (cmd == 1) { RevealInExplorer(path); return; }
     if (cmd == 3) {
-        // A fresh tab on the file's own drive; the in-map reveal then
-        // switches, navigates and flashes inside it.
+        // A fresh tab on the file's own drive, going to the file's folder
+        // and flashing the file once that tree is here. Asking the reveal
+        // to start the drive as well used to restart the scan the tab had
+        // just begun, and the restart forgot the file: the tab sat at the
+        // drive's root.
         if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\') {
             int vol = -1;
             for (size_t i = 0; i < g_app.volumes.size(); ++i) {
@@ -4610,7 +4686,11 @@ static void ShowDupeMenu(int rowIndex, POINT screenPt) {
                     break;
                 }
             }
-            OpenViewTab(path.substr(0, 3), vol, {});
+            std::vector<std::wstring> comps = ComponentsBelowRoot(path);
+            if (!comps.empty()) comps.pop_back();   // the file's folder
+            OpenViewTab(path.substr(0, 3), vol, std::move(comps));
+            if (!NavigateToPath(path)) g_app.pendingReveal = path;
+            return;
         }
         ShowDupeInMap(path);
         return;
@@ -4743,16 +4823,8 @@ static void ShowRowMenu(int rowIndex, POINT screenPt) {
     for (size_t k = 1; k < g_app.trail.size(); ++k) {
         if (g_app.trail[k]) comps.push_back(g_app.trail[k]->name);
     }
-    {
-        size_t pos = 0;
-        while (pos < rel.size()) {
-            const size_t sep = rel.find(L'\\', pos);
-            const std::wstring comp =
-                (sep == std::wstring::npos) ? rel.substr(pos)
-                                            : rel.substr(pos, sep - pos);
-            pos = (sep == std::wstring::npos) ? rel.size() : sep + 1;
-            if (!comp.empty()) comps.push_back(comp);
-        }
+    for (std::wstring& c : TreePathComponents(rel)) {
+        comps.push_back(std::move(c));
     }
     if (!isDir && !comps.empty()) comps.pop_back();   // stop at the parent
 
@@ -5531,7 +5603,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const int p = g_app.settings.lastPanel;
                     g_app.panel = static_cast<App::Panel>(
                         (p >= 0 && p <= 3) ? p : 0);
-                    StartAllDrives();   // clears pendingTrail, so set it after
                     std::vector<std::wstring> comps;
                     if (lettered) {
                         comps.push_back(last.substr(0, 2) + L"\\");
@@ -5539,7 +5610,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             comps.push_back(std::move(c));
                         }
                     }
-                    g_app.pendingTrail = comps;
+                    StartAllDrives(std::move(comps));
                     return 0;
                 }
 
@@ -5568,8 +5639,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         const int p = g_app.settings.lastPanel;
                         g_app.panel = static_cast<App::Panel>(
                             (p >= 0 && p <= 3) ? p : 0);
-                        StartScanPath(drive, idx, true);
-                        g_app.pendingTrail = comps;   // replayed on completion
+                        StartScanPath(drive, idx, true, comps);
                         QueueLaunchPrefetch(drive);
                         return 0;
                     }
@@ -5719,8 +5789,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::unique_ptr<ScanResult> res(cr ? cr->result : nullptr);
             if (cr) cr->result = nullptr;
             // Superseded by a later scan: drop it. For a fresh cache the
-            // worker has already returned, so also reap its handle here.
-            if (static_cast<uint64_t>(wp) != g_app.scanGen.load()) return 0;
+            // worker returned right after posting this and will say nothing
+            // more, so it is reaped here and the start waiting for it runs.
+            if (static_cast<uint64_t>(wp) != g_app.scanGen.load()) {
+                if (cr && cr->fresh && g_app.pendingStartSet &&
+                    g_app.worker) {
+                    WaitForSingleObject(g_app.worker, INFINITE);
+                    CloseHandle(g_app.worker);
+                    g_app.worker   = nullptr;
+                    g_app.scanning = false;
+                    RunPendingStart();
+                }
+                return 0;
+            }
             if (!res) return 0;
 
             DropTreeReferences();
@@ -5791,16 +5872,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             StartPrefetchNext();   // the disk is free again
 
             // A null result means the scan thread aborted rather than
-            // finished. Say so instead of showing an empty map.
+            // finished. Say so instead of showing an empty map, unless the
+            // person stopped it themselves (Esc), which needs no telling.
             if (!res) {
-                MessageBoxW(hwnd, L"The scan stopped before it finished. "
-                                  L"Nothing was changed on disk.",
-                            L"Spindle", MB_OK | MB_ICONWARNING);
+                if (!g_app.progress.cancel.load(std::memory_order_relaxed)) {
+                    MessageBoxW(hwnd, L"The scan stopped before it finished. "
+                                      L"Nothing was changed on disk.",
+                                L"Spindle", MB_OK | MB_ICONWARNING);
+                }
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
 
             if (!g_app.progress.cancel.load(std::memory_order_relaxed)) {
+                // A walk revalidating the cached tree on screen replaces a
+                // tree the person has been using, so they stay where they
+                // are, as deep as the fresh tree still goes. Landing them
+                // on the root made a folder just opened, in a tab or by a
+                // remembered place, look as if it had never opened.
+                if (g_app.showingCache && g_app.pendingTrail.empty()) {
+                    for (size_t i = 1; i < g_app.trail.size(); ++i) {
+                        if (g_app.trail[i]) {
+                            g_app.pendingTrail.push_back(g_app.trail[i]->name);
+                        }
+                    }
+                }
                 // Drop every pointer into the outgoing tree BEFORE it is
                 // freed. When a cached map is on screen the user has been
                 // hovering and clicking a tree that is about to disappear

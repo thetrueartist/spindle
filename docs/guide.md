@@ -20,7 +20,7 @@ users' profiles, which on a typical system adds up to tens of gigabytes.
 | Backspace / mouse-back | go up |
 | Click a breadcrumb | jump to that level |
 | Ctrl+L, or click the current folder's name | type or paste a path, Enter goes there |
-| Right-click a block | show in Explorer, copy path, recycle, force remove |
+| Right-click a block | open in a new tab, show in Explorer (a folder opens as itself, a file is selected in its folder), copy path, recycle, force remove |
 | F5 | rescan |
 | Esc | cancel a running scan |
 
@@ -142,9 +142,11 @@ item, and the window stays usable throughout.
 ## Tabs
 
 Views come in tabs. Right-click anything and open it in its own tab: a
-folder on the map, a row in Largest or Find, a duplicate (its drive
+folder on the map, a row in Largest or Find, a duplicate (its folder
 opens with the file outlined), or a Kinds row, which opens a tab running
-that extension's search. Each tab remembers its drive, its position in
+that extension's search. A tab opens on the folder you right-clicked,
+inside All drives too, and stays there when a cache being refreshed
+behind it is replaced. Each tab remembers its drive, its position in
 the tree, its panel and its search, and switching is instant because
 the caches already hold every drive. The strip only appears once there
 are two tabs to choose from.

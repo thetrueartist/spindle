@@ -840,6 +840,12 @@ struct Query {
 // guesses.
 Query ParseQuery(const std::wstring& text);
 
+// The names a path relative to the tree on screen walks through, as the
+// tree spells them: separators collapse, and a leading drive keeps its
+// backslash ("C:\"), which is how All drives names the volumes it holds.
+// Used to send a list row's folder to a tab or to the map.
+std::vector<std::wstring> TreePathComponents(const std::wstring& rel);
+
 // Path completion, split so the pure logic is testable off Windows. Split
 // normalises slashes and the drive-relative form, then divides into the
 // parent directory (with its trailing separator) and the partial leaf.
